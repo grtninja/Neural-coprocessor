@@ -27,3 +27,14 @@ jobs:
       - name: Run bounded mgpu.ini parser regression
         shell: pwsh
         run: ./tests/run_mgpu_ini_parser_test.ps1
+
+      - name: Smoke-test system report tool
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'mgpu-sysinfo.md'
+          ./tools/mgpu-sysinfo.ps1 -NoNvidia -OutputPath $out
+          if (-not (Test-Path -LiteralPath $out -PathType Leaf)) { throw 'system report was not written' }
+          $text = Get-Content -LiteralPath $out -Raw
+          if ($text -notmatch '# MGPU system report') { throw 'report header missing' }
+          if ($text -notmatch 'Display devices and PCI location paths') { throw 'PCI location section missing' }
+          if ($text -notmatch 'Skipped by -NoNvidia') { throw 'NoNvidia path missing' }
