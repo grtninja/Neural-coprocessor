@@ -90,7 +90,7 @@ Add-CommandBlock $lines 'Display adapters (CIM)' {
 
 Add-CommandBlock $lines 'Display devices and PCI location paths' {
     $devices = Get-PnpDevice -Class Display -PresentOnly -ErrorAction Stop
-    foreach ($device in $devices) {
+    $rows = foreach ($device in $devices) {
         $location = $null
         try {
             $location = (Get-PnpDeviceProperty -InstanceId $device.InstanceId `
@@ -106,12 +106,13 @@ Add-CommandBlock $lines 'Display devices and PCI location paths' {
             Status = $device.Status
             LocationPaths = $location
         }
-    } | Format-List | Out-String -Width 360
+    }
+    $rows | Format-List | Out-String -Width 360
 }
 
 Add-CommandBlock $lines 'Attached monitor identities' {
     $monitors = Get-CimInstance -Namespace 'root\wmi' -ClassName WmiMonitorID -ErrorAction Stop
-    foreach ($monitor in $monitors) {
+    $rows = foreach ($monitor in $monitors) {
         [pscustomobject]@{
             InstanceName = $monitor.InstanceName
             Manufacturer = Convert-WmiChars $monitor.ManufacturerName
@@ -120,7 +121,8 @@ Add-CommandBlock $lines 'Attached monitor identities' {
             Serial = Convert-WmiChars $monitor.SerialNumberID
             Active = $monitor.Active
         }
-    } | Format-List | Out-String -Width 320
+    }
+    $rows | Format-List | Out-String -Width 320
 }
 
 if ($NoNvidia) {
