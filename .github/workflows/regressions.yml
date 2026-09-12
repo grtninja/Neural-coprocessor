@@ -1,0 +1,29 @@
+name: regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-regressions:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure adapter regression
+        run: cmake -B build-tests -A x64 -DMGPU_BUILD_TESTS=ON
+
+      - name: Build adapter regression
+        run: cmake --build build-tests --config Release --target mgpu_adapter_selection_test
+
+      - name: Run adapter regression
+        run: ctest --test-dir build-tests -C Release --output-on-failure
+
+      - name: Run bounded mgpu.ini parser regression
+        shell: pwsh
+        run: ./tests/run_mgpu_ini_parser_test.ps1
