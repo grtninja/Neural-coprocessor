@@ -51,6 +51,16 @@ add_library(mgpu_bridge SHARED
     # SLTags= is set in mgpu.ini, so this source compiles into every build
     # and touches nothing in any of them until it is asked for.
     src/sl_tags.cpp
+    # R208: the experimental FP16 input path. No gpu1_context type;
+    # gpu1_context hands it D3D12 objects. OFF unless NRInput16=4 is in
+    # mgpu.ini: no texture, no kernel, no extra pass.
+    src/nr16.cpp
+    # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in
+    # mgpu.ini. Holds no ReShade type and no gpu1_context type.
+    src/discovery.cpp
+    # D1.5a (0.3.0 R&D): the read-only latency probe. OFF unless
+    # LatencyProbe=1 in mgpu.ini. Holds no ReShade type and no gpu1_context type.
+    src/latency_probe.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE

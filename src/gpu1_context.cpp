@@ -41,6 +41,7 @@
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+#include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -7783,7 +7784,8 @@ namespace
         // sr_on carries TWO facts and cannot hold both. It starts as the ini's
         // SRUpscale - the request - and then every refusal path sets it to 0 so
         // the rest of the run behaves as if SR were off: the failed create at
-        // arm, a failed rebuild, Subrect below 100, Passes above 1. That is
+        // arm, a failed rebuild, Subrect below 100, Passes above 1 (only when
+        // the panel raised the count before the first arm - R213). That is
         // correct for the STREAM and destroys the only record that the user
         // asked.
         //
@@ -8465,6 +8467,96 @@ namespace
     static const unsigned MAX_PASSES = 2;
         unsigned passes = 1;
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
+        // R212: the foveated pass 2, read at arm. p2r_on false = the 0.2.5
+        // chain, untouched. The region is in output pixels, multiples of 8.
+        bool p2r_on = false;
+        bool p2r_inputs_full = false;     // Pass2RegionInputs=full
+        bool p2r_feature_region = false;  // Pass2Feature=region
+        bool p2r_band = false;            // Pass2RegionShape=band
+        // R214: pass 1 foveated, read at arm. 0 off (the 0.2.5 pass 1), 1 alt
+        // (centre band every frame + one edge strip per frame, L/R in turn),
+        // 2 window (one evaluate per frame: left+centre, then centre+right).
+        unsigned p1f_mode = 0;
+        unsigned p1f_n = 0;                       // extra features: alt 2, window 1
+        NVSDK_NGX_Handle *p1f_handle[2] = {};
+        UINT p1f_cx = 0, p1f_cw = 0;              // the centre band, full height
+        unsigned long long p1f_last_fi[3] = {};   // per feature: game frame of its last evaluate
+        bool p1f_fresh[3] = {};                   // per feature: next evaluate resets history
+        unsigned long long p1f_frame = 0;         // consumed frames, drives the alternation
+        // R214: per-evaluate GPU timestamps (EvalTimes=1), own heap - the P2.2
+        // marks and their statistics are untouched.
+        // R215: pass 2 foveated with alternating strips (Pass2Fovea=alt): its
+        // centre band is the R212 region, every frame; ONE edge strip per frame.
+        unsigned p2f_mode = 0;
+        NVSDK_NGX_Handle *p2f_handle[2] = {};
+        unsigned long long p2f_last_fi[3] = {};
+        bool p2f_fresh[3] = {};
+        unsigned long long p2f_frame = 0;
+        // R216: the scale modes, read at arm. vr_mode 0 off (the 0.2.5 chain),
+        // 1 crop (both passes on the centred box, then the box to the full
+        // frame), 2 whole (the frame shrunk for pass 1, stretched back, pass 2
+        // at full size). vr_up, crop only: 0 stretch, 1 SR with its own
+        // input windows (srwindow), 2 SR with the box cut out (srcut).
+        unsigned vr_mode = 0;
+        unsigned vr_up = 0;
+        unsigned vr_pct = 0;                      // ScaleStep, percent per side
+        UINT vr_x = 0, vr_y = 0, vr_w = 0, vr_h = 0;
+        bool vr_sr_ok = false;                    // crop + SR: the SR feature is up
+        bool vr_said_passes = false;
+        ID3D12Resource *vr_small = nullptr;       // whole: pass 1's input
+        ID3D12Resource *vr_full  = nullptr;       // the stretch's (or SR's) output
+        ID3D12Resource *vr_depth = nullptr;       // crop + SR: depth for SR
+        ID3D12Resource *vr_mv    = nullptr;       // crop + SR, srcut: the box's vectors
+        ID3D12RootSignature *vr_rs = nullptr;
+        ID3D12PipelineState *vr_pso = nullptr;    // resize
+        ID3D12PipelineState *vr_pso_g = nullptr;  // gather (crop + SR)
+        ID3D12DescriptorHeap *vr_heap = nullptr;
+        UINT vr_inc = 0;
+        unsigned long long vr_sr_evals = 0, vr_sr_fails = 0;
+        bool vr_was_on = false;                   // R217: a scale mode turned on or off -> reset
+        // R218: the crop camera switch, read at arm. The key flips between the
+        // crop and the whole frame in play; with CropAuto on, frames without
+        // motion vectors (menus, loading) switch to the whole frame on their own.
+        unsigned vr_key = 0;                      // CropKey, a virtual-key code (0 = none)
+        bool vr_auto = false;                     // CropAuto
+        bool vr_user_on = true;                   // the key's state: true = crop
+        bool vr_key_down = false;                 // the key's last state, for the press edge
+        bool vr_auto_full = false;                // auto: whole frame now
+        unsigned vr_nomv_run = 0, vr_mv_run = 0;  // frames in a row without / with vectors
+        unsigned long long vr_sw_key = 0, vr_sw_auto = 0;
+        unsigned long long vr_fr_crop = 0, vr_fr_full = 0;
+        // R219: ScaleMode and CropAuto as mgpu.ini had them at arm, before any rule
+        // turned them off. The panel's restart line compares against these.
+        unsigned vr_ini_mode = 0;
+        bool vr_ini_auto = true;
+        bool vr_ini_ok = false;                   // R219: the two above were read this arm
+        bool n16_ini_ok = false;                  // R219-2: nr16 read its keys this arm
+        // R217: late-frame vectors, read at arm. cv_nr 0 multiply (R87, the
+        // shipped behaviour), 1 chain. cv_sr 0 off (shipped: SR is handed the
+        // vectors as they are), 1 multiply, 2 chain. Chain follows each pixel
+        // back through the skipped frames' own vectors, read from their ring
+        // slots; a frame whose slots cannot be trusted falls back to the
+        // default for that frame and is counted.
+        unsigned cv_nr = 0, cv_sr = 0;
+        static const unsigned CV_MAX = 3;         // skipped frames chained (4 frames in the path)
+        ID3D12Resource *cv_prev[CV_MAX] = {};     // skipped frames' vectors, the game's format
+        ID3D12Resource *cv_out = nullptr;         // the chained field, R32G32_FLOAT
+        ID3D12RootSignature *cv_rs = nullptr;
+        ID3D12PipelineState *cv_pso = nullptr;
+        ID3D12DescriptorHeap *cv_heap = nullptr;
+        UINT cv_inc = 0;
+        unsigned long long cv_built = 0, cv_fb_far = 0, cv_fb_old = 0, cv_fb_slot = 0;
+        unsigned long long cv_late = 0;           // frames more than one game frame late
+        static const UINT EV_MAX = 6;             // R217: + shrink, chain, stretch around 2 passes
+        static const unsigned EV_ROLES = 19;      // R216: + shrink, stretch, crop, cut, SR; R217: chain
+        ID3D12QueryHeap *evheap = nullptr;
+        ID3D12Resource *evread = nullptr;
+        bool ev_ok = false;
+        unsigned ev_count = 0;
+        unsigned ev_role[EV_MAX] = {};
+        double ev_sum[EV_ROLES] = {}, ev_min[EV_ROLES] = {}, ev_max[EV_ROLES] = {};
+        unsigned long long ev_n[EV_ROLES] = {};
+        UINT p2r_x = 0, p2r_y = 0, p2r_w = 0, p2r_h = 0;
         ngx_pf_evaluate_feature nr_eval = nullptr;
         ngx_pf_release_feature nr_release = nullptr;
         // V40. The parameter blocks' destructor. NEVER CALLED UNTIL NOW: the
@@ -9134,9 +9226,12 @@ namespace
     //  3. WRITE A TEMP AND RENAME. A half-written mgpu.ini is a game that
     //     launches with every key at its default and no way to tell (P7.2).
     //     MoveFileExW with REPLACE_EXISTING is atomic enough for this.
-    bool ini_write_int(const char *key, int value)
+    // R219-2: the text core. The panel's 16-bit colour power is a decimal, so
+    // the writer takes the value as text; ini_write_int below formats an int
+    // and calls this, so every int key is written byte for byte as before.
+    bool ini_write_text(const char *key, const char *value)
     {
-        if (key == nullptr || key[0] == '\0') return false;
+        if (key == nullptr || key[0] == '\0' || value == nullptr) return false;
         const wchar_t *wp = ini_path();
         if (wp == nullptr || wp[0] == L'\0')
         {
@@ -9163,7 +9258,7 @@ namespace
         buf[len] = '\0';
 
         char line_new[160];
-        snprintf(line_new, sizeof line_new, "%s=%d", key, value);
+        snprintf(line_new, sizeof line_new, "%s=%s", key, value);
 
         const size_t klen = strlen(key);
         size_t oi = 0;
@@ -9245,6 +9340,13 @@ namespace
 
         free(buf); free(out);
         return ok;
+    }
+
+    bool ini_write_int(const char *key, int value)
+    {
+        char v[16];
+        snprintf(v, sizeof v, "%d", value);
+        return ini_write_text(key, v);
     }
 
     // Defined below, with the rest of the readers. Declared here because the
@@ -9485,6 +9587,27 @@ namespace
         if (!ini_slurp(buf, sizeof buf)) return false;
         const char *k = ini_find(buf, key);
         return (k != nullptr) && (*k == '1');
+    }
+
+    // R212. Pass2Region=<percent of the frame's AREA, 10-99>. Absent, 100 or
+    // out of range: 0, off.
+    unsigned ini_read_pass2_region()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0u;
+        const char *k = ini_find(buf, "Pass2Region");
+        if (k == nullptr) return 0u;
+        const int v = atoi(k);
+        return (v >= 10 && v <= 99) ? (unsigned)v : 0u;
+    }
+
+    // R212. A word key: true when its value starts with `first`.
+    bool ini_read_word(const char *key, char first)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        const char *k = ini_find(buf, key);
+        return (k != nullptr) && (*k == first);
     }
 
     bool ini_read_srgb_input()
@@ -9987,6 +10110,16 @@ namespace
         // The NGX features first: they hold references to the textures.
         // Released in reverse creation order, every one of them - a partial
         // release on a failed create is how a handle leaks past the summary.
+        if (s.nr_release != nullptr)   // R215: pass 2's extra features, created last
+            for (int i = 1; i >= 0; --i)
+                if (s.p2f_handle[i] != nullptr)
+                { (void)s.nr_release(s.p2f_handle[i]); s.p2f_handle[i] = nullptr; }
+        s.p2f_handle[0] = s.p2f_handle[1] = nullptr;
+        if (s.nr_release != nullptr)   // R214: pass 1's extra features
+            for (int i = 1; i >= 0; --i)
+                if (s.p1f_handle[i] != nullptr)
+                { (void)s.nr_release(s.p1f_handle[i]); s.p1f_handle[i] = nullptr; }
+        s.p1f_handle[0] = s.p1f_handle[1] = nullptr;
         if (s.nr_release != nullptr)
             for (int i = (int)stream_state::MAX_PASSES - 1; i >= 0; --i)
                 if (s.nr_handle[i] != nullptr)
@@ -10003,6 +10136,25 @@ namespace
         if (s.ds_pso  != nullptr) { s.ds_pso->Release();  s.ds_pso  = nullptr; }
         if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
         if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
+        mgpu::nr16::release();   // R208: same point, same reason
+        // R216: same point, same reason.
+        if (s.vr_pso_g != nullptr) { s.vr_pso_g->Release(); s.vr_pso_g = nullptr; }
+        if (s.vr_pso   != nullptr) { s.vr_pso->Release();   s.vr_pso   = nullptr; }
+        if (s.vr_rs    != nullptr) { s.vr_rs->Release();    s.vr_rs    = nullptr; }
+        if (s.vr_heap  != nullptr) { s.vr_heap->Release();  s.vr_heap  = nullptr; }
+        if (s.vr_small != nullptr) { s.vr_small->Release(); s.vr_small = nullptr; }
+        if (s.vr_full  != nullptr) { s.vr_full->Release();  s.vr_full  = nullptr; }
+        if (s.vr_depth != nullptr) { s.vr_depth->Release(); s.vr_depth = nullptr; }
+        if (s.vr_mv    != nullptr) { s.vr_mv->Release();    s.vr_mv    = nullptr; }
+        s.vr_mode = 0u;
+        s.vr_sr_ok = false;
+        // R217: same point, same reason.
+        if (s.cv_pso  != nullptr) { s.cv_pso->Release();  s.cv_pso  = nullptr; }
+        if (s.cv_rs   != nullptr) { s.cv_rs->Release();   s.cv_rs   = nullptr; }
+        if (s.cv_heap != nullptr) { s.cv_heap->Release(); s.cv_heap = nullptr; }
+        for (unsigned ci = 0; ci < stream_state::CV_MAX; ++ci)
+            if (s.cv_prev[ci] != nullptr) { s.cv_prev[ci]->Release(); s.cv_prev[ci] = nullptr; }
+        if (s.cv_out != nullptr) { s.cv_out->Release(); s.cv_out = nullptr; }
         for (unsigned i = 0; i < 2u; ++i)
             if (s.sr_color[i] != nullptr) { s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
         if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
@@ -10057,6 +10209,9 @@ namespace
         if (s.gate_ev != nullptr) { CloseHandle(s.gate_ev); s.gate_ev = nullptr; }
         if (s.tsread != nullptr) { s.tsread->Release(); s.tsread = nullptr; }
         if (s.tsheap != nullptr) { s.tsheap->Release(); s.tsheap = nullptr; }
+        if (s.evread != nullptr) { s.evread->Release(); s.evread = nullptr; }   // R214
+        if (s.evheap != nullptr) { s.evheap->Release(); s.evheap = nullptr; }
+        s.ev_ok = false;
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
         if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
         // ---- HANGFIX 2026-09-12: DRAIN *GPU 0* BEFORE FREEING WHAT IT READS ----
@@ -11147,15 +11302,468 @@ namespace
         (void)ui_ini_write("ArmCrashed", 1);
     }
 
+    // ---- R216: the scale modes (ScaleMode=crop | whole) ----
+    //
+    // Off (ScaleMode absent): nothing here runs and nothing is created.
+    //
+    // One resize kernel does both directions. It samples a rectangle of one
+    // texture with a linear filter and writes a whole texture: the frame to
+    // pass 1's small input (whole, shrink), pass 1's small output back to the
+    // full frame (whole, stretch), or the box to the full frame (crop,
+    // stretch). The sample point is clamped half a texel inside the rectangle,
+    // so a stretch never reads a pixel from outside it.
+    //
+    // The gather kernel (crop + SR) LOADS depth and vectors - no filter - from
+    // the box into textures at SR's input size. srcut uses it for both;
+    // srwindow uses it only to write a zero depth on a frame that has none.
+    static const char *kVrResizeHLSL =
+        "Texture2D<float4> gSrc : register(t0);\n"
+        "RWTexture2D<float4> oDst : register(u0);\n"
+        "SamplerState gLin : register(s0);\n"
+        "cbuffer C : register(b0) { float4 gA; float4 gB; uint2 gDst; uint gFlags; uint gPad; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gDst.x || id.y >= gDst.y) return;\n"
+        "  float2 p = gA.xy + (float2(id.xy) + 0.5f) * gA.zw / float2(gDst);\n"
+        "  p = clamp(p, gA.xy + 0.5f, gA.xy + gA.zw - 0.5f);\n"
+        "  oDst[id.xy] = gSrc.SampleLevel(gLin, p * gB.xy, 0);\n"
+        "}\n";
+
+    static const char *kVrGatherHLSL =
+        "Texture2D<float>  gDepth : register(t0);\n"
+        "Texture2D<float2> gMv    : register(t1);\n"
+        "RWTexture2D<float>  oDepth : register(u0);\n"
+        "RWTexture2D<float2> oMv    : register(u1);\n"
+        "cbuffer C : register(b0) { float4 gA; float4 gB; uint2 gDst; uint gFlags; uint gPad; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gDst.x || id.y >= gDst.y) return;\n"
+        "  float2 t = (float2(id.xy) + 0.5f) / float2(gDst);\n"
+        "  float d = 0.0f;\n"
+        "  if ((gFlags & 1u) != 0u) {\n"
+        "    int2 p = int2(gA.xy + t * gA.zw);\n"
+        "    p = clamp(p, int2(gA.xy), int2(gA.xy + gA.zw) - int2(1,1));\n"
+        "    d = gDepth.Load(int3(p, 0));\n"
+        "  }\n"
+        "  oDepth[id.xy] = d;\n"
+        "  float2 m = float2(0.0f, 0.0f);\n"
+        "  if ((gFlags & 2u) != 0u) {\n"
+        "    int2 q = int2(gB.xy + t * gB.zw);\n"
+        "    q = clamp(q, int2(gB.xy), int2(gB.xy + gB.zw) - int2(1,1));\n"
+        "    m = gMv.Load(int3(q, 0));\n"
+        "  }\n"
+        "  if ((gFlags & 4u) != 0u) oMv[id.xy] = m;\n"
+        "}\n";
+
+    // Per parity: SRV(colour) SRV(-) UAV(small) UAV(-) - whole, shrink.
+    // Then SRV(tex_out) and SRV(tex_pong) -> UAV(vr_full) - the stretch.
+    // Then, per parity: SRV(depth) SRV(vectors) UAV(vr_depth) UAV(vr_mv).
+    // Written once at arm: every resource here lives for the whole stream.
+    static const UINT VR_BLOCKS = 6;
+
+    static void vr_srv(ID3D12Device *ndev, ID3D12Resource *r, D3D12_CPU_DESCRIPTOR_HANDLE h)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        sv.Format = (r != nullptr) ? r->GetDesc().Format : DXGI_FORMAT_R8G8B8A8_UNORM;
+        ndev->CreateShaderResourceView(r, &sv, h);
+    }
+
+    static void vr_uav(ID3D12Device *ndev, ID3D12Resource *r, D3D12_CPU_DESCRIPTOR_HANDLE h)
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uv.Format = (r != nullptr) ? r->GetDesc().Format : DXGI_FORMAT_R8G8B8A8_UNORM;
+        ndev->CreateUnorderedAccessView(r, nullptr, &uv, h);
+    }
+
+    static void vr_block(stream_state &s, ID3D12Device *ndev, UINT b,
+                         ID3D12Resource *s0, ID3D12Resource *s1,
+                         ID3D12Resource *u0, ID3D12Resource *u1)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = s.vr_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(b * 4u) * s.vr_inc;
+        vr_srv(ndev, s0, h); h.ptr += s.vr_inc;
+        vr_srv(ndev, s1, h); h.ptr += s.vr_inc;
+        vr_uav(ndev, u0, h); h.ptr += s.vr_inc;
+        vr_uav(ndev, u1, h);
+    }
+
+    // At arm, after the stream's textures exist. False turns the mode off for
+    // the run; it never fails the arm.
+    static bool vr_arm(stream_state &s, ID3D12Device *ndev, DXGI_FORMAT nrfmt)
+    {
+        char line[600];
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        pfn_d3dcompile p_compile =
+            (dc != nullptr) ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (p_compile == nullptr)
+        {
+            mgpu::diag::error("[MGPU][R216] d3dcompiler_47.dll / D3DCompile not available - "
+                              "ScaleMode is OFF for this run.");
+            return false;
+        }
+        // srwindow hands SR the game's own textures with a window offset, and
+        // SR reads a window the size of the box from them. That is only the
+        // box when the vectors and the depth are at the display's size; on a
+        // title whose vectors are smaller (Cyberpunk: 1707x960) the window
+        // would run past the end of the texture. There, srcut runs instead.
+        if (s.vr_mode == 1u && s.vr_up == 1u &&
+            ((s.mvec_w != 0u && (s.mvec_w != s.width || s.mvec_h != s.height)) ||
+             (s.depth_mode == 1 && s.depth_w != 0u &&
+              (s.depth_w != s.width || s.depth_h != s.height))))
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][R216] CropUpscale=srwindow needs the vectors and depth at the display "
+                     "size (%ux%u). Here the vectors are %ux%u and the depth %ux%u, so SR's window "
+                     "would read past them. CropUpscale=srcut runs instead for this run.",
+                     s.width, s.height, s.mvec_w, s.mvec_h, s.depth_w, s.depth_h);
+            mgpu::diag::warn(line);
+            s.vr_up = 2u;
+        }
+        const bool want_g = (s.vr_mode == 1u && s.vr_up != 0u);
+        ID3DBlob *cs = nullptr, *csg = nullptr, *err = nullptr;
+        HRESULT hr = p_compile(kVrResizeHLSL, strlen(kVrResizeHLSL), "vr_resize", nullptr,
+                               nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
+        if (SUCCEEDED(hr) && want_g)
+        {
+            if (err != nullptr) { err->Release(); err = nullptr; }
+            hr = p_compile(kVrGatherHLSL, strlen(kVrGatherHLSL), "vr_gather", nullptr,
+                           nullptr, "main", "cs_5_1", 0, 0, &csg, &err);
+        }
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][R216] a kernel failed to compile: 0x%08X %s - "
+                     "ScaleMode is OFF for this run.", (unsigned)hr,
+                     (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+            mgpu::diag::error(line);
+            if (err != nullptr) err->Release();
+            if (cs != nullptr) cs->Release();
+            if (csg != nullptr) csg->Release();
+            return false;
+        }
+        if (err != nullptr) { err->Release(); err = nullptr; }
+
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng[0].NumDescriptors = 2; rng[0].BaseShaderRegister = 0;
+        rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        rng[1].NumDescriptors = 2; rng[1].BaseShaderRegister = 0;
+        rng[1].OffsetInDescriptorsFromTableStart = 2;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 2;
+        rp[0].DescriptorTable.pDescriptorRanges = rng;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.ShaderRegister = 0;
+        rp[1].Constants.Num32BitValues = 12;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderRegister = 0;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = rp;
+        rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &ss;
+        ID3DBlob *sig = nullptr;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (err != nullptr) { err->Release(); err = nullptr; }
+        if (SUCCEEDED(hr))
+        {
+            hr = ndev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                           IID_PPV_ARGS(&s.vr_rs));
+            sig->Release();
+        }
+        if (SUCCEEDED(hr))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.vr_rs;
+            pd.CS.pShaderBytecode = cs->GetBufferPointer();
+            pd.CS.BytecodeLength  = cs->GetBufferSize();
+            hr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.vr_pso));
+            if (SUCCEEDED(hr) && csg != nullptr)
+            {
+                pd.CS.pShaderBytecode = csg->GetBufferPointer();
+                pd.CS.BytecodeLength  = csg->GetBufferSize();
+                hr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.vr_pso_g));
+            }
+        }
+        cs->Release();
+        if (csg != nullptr) csg->Release();
+
+        if (SUCCEEDED(hr) && s.vr_mode == 2u)
+            hr = make_tex(ndev, s.vr_w, s.vr_h, nrfmt,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.vr_small);
+        if (SUCCEEDED(hr))
+            hr = make_tex(ndev, s.width, s.height, nrfmt,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.vr_full);
+        if (SUCCEEDED(hr) && want_g)
+            hr = make_tex(ndev, s.vr_w, s.vr_h, DXGI_FORMAT_R32_FLOAT,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.vr_depth);
+        // The box's vectors at SR's input size, in the game's own vector
+        // format: srcut's cut, and both variants' zero vectors on a frame that
+        // has none (a menu, a load screen) - SR is never handed a null.
+        if (SUCCEEDED(hr) && want_g && s.tex_mvec_r[0] != nullptr)
+            hr = make_tex(ndev, s.vr_w, s.vr_h, (DXGI_FORMAT)s.mvec_format,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.vr_mv);
+        if (SUCCEEDED(hr))
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = VR_BLOCKS * 4u;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.vr_heap));
+        }
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][R216] building the scale mode failed 0x%08X - "
+                     "ScaleMode is OFF for this run.", (unsigned)hr);
+            mgpu::diag::error(line);
+            return false;
+        }
+        s.vr_inc = ndev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (UINT p = 0; p < 2u; ++p)
+        {
+            vr_block(s, ndev, p, s.tex_in[p], nullptr, s.vr_small, nullptr);
+            vr_block(s, ndev, 4u + p,
+                     (s.depth_mode != 0) ? s.tex_depth[p] : nullptr,
+                     (s.vr_mv != nullptr) ? s.tex_mvec_r[p] : nullptr,
+                     s.vr_depth, s.vr_mv);
+        }
+        vr_block(s, ndev, 2u, s.tex_out,  nullptr, s.vr_full, nullptr);
+        vr_block(s, ndev, 3u, s.tex_pong, nullptr, s.vr_full, nullptr);
+        return true;
+    }
+
+    // One dispatch of the resize (gather=false) or gather kernel on the
+    // stream's list. a/b: the rectangles, as the kernels read them.
+    static void vr_dispatch(stream_state &s, bool gather, UINT block,
+                            const float a[4], const float b[4],
+                            UINT dw, UINT dh, UINT flags)
+    {
+        ID3D12DescriptorHeap *heaps[1] = { s.vr_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.vr_rs);
+        s.nl->SetPipelineState(gather ? s.vr_pso_g : s.vr_pso);
+        D3D12_GPU_DESCRIPTOR_HANDLE gh = s.vr_heap->GetGPUDescriptorHandleForHeapStart();
+        gh.ptr += (UINT64)(block * 4u) * s.vr_inc;
+        s.nl->SetComputeRootDescriptorTable(0, gh);
+        UINT c[12] = {};
+        memcpy(&c[0], a, 4u * sizeof(float));
+        memcpy(&c[4], b, 4u * sizeof(float));
+        c[8] = dw; c[9] = dh; c[10] = flags; c[11] = 0u;
+        s.nl->SetComputeRoot32BitConstants(1, 12, c, 0);
+        s.nl->Dispatch((dw + 7u) / 8u, (dh + 7u) / 8u, 1u);
+    }
+
+    // The resize: rectangle (x, y, w, h) of a texture sized sw x sh, into the
+    // whole of a texture sized dw x dh.
+    static void vr_resize(stream_state &s, UINT block, float x, float y, float w, float h,
+                          UINT sw, UINT sh, UINT dw, UINT dh)
+    {
+        const float a[4] = { x, y, w, h };
+        const float b[4] = { 1.0f / (float)sw, 1.0f / (float)sh, 0.0f, 0.0f };
+        vr_dispatch(s, false, block, a, b, dw, dh, 0u);
+    }
+
+    // R214's per-evaluate mark, for a step that is not an evaluate.
+    static void vr_mark(stream_state &s, unsigned role)
+    {
+        if (s.ev_ok && s.ev_count < stream_state::EV_MAX)
+        {
+            s.ev_role[s.ev_count] = role;
+            ++s.ev_count;
+            s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, s.ev_count);
+        }
+    }
+
+    // ---- R217: chained late-frame vectors (NRVectors / SRVectors = chain) ----
+    //
+    // Off (both keys absent or not chain): nothing here runs and nothing is
+    // created.
+    //
+    // A vector describes ONE game frame. When GPU 1 evaluates a frame N game
+    // frames after the last one, R87 multiplies that one frame's vector by N,
+    // which is a straight line at constant speed. Chain follows each pixel
+    // back through the N frames' own vectors instead: V0 is this frame's,
+    // V1..V3 the skipped frames' (read from their ring slots). The path uses
+    // the DLSS convention, previous position = current + vector x scale, with
+    // the scale NR and SR are handed. The sum of the steps is written in the
+    // vectors' own units, so the consumer uses the scale unchanged.
+    static const char *kCvChainHLSL =
+        "Texture2D<float2> gV0 : register(t0);\n"
+        "Texture2D<float2> gV1 : register(t1);\n"
+        "Texture2D<float2> gV2 : register(t2);\n"
+        "Texture2D<float2> gV3 : register(t3);\n"
+        "RWTexture2D<float2> oV : register(u0);\n"
+        "cbuffer C : register(b0) { float2 gScale; uint2 gDim; uint gN; uint gP0; uint gP1; uint gP2; };\n"
+        "float2 ld(uint k, float2 q)\n"
+        "{\n"
+        "  int2 p = clamp(int2(floor(q)), int2(0,0), int2(gDim) - int2(1,1));\n"
+        "  if (k == 1u) return gV1.Load(int3(p, 0));\n"
+        "  if (k == 2u) return gV2.Load(int3(p, 0));\n"
+        "  return gV3.Load(int3(p, 0));\n"
+        "}\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "  if (id.x >= gDim.x || id.y >= gDim.y) return;\n"
+        "  float2 acc = gV0.Load(int3(id.xy, 0));\n"
+        "  float2 q = float2(id.xy) + 0.5f + acc * gScale;\n"
+        "  for (uint k = 1u; k < gN; ++k)\n"
+        "  {\n"
+        "    float2 v = ld(k, q);\n"
+        "    acc += v;\n"
+        "    q += v * gScale;\n"
+        "  }\n"
+        "  oV[id.xy] = acc;\n"
+        "}\n";
+
+    // At arm, after the MVec pair exists. False turns chain off for the run
+    // (both keys go back to their defaults); it never fails the arm.
+    static bool cv_arm(stream_state &s, ID3D12Device *ndev)
+    {
+        char line[500];
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        pfn_d3dcompile p_compile =
+            (dc != nullptr) ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+        if (p_compile == nullptr)
+        {
+            mgpu::diag::error("[MGPU][R217] d3dcompiler_47.dll / D3DCompile not available - "
+                              "chain is OFF for this run.");
+            return false;
+        }
+        ID3DBlob *cs = nullptr, *err = nullptr;
+        HRESULT hr = p_compile(kCvChainHLSL, strlen(kCvChainHLSL), "cv_chain", nullptr,
+                               nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][R217] the chain kernel failed to compile: 0x%08X %s "
+                     "- chain is OFF for this run.", (unsigned)hr,
+                     (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+            mgpu::diag::error(line);
+            if (err != nullptr) err->Release();
+            if (cs != nullptr) cs->Release();
+            return false;
+        }
+        if (err != nullptr) { err->Release(); err = nullptr; }
+
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng[0].NumDescriptors = 4; rng[0].BaseShaderRegister = 0;
+        rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
+        rng[1].OffsetInDescriptorsFromTableStart = 4;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 2;
+        rp[0].DescriptorTable.pDescriptorRanges = rng;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.ShaderRegister = 0;
+        rp[1].Constants.Num32BitValues = 8;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = rp;
+        ID3DBlob *sig = nullptr;
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (err != nullptr) { err->Release(); err = nullptr; }
+        if (SUCCEEDED(hr))
+        {
+            hr = ndev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                           IID_PPV_ARGS(&s.cv_rs));
+            sig->Release();
+        }
+        if (SUCCEEDED(hr))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.cv_rs;
+            pd.CS.pShaderBytecode = cs->GetBufferPointer();
+            pd.CS.BytecodeLength  = cs->GetBufferSize();
+            hr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.cv_pso));
+        }
+        cs->Release();
+
+        for (unsigned i = 0; SUCCEEDED(hr) && i < stream_state::CV_MAX; ++i)
+            hr = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
+                          D3D12_RESOURCE_FLAG_NONE,
+                          D3D12_RESOURCE_STATE_COPY_DEST, &s.cv_prev[i]);
+        if (SUCCEEDED(hr))
+            hr = make_tex(ndev, s.mvec_w, s.mvec_h, DXGI_FORMAT_R32G32_FLOAT,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.cv_out);
+        if (SUCCEEDED(hr))
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 10;                  // 5 per parity
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.cv_heap));
+        }
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line, "[MGPU][R217] building chain failed 0x%08X - chain is OFF "
+                     "for this run.", (unsigned)hr);
+            mgpu::diag::error(line);
+            return false;
+        }
+        s.cv_inc = ndev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // Per parity: SRV(this frame's vectors) SRV(skipped 1..3) UAV(chained).
+        for (UINT p = 0; p < 2u; ++p)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = s.cv_heap->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += (SIZE_T)(p * 5u) * s.cv_inc;
+            vr_srv(ndev, s.tex_mvec_r[p], h); h.ptr += s.cv_inc;
+            for (unsigned i = 0; i < stream_state::CV_MAX; ++i)
+            { vr_srv(ndev, s.cv_prev[i], h); h.ptr += s.cv_inc; }
+            vr_uav(ndev, s.cv_out, h);
+        }
+        return true;
+    }
+
+    // The chain dispatch: n frames in the path (2..4), this parity's block.
+    static void cv_dispatch(stream_state &s, unsigned ii, unsigned n)
+    {
+        ID3D12DescriptorHeap *heaps[1] = { s.cv_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.cv_rs);
+        s.nl->SetPipelineState(s.cv_pso);
+        D3D12_GPU_DESCRIPTOR_HANDLE gh = s.cv_heap->GetGPUDescriptorHandleForHeapStart();
+        gh.ptr += (UINT64)(ii * 5u) * s.cv_inc;
+        s.nl->SetComputeRootDescriptorTable(0, gh);
+        const float sc[2] = { s.mvec_scale_x, s.mvec_scale_y };
+        UINT c[8] = {};
+        memcpy(&c[0], sc, sizeof sc);
+        c[2] = s.mvec_w; c[3] = s.mvec_h; c[4] = n;
+        s.nl->SetComputeRoot32BitConstants(1, 8, c, 0);
+        s.nl->Dispatch((s.mvec_w + 7u) / 8u, (s.mvec_h + 7u) / 8u, 1u);
+    }
+
     bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
     {
         char line[900];
 
-        // R210. Diagnostic only. Once per launch, before this function touches
-        // NGX: no command list is open, no NGX call is in flight, s.cs is not
-        // held (the caller drops it before calling in). It reads the module
-        // list and file versions and changes nothing.
-        report_process_census_at_arm();
+        // R210. Diagnostic only, OFF unless ProcessCensus=1 (R211: absent, the
+        // launch is the 0.2.5 launch - no module walk, no version.dll or
+        // bcrypt.dll load, no file hashing, no log lines). Once per launch,
+        // before this function touches NGX: no command list is open, no NGX
+        // call is in flight, s.cs is not held (the caller drops it before
+        // calling in). It reads the module list and file versions and changes
+        // nothing.
+        if (ini_read_flag("ProcessCensus")) report_process_census_at_arm();
 
         ngx_modules mods;
         mods.core = GetModuleHandleW(L"_nvngx.dll");
@@ -11304,6 +11912,271 @@ namespace
         s.skin_strength      = ini_read_float("SkinStrength",      1.0f);
         s.style              = ini_read_float("Style",             0.0f);
         s.auto_mask          = ini_read_flag("AutoMask");
+
+        // R214: pass 1 foveated. Off unless Pass1Fovea=alt or =window.
+        {
+            s.p1f_mode = ini_read_word("Pass1Fovea", 'a') ? 1u
+                       : (ini_read_word("Pass1Fovea", 'w') ? 2u : 0u);
+            s.p1f_n = (s.p1f_mode == 1u) ? 2u : ((s.p1f_mode == 2u) ? 1u : 0u);
+            s.p1f_frame = 0;
+            for (unsigned i = 0; i < 3u; ++i) { s.p1f_last_fi[i] = 0; s.p1f_fresh[i] = true; }
+            if (s.p1f_mode != 0u)
+            {
+                unsigned pct = 50u;
+                {
+                    char pb[INI_BYTES];
+                    if (ini_slurp(pb, sizeof pb))
+                    {
+                        const char *k = ini_find(pb, "Pass1Region");
+                        if (k != nullptr) { const int v = atoi(k); if (v >= 10 && v <= 90) pct = (unsigned)v; }
+                    }
+                }
+                UINT w = (UINT)(((unsigned long long)s.width * pct) / 100ull) & ~7u;
+                if (w < 64u) w = 64u;
+                s.p1f_cw = w;
+                s.p1f_cx = ((s.width - w) / 2u) & ~7u;
+                snprintf(line, sizeof line,
+                         "[MGPU][R214] FOVEATED PASS 1 ON: Pass1Fovea=%s, centre band %ux%u at "
+                         "%u,0 (Pass1Region=%u%% of the width). %s Extra NR features: %u, full "
+                         "size, regions as subrects. Vectors and depth: the same regions, scaled "
+                         "to each input. Applies with SRUpscale off and Subrect=100.",
+                         (s.p1f_mode == 1u) ? "alt" : "window", w, s.height, s.p1f_cx, pct,
+                         (s.p1f_mode == 1u)
+                             ? "Every frame: the centre band, then ONE edge strip, left and right "
+                               "in turn."
+                             : "Every frame ONE evaluate: left edge + centre, then centre + right "
+                               "edge, in turn.",
+                         s.p1f_n);
+                mgpu::diag::info(line);
+            }
+        }
+
+        // R212: the foveated pass 2. Off unless Pass2Region is set.
+        {
+            const unsigned pct = ini_read_pass2_region();
+            s.p2r_on = false;
+            s.p2r_inputs_full    = ini_read_word("Pass2RegionInputs", 'f');
+            s.p2r_feature_region = ini_read_word("Pass2Feature", 'r');
+            s.p2r_band           = ini_read_word("Pass2RegionShape", 'b');
+            // R215: Pass2Fovea=alt makes the region a band with full-size features.
+            s.p2f_mode = ini_read_word("Pass2Fovea", 'a') ? 1u : 0u;
+            s.p2f_frame = 0;
+            for (unsigned i = 0; i < 3u; ++i) { s.p2f_last_fi[i] = 0; s.p2f_fresh[i] = true; }
+            if (s.p2f_mode != 0u) { s.p2r_band = true; s.p2r_feature_region = false; }
+            if (pct != 0u)
+            {
+                // Box: per-axis percent = sqrt(area percent), in whole percent.
+                // Band: full height, the width alone carries the area.
+                unsigned q = 0u;
+                while ((q + 1u) * (q + 1u) <= pct * 100u) ++q;
+                UINT w = (UINT)(((unsigned long long)s.width  * (s.p2r_band ? pct : q)) / 100ull) & ~7u;
+                UINT h = s.p2r_band ? s.height
+                                    : ((UINT)(((unsigned long long)s.height * q) / 100ull) & ~7u);
+                if (w < 64u) w = 64u;
+                if (h < 64u) h = 64u;
+                if (w > s.width)  w = s.width;
+                if (h > s.height) h = s.height;
+                s.p2r_w = w;
+                s.p2r_h = h;
+                s.p2r_x = ((s.width  - w) / 2u) & ~7u;
+                s.p2r_y = ((s.height - h) / 2u) & ~7u;
+                s.p2r_on = true;
+                snprintf(line, sizeof line,
+                         "[MGPU][R212] FOVEATED PASS 2 ON: Pass2Region=%u%% of the area, %s -> "
+                         "%ux%u at %u,%u of %ux%u. Vectors and depth: %s. Pass 2 feature: "
+                         "%s. Pass 1 is unchanged; pass 2 starts from a copy of pass 1's "
+                         "frame and evaluates only the region. Applies with Passes=2 and "
+                         "SRUpscale off.",
+                         pct, s.p2r_band ? "full-height band (Pass2RegionShape=band)" : "centred box",
+                         w, h, s.p2r_x, s.p2r_y, s.width, s.height,
+                         s.p2r_inputs_full ? "whole frame (Pass2RegionInputs=full)"
+                                           : "the same region, scaled to each input",
+                         s.p2r_feature_region ? "created at the region's size (Pass2Feature=region)"
+                                              : "full size, region as a subrect");
+                mgpu::diag::info(line);
+            }
+            if (s.p2f_mode != 0u && !s.p2r_on)
+            {
+                s.p2f_mode = 0u;
+                mgpu::diag::warn("[MGPU][R215] Pass2Fovea=alt needs Pass2Region (the centre band's "
+                                 "width) - OFF for this run.");
+            }
+            else if (s.p2f_mode != 0u)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][R215] FOVEATED PASS 2, ALTERNATING STRIPS: centre band %ux%u at "
+                         "%u,0 every frame (Pass2Region=%u%% of the width), then ONE edge strip, "
+                         "left and right in turn, each its own full-size feature. The strip not "
+                         "evaluated keeps pass 2's last result there; pass 1 is copied in only on "
+                         "the first frame. Applies with Passes=2 and SRUpscale off.",
+                         s.p2r_w, s.p2r_h, s.p2r_x, pct);
+                mgpu::diag::info(line);
+            }
+        }
+        // R216: the scale modes. Off unless ScaleMode=crop or =whole.
+        {
+            s.vr_mode = 0u; s.vr_up = 0u; s.vr_pct = 67u;
+            s.vr_ini_mode = 0u; s.vr_ini_auto = true; s.vr_ini_ok = false;   // R219
+            s.vr_sr_ok = false; s.vr_said_passes = false;
+            s.vr_sr_evals = 0; s.vr_sr_fails = 0;
+            char vb[INI_BYTES];
+            if (ini_slurp(vb, sizeof vb))
+            {
+                const char *k = ini_find(vb, "ScaleMode");
+                // R219: 1 and 2 as well, so the panel can write it with the int writer.
+                if (k != nullptr && (strncmp(k, "crop", 4) == 0 || *k == '1'))       s.vr_mode = 1u;
+                else if (k != nullptr && (strncmp(k, "whole", 5) == 0 || *k == '2')) s.vr_mode = 2u;
+                k = ini_find(vb, "ScaleStep");
+                if (k != nullptr)
+                {
+                    const int v = atoi(k);
+                    if (v == 75 || v == 67 || v == 50) s.vr_pct = (unsigned)v;
+                    else if (s.vr_mode == 1u && v >= 50 && v <= 95) s.vr_pct = (unsigned)v;   // R218
+                    else if (s.vr_mode != 0u)
+                        mgpu::diag::warn("[MGPU][R216] ScaleStep must be 75, 67 or 50 for whole, "
+                                         "50 to 95 for crop (percent per side) - using 67.");
+                }
+                // R218: the camera switch key and the automatic whole frame.
+                s.vr_key = VK_INSERT; s.vr_auto = true;
+                s.vr_user_on = true; s.vr_key_down = false; s.vr_auto_full = false;
+                s.vr_nomv_run = s.vr_mv_run = 0u;
+                s.vr_sw_key = s.vr_sw_auto = s.vr_fr_crop = s.vr_fr_full = 0ull;
+                k = ini_find(vb, "CropKey");
+                if (k != nullptr)
+                {
+                    static const struct { const char *n; unsigned vk; } kn[] = {
+                        { "insert", VK_INSERT }, { "delete", VK_DELETE }, { "end", VK_END },
+                        { "home", VK_HOME }, { "pageup", VK_PRIOR }, { "pagedown", VK_NEXT },
+                        { "scrolllock", VK_SCROLL }, { "pause", VK_PAUSE }, { "none", 0u } };
+                    bool got = false;
+                    for (unsigned q = 0; q < sizeof kn / sizeof kn[0] && !got; ++q)
+                        if (_strnicmp(k, kn[q].n, strlen(kn[q].n)) == 0) { s.vr_key = kn[q].vk; got = true; }
+                    // ` (or "grave"): the key under Esc, by position, on any layout.
+                    if (!got && (*k == '`' || _strnicmp(k, "grave", 5) == 0))
+                    { s.vr_key = MapVirtualKeyW(0x29u, MAPVK_VSC_TO_VK); got = true; }
+                    // A number: a Windows virtual-key code, decimal or 0x hex.
+                    if (!got && *k >= '0' && *k <= '9')
+                    {
+                        const unsigned long v = strtoul(k, nullptr, 0);
+                        if (v > 0ul && v < 256ul) { s.vr_key = (unsigned)v; got = true; }
+                    }
+                    if (!got && s.vr_mode == 1u)
+                        mgpu::diag::warn("[MGPU][R218] CropKey names a key this build does not "
+                                         "know - using Insert. Names: insert, delete, end, home, "
+                                         "pageup, pagedown, scrolllock, pause, ` (grave), none, or a "
+                                         "virtual-key number.");
+                }
+                k = ini_find(vb, "CropAuto");
+                if (k != nullptr && (*k == '0' || _strnicmp(k, "off", 3) == 0 ||
+                                     _strnicmp(k, "false", 5) == 0)) s.vr_auto = false;
+                // With CropAuto, start on the whole frame and crop once vectors
+                // are steady (30 frames): one switch at start instead of three.
+                s.vr_auto_full = s.vr_auto;
+                s.vr_ini_mode = s.vr_mode; s.vr_ini_auto = s.vr_auto; s.vr_ini_ok = true;   // R219
+                k = ini_find(vb, "CropUpscale");
+                if (k != nullptr && strncmp(k, "srwindow", 8) == 0)   s.vr_up = 1u;
+                else if (k != nullptr && strncmp(k, "srcut", 5) == 0) s.vr_up = 2u;
+            }
+            if (s.vr_mode != 1u) s.vr_up = 0u;
+            const char *why = nullptr;
+            if (s.vr_mode != 0u && s.sr_on != 0u)            why = "SRUpscale is on";
+            else if (s.vr_mode != 0u && s.subrect_pct != 100u) why = "Subrect is below 100";
+            else if (s.vr_mode != 0u && ini_read_srgb_input()) why = "SrgbInput=1 is set";
+            else if (s.vr_mode != 0u && s.cc_on != 0u)         why = "CostCurve=1 is set";
+            if (why != nullptr)
+            {
+                snprintf(line, sizeof line, "[MGPU][R216] ScaleMode is OFF for this run: %s. "
+                         "The scale modes run with SRUpscale=0, Subrect=100, SrgbInput=0 and "
+                         "CostCurve=0.",
+                         why);
+                mgpu::diag::warn(line);
+                s.vr_mode = 0u; s.vr_up = 0u;
+            }
+            if (s.vr_mode != 0u)
+            {
+                // The step is a percent of EACH side, so the aspect ratio is
+                // the frame's (to within the multiple-of-8 rounding).
+                UINT w = (UINT)(((unsigned long long)s.width  * s.vr_pct) / 100ull) & ~7u;
+                UINT h = (UINT)(((unsigned long long)s.height * s.vr_pct) / 100ull) & ~7u;
+                if (w < 64u) w = 64u;
+                if (h < 64u) h = 64u;
+                s.vr_w = w; s.vr_h = h;
+                s.vr_x = (s.vr_mode == 1u) ? (((s.width  - w) / 2u) & ~7u) : 0u;
+                s.vr_y = (s.vr_mode == 1u) ? (((s.height - h) / 2u) & ~7u) : 0u;
+                // The other region keys do not mix with this one.
+                if (s.p1f_mode != 0u || s.p2r_on || s.p2f_mode != 0u)
+                    mgpu::diag::warn("[MGPU][R216] ScaleMode is set, so Pass1Fovea, Pass2Region "
+                                     "and Pass2Fovea are OFF for this run.");
+                s.p1f_mode = 0u; s.p1f_n = 0u;
+                s.p2r_on = false; s.p2f_mode = 0u;
+                static const char *const up[3] = {
+                    "a stretch of the box to the full frame (CropUpscale=stretch)",
+                    "DLSS SR from the box to the full frame, reading the box through SR's own "
+                    "input windows - vectors untouched (CropUpscale=srwindow)",
+                    "DLSS SR from the box to the full frame, with the box's colour, depth and "
+                    "vectors cut out into textures at SR's input size (CropUpscale=srcut)" };
+                if (s.vr_mode == 1u)
+                    snprintf(line, sizeof line,
+                             "[MGPU][R216] SCALE MODE ON: ScaleMode=crop, ScaleStep=%u%% per side "
+                             "-> box %ux%u at %u,%u of %ux%u. Every pass evaluates the box only; "
+                             "then %s. The view outside the box is not shown.",
+                             s.vr_pct, w, h, s.vr_x, s.vr_y, s.width, s.height, up[s.vr_up]);
+                else
+                    snprintf(line, sizeof line,
+                             "[MGPU][R216] SCALE MODE ON: ScaleMode=whole, ScaleStep=%u%% per side. "
+                             "The frame is shrunk to %ux%u, pass 1 runs on it, the result is "
+                             "stretched back to %ux%u and pass 2 runs at full size. Runs only on "
+                             "frames with Passes=2; with Passes=1 the one pass runs at full size.",
+                             s.vr_pct, w, h, s.width, s.height);
+                mgpu::diag::info(line);
+                if (s.vr_mode == 1u)   // R218
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][R218] CAMERA SWITCH: CropKey (virtual key 0x%02X%s) flips "
+                             "between the crop and the whole frame in play. It is read only while "
+                             "the game window is in front and is not taken from the game. "
+                             "CropAuto=%s%s",
+                             s.vr_key, (s.vr_key == 0u) ? ", none" : "",
+                             s.vr_auto ? "1: whole frame after 10 frames without motion vectors "
+                                         "(menus, loading), crop again after 30 frames with them."
+                                       : "0: off.",
+                             (s.vr_auto && s.mvec_mode != 3)
+                                 ? " The game's own vectors are not transported (MVec mode 3), "
+                                   "so the automatic switch is OFF for this run." : "");
+                    mgpu::diag::info(line);
+                    if (s.mvec_mode != 3) { s.vr_auto = false; s.vr_auto_full = false; }
+                }
+            }
+        }
+        // R217: late-frame vectors. Absent: NR multiplies (R87) and SR is
+        // handed the vectors as they are - the shipped behaviour.
+        {
+            s.cv_nr = 0u; s.cv_sr = 0u; s.vr_was_on = false;
+            s.cv_built = s.cv_fb_far = s.cv_fb_old = s.cv_fb_slot = s.cv_late = 0;
+            char cb[INI_BYTES];
+            if (ini_slurp(cb, sizeof cb))
+            {
+                const char *k = ini_find(cb, "NRVectors");
+                if (k != nullptr && strncmp(k, "chain", 5) == 0) s.cv_nr = 1u;
+                k = ini_find(cb, "SRVectors");
+                if (k != nullptr && strncmp(k, "multiply", 8) == 0)   s.cv_sr = 1u;
+                else if (k != nullptr && strncmp(k, "chain", 5) == 0) s.cv_sr = 2u;
+            }
+            if (s.cv_nr != 0u || s.cv_sr != 0u)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][R217] LATE-FRAME VECTORS: NR %s, SR %s. A late frame is one "
+                         "evaluated more than one game frame after the last. Chain follows the "
+                         "skipped frames' own vectors (up to %u skipped); a frame it cannot "
+                         "chain uses the default for that frame and is counted.",
+                         (s.cv_nr == 1u) ? "chain (NRVectors=chain)" : "multiply (R87, default)",
+                         (s.cv_sr == 2u) ? "chain (SRVectors=chain)"
+                             : ((s.cv_sr == 1u) ? "multiply (SRVectors=multiply)"
+                                                : "off (default)"),
+                         stream_state::CV_MAX);
+                mgpu::diag::info(line);
+            }
+        }
         if (s.tuning_on)
         {
             snprintf(line, sizeof line,
@@ -11389,6 +12262,9 @@ namespace
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
         if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
+        // R208: the FP16 input path. Reads NRInput16 itself; a failure here
+        // leaves it off and never fails the arm.
+        if (SUCCEEDED(h)) { (void)mgpu::nr16::arm(ndev, s.width, s.height); s.n16_ini_ok = true; }
 
         // P8.0. Always created, like tex_pong and for the same reason: the mode
         // is live, so "will it be used" is not knowable at arm time and a lazy
@@ -11449,6 +12325,33 @@ namespace
                 h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
                              D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_mvec_r[1]);
+        }
+
+        // R216: built last, once every texture it reads exists.
+        if (SUCCEEDED(h) && s.vr_mode != 0u && !vr_arm(s, ndev, nrfmt))
+        {
+            s.vr_mode = 0u; s.vr_up = 0u;
+        }
+
+        // R217: chain needs the game's vectors on every frame (MVec mode 3)
+        // and every frame sent (Stride=0). Built last, like R216.
+        if (SUCCEEDED(h) && (s.cv_nr == 1u || s.cv_sr == 2u))
+        {
+            const char *why = nullptr;
+            if (s.stride_max != 0u) why = "Stride is on, so the skipped frames never reach GPU 1";
+            else if (s.mvec_mode != 3 || s.tex_mvec_r[0] == nullptr || s.tex_mvec_r[1] == nullptr ||
+                     s.mvec_w == 0u || s.mvec_h == 0u)
+                why = "the game's own motion vectors are not transported (MVec mode 3)";
+            if (why == nullptr && !cv_arm(s, ndev)) why = "it could not be built (see above)";
+            if (why != nullptr)
+            {
+                snprintf(line, sizeof line, "[MGPU][R217] chain is OFF for this run: %s. NR "
+                         "multiplies (R87) and SR is %s.", why,
+                         (s.cv_sr == 1u) ? "multiplied (SRVectors=multiply)" : "handed the vectors as they are");
+                mgpu::diag::warn(line);
+                s.cv_nr = 0u;
+                if (s.cv_sr == 2u) s.cv_sr = 0u;
+            }
         }
 
         // ---- P9.0: the title profile ----
@@ -11582,13 +12485,18 @@ namespace
             arm_sentinel_set();
             for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
+                // R212: pass 2's own feature at the region's size, when asked.
+                const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
+                const UINT cw = p2f ? s.p2r_w : s.width, chh = p2f ? s.p2r_h : s.height;
+                s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
+                s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
                 {
                     char am[200];
                     snprintf(am, sizeof am,
                              "[MGPU][P4.1] arm step 3.%u: entering CreateFeature(Reserved18) "
                              "%ux%u - IF THIS IS THE LAST LINE, IT DIED INSIDE NGX",
-                             i + 1, s.width, s.height);
+                             i + 1, cw, chh);
                     mgpu::diag::info(am);
                 }
                 // V44. Guarded. See ngx_create_guarded for why it is its own
@@ -11611,11 +12519,70 @@ namespace
                 snprintf(line, sizeof line,
                          "[MGPU][P4.1] CreateFeature(Reserved18) handle %u/%u %ux%u fmt=%d: "
                          "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
-                         i + 1, stream_state::MAX_PASSES, s.width, s.height, (int)s.format,
+                         i + 1, stream_state::MAX_PASSES, cw, chh, (int)s.format,
                          (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
                          (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
                 mgpu::diag::info(line);
                 if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
+            }
+            // R212: the block is shared with every evaluate; back to full size.
+            s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+            s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+            // R214: pass 1's extra features, full size. A failure turns the
+            // foveated pass 1 off; it never fails the arm.
+            for (unsigned i = 0; i < s.p1f_n && r == NVSDK_NGX_Result_Success; ++i)
+            {
+                unsigned long seh_p1 = 0ul;
+                const NVSDK_NGX_Result rp =
+                    ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
+                                       (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                                       s.nr_params, &s.p1f_handle[i], &seh_p1);
+                if ((unsigned)rp == NGX_RESULT_MGPU_SEH_FAULT)
+                {
+                    arm_fault_recover(s, seh_p1);
+                    return false;
+                }
+                snprintf(line, sizeof line,
+                         "[MGPU][R214] CreateFeature(Reserved18) pass 1 extra %u/%u %ux%u: "
+                         "result=0x%08X (%s) handle=0x%p",
+                         i + 1, s.p1f_n, s.width, s.height, (unsigned)rp, ngx_result_name(rp),
+                         (void *)s.p1f_handle[i]);
+                mgpu::diag::info(line);
+                if (rp != NVSDK_NGX_Result_Success || s.p1f_handle[i] == nullptr)
+                {
+                    mgpu::diag::warn("[MGPU][R214] an extra pass-1 feature was not created - "
+                                     "FOVEATED PASS 1 OFF for this run; pass 1 is the full frame.");
+                    s.p1f_mode = 0u;
+                    break;
+                }
+            }
+            // R215: pass 2's two strip features, full size. A failure turns the
+            // alternating strips off (pass 2 is then the band alone, R212).
+            for (unsigned i = 0; s.p2f_mode != 0u && i < 2u && r == NVSDK_NGX_Result_Success; ++i)
+            {
+                unsigned long seh_p2 = 0ul;
+                const NVSDK_NGX_Result rp =
+                    ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
+                                       (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                                       s.nr_params, &s.p2f_handle[i], &seh_p2);
+                if ((unsigned)rp == NGX_RESULT_MGPU_SEH_FAULT)
+                {
+                    arm_fault_recover(s, seh_p2);
+                    return false;
+                }
+                snprintf(line, sizeof line,
+                         "[MGPU][R215] CreateFeature(Reserved18) pass 2 strip %u/2 %ux%u: "
+                         "result=0x%08X (%s) handle=0x%p",
+                         i + 1, s.width, s.height, (unsigned)rp, ngx_result_name(rp),
+                         (void *)s.p2f_handle[i]);
+                mgpu::diag::info(line);
+                if (rp != NVSDK_NGX_Result_Success || s.p2f_handle[i] == nullptr)
+                {
+                    mgpu::diag::warn("[MGPU][R215] a pass-2 strip feature was not created - "
+                                     "alternating strips OFF; pass 2 is the band alone.");
+                    s.p2f_mode = 0u;
+                    break;
+                }
             }
             // Survived NGX. Whether the RESULT was a success does not matter
             // here - a returned error code means the process is alive, which
@@ -13464,6 +14431,28 @@ int ui_ini_read(const char *key, int dflt)
     return ini_mirror_get(key, dflt);
 }
 
+// R219-2. A decimal key, written with the same line-anchored writer. Two decimals.
+bool ui_ini_write_float(const char *key, float value)
+{
+    char v[32];
+    snprintf(v, sizeof v, "%.2f", (double)value);
+    return ini_write_text(key, v);
+}
+
+// R219. The same parse as the arm's R216/R218 block, on the file as it is now.
+void ui_ini_read_crop(unsigned &mode, bool &crop_auto)
+{
+    mode = 0u; crop_auto = true;
+    char vb[INI_BYTES];
+    if (!ini_slurp(vb, sizeof vb)) return;
+    const char *k = ini_find(vb, "ScaleMode");
+    if (k != nullptr && (strncmp(k, "crop", 4) == 0 || *k == '1'))       mode = 1u;
+    else if (k != nullptr && (strncmp(k, "whole", 5) == 0 || *k == '2')) mode = 2u;
+    k = ini_find(vb, "CropAuto");
+    if (k != nullptr && (*k == '0' || _strnicmp(k, "off", 3) == 0 ||
+                         _strnicmp(k, "false", 5) == 0)) crop_auto = false;
+}
+
 // ---- V43: THE ARM SENTINEL ----
 //
 // ArmCrashed=1 is written to mgpu.ini immediately BEFORE CreateFeature and
@@ -13980,6 +14969,11 @@ void ui_read(ui_state &out)
     out.sr_preset    = s.sr_preset;
     out.sr_scale_pct = s.sr_scale_pct;
     out.sr_mv_mode   = s.sr_mv_mode;
+    out.crop_ini_mode = s.vr_ini_mode;   // R219
+    out.crop_ini_auto = s.vr_ini_auto;
+    out.crop_ini_ok   = s.vr_ini_ok;
+    out.n16_ini_ok    = s.n16_ini_ok;   // R219-2
+    mgpu::nr16::ini_values(out.n16_ini_on, out.n16_ini_power);
     out.sr_mv_lowres = s.sr_mv_lowres;
     out.sr_mv_fix_x  = s.sr_mv_fix_x;
     out.sr_mv_fix_y  = s.sr_mv_fix_y;
@@ -14520,6 +15514,14 @@ void stream_request()
                             std::memory_order_relaxed);
             s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 99);
 
+            // R213, comment only. WHAT THIS CHECK REALLY DOES: it runs before
+            // Passes is read from mgpu.ini (a few lines below), and this
+            // function runs once per process, so it sees the default of 1 and
+            // SRUpscale=1 with Passes=2 runs - both passes at R, then SR. That
+            // is the behaviour of every build and the operator uses it. It
+            // fires only if the panel's pass count was raised before the first
+            // arm. Kept unchanged on purpose; do not read it as "SR refuses
+            // Passes above 1".
             if (s.sr_on != 0u && s.passes != 1u)
             {
                 mgpu::diag::error("[MGPU][C2-SR] SRUpscale=1 REFUSES Passes above 1. The "
@@ -15873,6 +16875,25 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 s.ts_ok = SUCCEEDED(th) && s.ts_freq > 0;
                 for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i) s.ts_min[i] = 1e30;
                 for (UINT q = 0; q < stream_state::TS_SEGS; ++q) s.ts_seg_min[q] = 1e30;   // D5b
+                // R214: per-evaluate marks, off unless EvalTimes=1.
+                if (s.ts_ok && ini_read_flag("EvalTimes"))
+                {
+                    D3D12_QUERY_HEAP_DESC evd{};
+                    evd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+                    evd.Count = stream_state::EV_MAX + 1u;
+                    evd.NodeMask = 0;
+                    HRESULT evh = ndev->CreateQueryHeap(&evd, IID_PPV_ARGS(&s.evheap));
+                    if (SUCCEEDED(evh))
+                        evh = make_buf(ndev, (UINT64)(stream_state::EV_MAX + 1u) * 8,
+                                       D3D12_HEAP_TYPE_READBACK, &s.evread);
+                    s.ev_ok = SUCCEEDED(evh);
+                    for (unsigned q = 0; q < stream_state::EV_ROLES; ++q) s.ev_min[q] = 1e30;
+                    mgpu::diag::info(s.ev_ok
+                        ? "[MGPU][R214] EvalTimes=1: one GPU timestamp before the first evaluate "
+                          "and one after each evaluate; the summary prints each evaluate's time."
+                        : "[MGPU][R214] EvalTimes=1 but the per-evaluate query heap could not be "
+                          "built - per-evaluate times are off for this run.");
+                }
                 char tl[400];
                 snprintf(tl, sizeof tl,
                          "[MGPU][P2.2] GPU timestamps on GPU 1: query heap + "
@@ -16060,6 +17081,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             return;
         }
         s.armed = true;
+        s.vr_ini_ok = false;   // R219: read again when the neural stage is created
+        s.n16_ini_ok = false;  // R219-2: same
         // R88: gxfer exists and the mvec geometry is final from here.
         // The flags are zeroed explicitly: std::atomic's default constructor
         // does not value-initialise before C++20, and relying on the static
@@ -16272,7 +17295,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             // decision actually needs: how many GAME FRAMES pass per FRAME
             // that gets evaluated, whatever that frame costs internally.
             const unsigned long long gf = s.game_frames - s.win_frames_at;
-            const unsigned pz = (s.passes >= 1u) ? s.passes : 1u;
+            // R217: ScaleMode=whole always runs two passes, whatever s.passes says.
+            const unsigned pz = (s.vr_mode == 2u) ? 2u : ((s.passes >= 1u) ? s.passes : 1u);
             const unsigned long long ev = (s.nr_evals > s.win_evals_at)
                                         ? ((s.nr_evals - s.win_evals_at) / pz) : 0ull;
             s.win_frames_at = s.game_frames;
@@ -17153,6 +18177,30 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 }
                 D3D12_RANGE tn{0, 0};
                 s.tsread->Unmap(0, &tn);
+            }
+        }
+
+        // R214: this frame's per-evaluate GPU times (EvalTimes=1).
+        if (s.ev_ok && run_nr && s.ev_count > 0u && s.cc_state != 1u && s.cc_state != 2u)
+        {
+            const UINT64 *ev = nullptr;
+            const unsigned kn = s.ev_count;
+            D3D12_RANGE er{0, (SIZE_T)((kn + 1u) * 8u)};
+            if (SUCCEEDED(s.evread->Map(0, &er, (void **)&ev)) && ev != nullptr)
+            {
+                for (unsigned i = 0; i < kn; ++i)
+                {
+                    if (ev[i + 1] < ev[i]) break;   // a wrapped or unwritten mark
+                    const double ms = (double)(ev[i + 1] - ev[i]) * 1000.0 / (double)s.ts_freq;
+                    const unsigned ro = s.ev_role[i];
+                    if (ro >= stream_state::EV_ROLES) continue;
+                    s.ev_sum[ro] += ms;
+                    if (ms < s.ev_min[ro]) s.ev_min[ro] = ms;
+                    if (ms > s.ev_max[ro]) s.ev_max[ro] = ms;
+                    ++s.ev_n[ro];
+                }
+                D3D12_RANGE en{0, 0};
+                s.evread->Unmap(0, &en);
             }
         }
 
@@ -18135,6 +19183,44 @@ void stream_poll()
             }
         }
 
+        // R216: crop + SR. The SR feature is built the shipped way, at the
+        // box's size (SRScale = ScaleStep gives exactly the box), with
+        // MVLowRes on because the vectors SR reads are the box's. The shipped
+        // SR chain stays off (sr_ready false): the crop step drives this
+        // feature. A failure falls back to crop + stretch.
+        if (s.nr_ok && s.vr_mode == 1u && s.vr_up != 0u && ndev != nullptr)
+        {
+            const unsigned keep_pct = s.sr_scale_pct, keep_mv = s.sr_mv_mode;
+            s.sr_scale_pct = s.vr_pct;
+            s.sr_mv_mode = 1u;
+            bool ok = stream_sr_create(s, ndev);
+            if (ok && (s.sr_w != s.vr_w || s.sr_h != s.vr_h)) ok = false;
+            s.sr_scale_pct = keep_pct;
+            s.sr_mv_mode = keep_mv;
+            s.sr_ready = false;
+            s.vr_sr_ok = ok;
+            if (!ok)
+            {
+                stream_sr_release_only(s);
+                s.vr_up = 0u;
+                mgpu::diag::warn("[MGPU][R216] the SR feature for crop + SR did not come up - "
+                                 "the crop runs with a stretch (CropUpscale=stretch) for this run.");
+            }
+            else
+            {
+                char vl[400];
+                snprintf(vl, sizeof vl,
+                         "[MGPU][R216] crop + SR ready: SR %ux%u -> %ux%u, CropUpscale=%s. "
+                         "MV scale on each evaluate: the game's x %.4f/%.4f (display pixels "
+                         "per vector-buffer pixel); the MVScale fix in the C2-SR line above "
+                         "is not used by the crop.",
+                         s.sr_w, s.sr_h, s.width, s.height,
+                         (s.vr_up == 1u) ? "srwindow" : "srcut",
+                         (double)s.width / (double)s.mvec_w, (double)s.height / (double)s.mvec_h);
+                mgpu::diag::info(vl);
+            }
+        }
+
         // Phase 1 arms here, not at stream_request: the calibration needs the
         // neural stage up and the geometry carried across by a seal, and this
         // is the first point where both are true.
@@ -18740,7 +19826,161 @@ void stream_poll()
                 }
 
                 bool final_pass_ok = false;
-                for (unsigned pi = 0; pi < s.passes; ++pi)
+                // R216: the scale modes this frame. Off, or a frame they do not
+                // apply to (a calibration or Subrect extent, or whole with
+                // Passes=1): the chain below is unchanged.
+                // R218: the camera switch. The key is read here, on the bridge
+                // thread, only while the game window is in front; a press flips
+                // crop and whole frame. With CropAuto, 10 frames in a row without
+                // motion vectors switch to the whole frame and 30 with them switch
+                // back. Every switch resets the passes (vr_flip, R217).
+                if (s.vr_mode == 1u)
+                {
+                    char cl[200];
+                    // The foreground window belongs to the game's process (the add-on
+                    // lives in it). Not g_game_hwnd: that is recorded only with
+                    // DcompOverlay on.
+                    const HWND fg = GetForegroundWindow();
+                    DWORD fpid = 0;
+                    if (fg != nullptr) (void)GetWindowThreadProcessId(fg, &fpid);
+                    const bool front = (fg != nullptr && fpid == GetCurrentProcessId());
+                    const bool down = front && s.vr_key != 0u &&
+                                      (GetAsyncKeyState((int)s.vr_key) & 0x8000) != 0;
+                    if (down && !s.vr_key_down)
+                    {
+                        s.vr_user_on = !s.vr_user_on;
+                        ++s.vr_sw_key;
+                        if (s.vr_sw_key + s.vr_sw_auto <= 200ull)
+                        {
+                            snprintf(cl, sizeof cl, "[MGPU][R218] f=%llu key: %s.", f,
+                                     s.vr_user_on ? "crop" : "whole frame");
+                            mgpu::diag::info(cl);
+                        }
+                    }
+                    s.vr_key_down = down;
+                    if (s.vr_auto)
+                    {
+                        if (mvec_here) { s.vr_nomv_run = 0u; if (s.vr_mv_run < 100000u) ++s.vr_mv_run; }
+                        else { s.vr_mv_run = 0u; if (s.vr_nomv_run < 100000u) ++s.vr_nomv_run; }
+                        const bool was = s.vr_auto_full;
+                        if (!s.vr_auto_full && s.vr_nomv_run >= 10u)    s.vr_auto_full = true;
+                        else if (s.vr_auto_full && s.vr_mv_run >= 30u)  s.vr_auto_full = false;
+                        if (s.vr_auto_full != was)
+                        {
+                            ++s.vr_sw_auto;
+                            if (s.vr_sw_key + s.vr_sw_auto <= 200ull)
+                            {
+                                snprintf(cl, sizeof cl, "[MGPU][R218] f=%llu auto: %s.", f,
+                                         s.vr_auto_full ? "whole frame (no motion vectors)"
+                                             : (s.vr_user_on ? "crop again (motion vectors back)"
+                                                             : "motion vectors back - the key "
+                                                               "keeps the whole frame"));
+                                mgpu::diag::info(cl);
+                            }
+                        }
+                    }
+                }
+                const bool vr_c  = (s.vr_mode == 1u && s.vr_user_on && !s.vr_auto_full &&   // R218
+                                    !s.sr_ready && ew == s.width && eh == s.height);
+                if (s.vr_mode == 1u) { if (vr_c) ++s.vr_fr_crop; else ++s.vr_fr_full; }
+                // R217: whole is its own mode. It always runs its two passes
+                // (small pass 1, stretch, full pass 2), whatever the pass count
+                // says, so the panel cannot switch it on or off mid-run.
+                const bool vr_wh = (s.vr_mode == 2u && !s.sr_ready &&
+                                    ew == s.width && eh == s.height);
+                if (s.vr_mode == 2u && s.passes != 2u && !s.vr_said_passes)
+                {
+                    s.vr_said_passes = true;
+                    mgpu::diag::warn("[MGPU][R217] ScaleMode=whole runs its own two passes - the "
+                                     "pass count is not used while it is on. Said once.");
+                }
+                const unsigned npass = vr_wh ? 2u : s.passes;   // R217
+                // R217: a frame where a scale mode turns on or off (the first
+                // frame, a calibration frame) resets every pass's history, so
+                // no pass blends a history built at another size.
+                const bool vr_now = vr_c || vr_wh;
+                const bool vr_flip = (vr_now != s.vr_was_on);
+                s.vr_was_on = vr_now;
+                if (vr_flip && vr_c && s.vr_sr_ok) s.sr_first = true;   // R218: crop + SR resumes
+                // R214: foveated pass 1 this frame, and the per-evaluate marks.
+                const bool p1f_on = (s.p1f_mode != 0u && !s.sr_ready &&
+                                     ew == s.width && eh == s.height);
+                const bool p1f_odd = (s.p1f_frame & 1ull) != 0ull;
+                const bool p2f_on = (s.p2f_mode != 0u && s.p2r_on && !s.sr_ready);   // R215
+                const bool p2f_odd = (s.p2f_frame & 1ull) != 0ull;
+                const float mv_el_frame = mv_el;
+                s.ev_count = 0;
+                if (s.ev_ok) s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                // R216: whole - the frame shrunk to the step's size for pass 1.
+                // Colour only: depth and vectors stay whole, as on the SR
+                // path's pass 1.
+                if (vr_wh)
+                {
+                    vr_resize(s, ii, 0.0f, 0.0f, (float)s.width, (float)s.height,
+                              s.width, s.height, s.vr_w, s.vr_h);
+                    barrier(s.nl, s.vr_small, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    vr_mark(s, 10u);
+                }
+                // R217: chain this frame's late vectors - this frame's own and
+                // the skipped frames', read from their ring slots. A skipped
+                // frame's slot is used only if it still holds that game frame,
+                // has vectors, and is 3+ frames from being overwritten (the
+                // producer does not wait for us). Otherwise the default runs.
+                bool cv_ran = false;
+                if (mvec_here && mv_el_frame > 1.5f) ++s.cv_late;
+                if ((s.cv_nr != 0u || s.cv_sr == 2u) && s.cv_pso != nullptr && mvec_here &&
+                    mv_el_frame > 1.5f)
+                {
+                    const unsigned n = (unsigned)(mv_el_frame + 0.5f);   // frames in the path
+                    bool ok = (n - 1u <= stream_state::CV_MAX);
+                    if (!ok) ++s.cv_fb_far;
+                    unsigned gsl[stream_state::CV_MAX] = {};
+                    for (unsigned k = 1u; ok && k < n; ++k)
+                    {
+                        const unsigned long long g = f - (unsigned long long)k;
+                        const unsigned gs = (unsigned)((g - 1ull) % stream_state::RING);
+                        if (g == 0ull ||
+                            g + (unsigned long long)stream_state::RING < s.produced + 3ull)
+                        { ok = false; ++s.cv_fb_old; break; }
+                        if (s.slot_game_frame[gs] != gnow - (unsigned long long)k ||
+                            s.mvec_slot_valid[gs].load(std::memory_order_acquire) == 0u)
+                        { ok = false; ++s.cv_fb_slot; break; }
+                        gsl[k - 1u] = gs;
+                    }
+                    if (ok)
+                    {
+                        for (unsigned k = 1u; k < n; ++k)
+                        {
+                            D3D12_TEXTURE_COPY_LOCATION csu{}, cdu{};
+                            csu.pResource = s.nxfer;
+                            csu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            csu.PlacedFootprint = s.mvec_fp2;
+                            csu.PlacedFootprint.Offset =
+                                (UINT64)gsl[k - 1u] * s.slot_bytes + s.mvec_off;
+                            cdu.pResource = s.cv_prev[k - 1u];
+                            cdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            cdu.SubresourceIndex = 0;
+                            s.nl->CopyTextureRegion(&cdu, 0, 0, 0, &csu, nullptr);
+                            barrier(s.nl, s.cv_prev[k - 1u], D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        }
+                        // This frame's scale, as the NR evaluate will be handed it (R105).
+                        mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);
+                        cv_dispatch(s, ii, n);
+                        for (unsigned k = 1u; k < n; ++k)
+                            barrier(s.nl, s.cv_prev[k - 1u],
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
+                        barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        cv_ran = true;
+                        ++s.cv_built;
+                        vr_mark(s, 18u);
+                    }
+                }
+                const bool cv_nr_on = cv_ran && s.cv_nr != 0u;
+                for (unsigned pi = 0; pi < npass; ++pi)
                 {
                     ID3D12Resource *src = (pi == 0)
                                             ? s.tex_in[ii]
@@ -18748,14 +19988,19 @@ void stream_poll()
                     ID3D12Resource *dst = (pi % 2u == 0u) ? s.tex_out : s.tex_pong;
                     // C2-SR: the first pass reads the reduced colour and the
                     // last writes the reduced output, which is SR's input.
-                    // Intermediate passes keep ping-ponging in the big pair,
-                    // which is why SRUpscale refuses Passes>1 at arm rather
-                    // than silently mixing two resolutions in one chain.
+                    // Passes in between use the full-size pair at the same
+                    // reduced extent (ew/eh are R). With Passes=2 there is no
+                    // pass in between: both passes run at R, then SR (R213; the
+                    // check in stream_request does not refuse this on a normal
+                    // launch - see the comment there).
                     if (s.sr_ready)
                     {
                         if (pi == 0)             src = s.sr_color[ii];
                         if (pi + 1u >= s.passes) dst = s.sr_nrout;
                     }
+                    // R216: whole - pass 1 reads the small frame, pass 2 the
+                    // stretched one.
+                    if (vr_wh) src = (pi == 0u) ? s.vr_small : s.vr_full;
 
                     // STATE, not just a UAV barrier. Pass 1's input (tex_in) is
                     // put in NON_PIXEL_SHADER_RESOURCE above, which is the only
@@ -18767,26 +20012,124 @@ void stream_poll()
                     // uses, and put back afterwards. The transition also IS the
                     // write-to-read dependency between consecutive passes, so
                     // no separate UAV barrier is needed.
+                    // R212: the foveated pass 2. It writes only its region, so
+                    // dst first gets pass 1's whole frame. Off: no copy.
+                    const bool p2r = (pi > 0u && s.p2r_on && !s.sr_ready);
+                    // R215: with alternating strips pass 2 writes every column
+                    // itself; pass 1 is copied in only before its first frame.
+                    if (p2r && (!p2f_on || s.p2f_frame == 0ull))
+                    {
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        barrier(s.nl, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                        s.nl->CopyResource(dst, src);
+                        barrier(s.nl, src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        barrier(s.nl, dst, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
+                    // R216: crop evaluates the box on every pass, with the
+                    // inputs windowed to it. Whole's pass 1 evaluates the small
+                    // frame from 0,0 with the inputs whole.
+                    const bool vr_box = vr_c || (vr_wh && pi == 0u);
+                    const bool p2r_in0 = (p2r && !s.p2r_inputs_full) || vr_c;
+                    const UINT rbx0 = p2r ? s.p2r_x : (vr_c ? s.vr_x : 0u);
+                    const UINT rby0 = p2r ? s.p2r_y : (vr_c ? s.vr_y : 0u);
+                    const UINT rw0  = p2r ? s.p2r_w : (vr_box ? s.vr_w : ew);
+                    const UINT rh0  = p2r ? s.p2r_h : (vr_box ? s.vr_h : eh);
+
                     if (pi > 0)
                         barrier(s.nl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-                    s.nr_params->Set("DLSSNR.Color", src);
-                    s.nr_params->Set("DLSSNR.Output", dst);
-                    s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
-                    s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                    // R208: the FP16 input path. Only on the one pass of a
+                    // Passes=1 full-frame run without SR; every other frame
+                    // is untouched. NR reads and writes FP16; the decode
+                    // below puts its output back into dst.
+                    // R214: pass 1 foveated is 2 evaluates (alt) or 1 (window).
+                    // Off: one evaluate with the values above, exactly as before.
+                    const bool p1f_here = (pi == 0u && p1f_on);
+                    const bool p2f_here = (pi > 0u && p2f_on);   // R215
+                    const unsigned nsub = ((p1f_here && s.p1f_mode == 1u) || p2f_here) ? 2u : 1u;
+                    for (unsigned sk = 0; sk < nsub; ++sk)
+                    {
+                    unsigned fidx = 0;                       // 0 = nr_handle[pi]
+                    unsigned role = (pi == 0u) ? 0u : 6u;
+                    if (vr_c) role = (pi == 0u) ? 13u : 14u;   // R216
+                    else if (vr_wh && pi == 0u) role = 11u;
+                    bool own_el = false;                     // feature not evaluated every frame
+                    UINT fx = rbx0, fw = rw0;
+                    if (p1f_here)
+                    {
+                        const UINT cx = s.p1f_cx, cw = s.p1f_cw, W = s.width;
+                        if (s.p1f_mode == 1u)
+                        {
+                            if (sk == 0u) { fidx = 0u; role = 1u; fx = cx; fw = cw; }
+                            else if (!p1f_odd) { fidx = 1u; role = 2u; fx = 0u; fw = cx; own_el = true; }
+                            else { fidx = 2u; role = 3u; fx = cx + cw; fw = W - (cx + cw); own_el = true; }
+                        }
+                        else
+                        {
+                            own_el = true;
+                            if (!p1f_odd) { fidx = 0u; role = 4u; fx = 0u; fw = cx + cw; }
+                            else { fidx = 1u; role = 5u; fx = cx; fw = W - cx; }
+                        }
+                    }
+                    if (p2f_here)   // R215: centre band, then one strip
+                    {
+                        const UINT cx = s.p2r_x, cw = s.p2r_w, W = s.width;
+                        if (sk == 0u) { fidx = 0u; role = 7u; fx = cx; fw = cw; }
+                        else if (!p2f_odd) { fidx = 1u; role = 8u; fx = 0u; fw = cx; own_el = true; }
+                        else { fidx = 2u; role = 9u; fx = cx + cw; fw = W - (cx + cw); own_el = true; }
+                    }
+                    NVSDK_NGX_Handle *const ngx_h =
+                        (fidx == 0u) ? s.nr_handle[pi]
+                                     : (p2f_here ? s.p2f_handle[fidx - 1u] : s.p1f_handle[fidx - 1u]);
+                    const bool p2r_in = p1f_here ? true : p2r_in0;
+                    const UINT rbx = fx, rby = p1f_here ? 0u : rby0;
+                    const UINT rw = fw, rh = p1f_here ? s.height : rh0;
+                    float mv_el_k = mv_el_frame;
+                    if (own_el)
+                    {
+                        const unsigned long long lfi =
+                            p2f_here ? s.p2f_last_fi[fidx] : s.p1f_last_fi[fidx];
+                        unsigned long long e = 1ull;
+                        if (lfi != 0ull && gnow > lfi)
+                            e = gnow - lfi;
+                        if (e > 64ull) e = 64ull;
+                        mv_el_k = (float)e;
+                    }
+                    const float mv_el = mv_el_k;
+                    if (sk > 0u)   // two evaluates write disjoint regions of one texture
+                    {
+                        D3D12_RESOURCE_BARRIER ub{};
+                        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        ub.UAV.pResource = dst;
+                        s.nl->ResourceBarrier(1, &ub);
+                    }
+
+                    const bool nr16_on = (pi == 0u && s.passes == 1u && !s.sr_ready && !vr_c && !vr_wh &&
+                                          ew == s.width && eh == s.height && !p1f_here &&
+                                          mgpu::nr16::active());
+                    ID3D12Resource *nr_color = src, *nr_output = dst;
+                    if (nr16_on) mgpu::nr16::encode(s.nl, ii, src, &nr_color, &nr_output);
+                    s.nr_params->Set("DLSSNR.Color", nr_color);
+                    s.nr_params->Set("DLSSNR.Output", nr_output);
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseX", (unsigned int)rbx);   // R212
+                    s.nr_params->Set("DLSSNR.ColorSubrectBaseY", (unsigned int)rby);
                     // R102: ew/eh, not s.width/s.height. They ARE s.width and
                     // s.height at Subrect=100, so a default run sets exactly
                     // what every published run set. Colour and output take the
                     // same extent because this stage is 1:1 - it denoises, it
                     // does not upscale, and a mismatched pair here would be
                     // asking for a resample nobody requested.
-                    s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)ew);
-                    s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)eh);
-                    s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
-                    s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-                    s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)ew);
-                    s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)eh);
+                    s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)rw);
+                    s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)rh);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseX", (unsigned int)rbx);
+                    s.nr_params->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)rby);
+                    s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)rw);
+                    s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)rh);
                     // P8.0. Bound for EVERY pass: each pass owns its own handle
                     // and therefore its own history, so each needs the
                     // reprojection. Unset when the mode is off, which leaves
@@ -18804,19 +20147,30 @@ void stream_poll()
                     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                         s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
                     {
-                        s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_r[ii]);
+                        // R217: the chained field on a late frame, in place of
+                        // R87's multiply - not for a strip's own count.
+                        const bool cv_here = cv_nr_on && !own_el;
+                        s.nr_params->Set("DLSSNR.MVec", cv_here ? s.cv_out : s.tex_mvec_r[ii]);
                         // R87: scaled by the frames that actually elapsed. With
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_el);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_el);
+                        const float mv_k = cv_here ? 1.0f : mv_el;   // R217
+                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
                         mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth",  (unsigned int)s.mvec_w);
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", (unsigned int)s.mvec_h);
-                        if (pi == 0) ++s.mvec_bound;
+                        // R212: the region, scaled to the vectors' own size.
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
+                            ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
+                            : (unsigned int)s.mvec_w);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
+                            ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
+                            : (unsigned int)s.mvec_h);
+                        if (pi == 0 && sk == 0) ++s.mvec_bound;
                     }
                     else if (s.mvec_mode == 3)
                     {
@@ -18826,7 +20180,7 @@ void stream_poll()
                         // reproject the history against a motion that did not
                         // happen, which is worse than no reprojection at all.
                         s.nr_params->Set("DLSSNR.MVec", (ID3D12Resource *)nullptr);
-                        if (pi == 0) ++s.mvec_skipped;
+                        if (pi == 0 && sk == 0) ++s.mvec_skipped;
                     }
                     else if (s.mvec_mode != 0 && s.tex_mvec != nullptr)
                     {
@@ -18835,10 +20189,12 @@ void stream_poll()
                         s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x);
                         s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y);
                         mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth",  (unsigned int)s.width);
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", (unsigned int)s.height);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in ? (unsigned int)rbx : 0u);   // R212
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in ? (unsigned int)rby : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth",
+                                         p2r_in ? (unsigned int)rw : (unsigned int)s.width);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight",
+                                         p2r_in ? (unsigned int)rh : (unsigned int)s.height);
                     }
 
                     // ---- T1b: DEPTH, bound only on frames that actually have it ----
@@ -18857,13 +20213,20 @@ void stream_poll()
                         s.depth_slot_valid[slot] != 0u)
                     {
                         s.nr_params->Set("DLSSNR.Depth", s.tex_depth[ii]);
-                        s.nr_params->Set("DLSSNR.DepthSubrectBaseX", 0u);
-                        s.nr_params->Set("DLSSNR.DepthSubrectBaseY", 0u);
-                        s.nr_params->Set("DLSSNR.DepthSubrectWidth",  (unsigned int)s.depth_w);
-                        s.nr_params->Set("DLSSNR.DepthSubrectHeight", (unsigned int)s.depth_h);
+                        // R212: the region, scaled to the depth's own size.
+                        s.nr_params->Set("DLSSNR.DepthSubrectBaseX", p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * s.depth_w) / s.width) : 0u);
+                        s.nr_params->Set("DLSSNR.DepthSubrectBaseY", p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * s.depth_h) / s.height) : 0u);
+                        s.nr_params->Set("DLSSNR.DepthSubrectWidth", p2r_in
+                            ? (unsigned int)(((unsigned long long)rw * s.depth_w) / s.width)
+                            : (unsigned int)s.depth_w);
+                        s.nr_params->Set("DLSSNR.DepthSubrectHeight", p2r_in
+                            ? (unsigned int)(((unsigned long long)rh * s.depth_h) / s.height)
+                            : (unsigned int)s.depth_h);
                         s.nr_params->Set("DLSSNR.DepthInverted",
                                          (unsigned int)s.depth_inverted);
-                        if (pi == 0) ++s.depth_bound;
+                        if (pi == 0 && sk == 0) ++s.depth_bound;
                     }
                     else if (s.depth_mode == 1)
                     {
@@ -18874,7 +20237,7 @@ void stream_poll()
                         // the model would reproject confidently against a
                         // geometry that is gone.
                         s.nr_params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
-                        if (pi == 0) ++s.depth_skipped;
+                        if (pi == 0 && sk == 0) ++s.depth_skipped;
                     }
                     // P6.2: per pass, not one hardcoded value for all of them.
                     s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
@@ -18914,15 +20277,43 @@ void stream_poll()
                     // now a setting rather than an edit, because which passes
                     // keep history is exactly the variable in question.
                     unsigned rst = s.nr_first ? 1u : 0u;
+                    if (vr_flip) rst = 1u;   // R217
                     if (s.pass_reset == 2) rst = 1u;
                     else if (s.pass_reset == 1 && pi > 0) rst = 1u;
+                    if (pi == 0u && mgpu::nr16::take_reset()) rst = 1u;   // R208
+                    if (p1f_here && s.p1f_fresh[fidx]) rst = 1u;           // R214
+                    if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     s.nr_params->Set("DLSSNR.Reset", rst);
 
+                    const bool p2f = p2r && s.p2r_feature_region;   // R212
+                    if (p2f)
+                    {
+                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.p2r_w);
+                        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.p2r_h);
+                    }
                     const NVSDK_NGX_Result er =
-                        s.nr_eval(s.nl, s.nr_handle[pi], s.nr_params, nullptr);
-                    ++s.nr_evals;
-                    if (pi + 1u >= s.passes)
-                        final_pass_ok = (er == NVSDK_NGX_Result_Success);
+                        s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
+                    if (p2f)
+                    {
+                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+                        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+                    }
+                    if (nr16_on)   // R208
+                        mgpu::nr16::decode(s.nl, ii, dst, er == NVSDK_NGX_Result_Success);
+                    if (sk == 0u) ++s.nr_evals;
+                    if (pi + 1u >= npass)   // R217: npass is s.passes outside whole mode
+                        final_pass_ok = (sk == 0u) ? (er == NVSDK_NGX_Result_Success)
+                                                   : (final_pass_ok && er == NVSDK_NGX_Result_Success);
+                    if (p1f_here)   // R214
+                    {
+                        s.p1f_fresh[fidx] = false;
+                        s.p1f_last_fi[fidx] = gnow;
+                    }
+                    if (p2f_here)   // R215
+                    {
+                        s.p2f_fresh[fidx] = false;
+                        s.p2f_last_fi[fidx] = gnow;
+                    }
                     if (er != NVSDK_NGX_Result_Success)
                     {
                         ++s.nr_fails;
@@ -18935,6 +20326,13 @@ void stream_poll()
                             mgpu::diag::error(line);
                         }
                     }
+                    if (s.ev_ok && s.ev_count < stream_state::EV_MAX)   // R214
+                    {
+                        s.ev_role[s.ev_count] = role;
+                        ++s.ev_count;
+                        s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, s.ev_count);
+                    }
+                    }   // R214: sub-evaluates
 
                     // Put it back: every UAV texture must be in
                     // UNORDERED_ACCESS at the end of the list, because that is
@@ -18943,7 +20341,182 @@ void stream_poll()
                     if (pi > 0)
                         barrier(s.nl, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                    // R216: whole - pass 1's small result stretched back to
+                    // the full frame, which is pass 2's input.
+                    if (vr_wh && pi == 0u)
+                    {
+                        barrier(s.nl, s.vr_small, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        vr_resize(s, 2u, 0.0f, 0.0f, (float)s.vr_w, (float)s.vr_h,
+                                  s.width, s.height, s.width, s.height);
+                        barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        vr_mark(s, 12u);
+                    }
                 }
+                if (p1f_on) ++s.p1f_frame;   // R214
+                if (p2f_on && s.passes > 1u) ++s.p2f_frame;   // R215
+                // R216: crop - the box to the full frame (vr_full), by a
+                // stretch or by DLSS SR. Only when the last pass wrote.
+                bool vr_done = false;
+                if (vr_c && final_pass_ok)
+                {
+                    ID3D12Resource *const last = (s.passes % 2u == 1u) ? s.tex_out : s.tex_pong;
+                    if (s.vr_up == 0u || !s.vr_sr_ok)
+                    {
+                        barrier(s.nl, last, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        vr_resize(s, (s.passes % 2u == 1u) ? 2u : 3u,
+                                  (float)s.vr_x, (float)s.vr_y, (float)s.vr_w, (float)s.vr_h,
+                                  s.width, s.height, s.width, s.height);
+                        barrier(s.nl, last, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        vr_mark(s, 12u);
+                        vr_done = true;
+                    }
+                    else
+                    {
+                        // Depth and vectors exactly as the passes bound them
+                        // this frame: present, and in NON_PIXEL_SHADER_RESOURCE.
+                        const bool d_ok = depth_here && s.depth_mode == 1;
+                        const bool m_ok = mvec_here;
+                        const bool cut = (s.vr_up == 2u);
+                        // The box in each input's own pixels.
+                        const UINT dbx = (s.depth_w != 0u) ? (UINT)(((unsigned long long)s.vr_x * s.depth_w) / s.width)  : 0u;
+                        const UINT dby = (s.depth_h != 0u) ? (UINT)(((unsigned long long)s.vr_y * s.depth_h) / s.height) : 0u;
+                        const UINT dbw = (s.depth_w != 0u) ? (UINT)(((unsigned long long)s.vr_w * s.depth_w) / s.width)  : 1u;
+                        const UINT dbh = (s.depth_h != 0u) ? (UINT)(((unsigned long long)s.vr_h * s.depth_h) / s.height) : 1u;
+                        const UINT mbx = (UINT)(((unsigned long long)s.vr_x * s.mvec_w) / s.width);
+                        const UINT mby = (UINT)(((unsigned long long)s.vr_y * s.mvec_h) / s.height);
+                        const UINT mbw = (UINT)(((unsigned long long)s.vr_w * s.mvec_w) / s.width);
+                        const UINT mbh = (UINT)(((unsigned long long)s.vr_h * s.mvec_h) / s.height);
+                        ID3D12Resource *sr_c = last, *sr_d = nullptr, *sr_m = nullptr;
+                        UINT cbx = s.vr_x, cby = s.vr_y, dsx = 0u, dsy = 0u, msx = 0u, msy = 0u;
+                        bool g_ran = false;
+                        if (cut)
+                        {
+                            // Colour: the box, copied exactly - same size, same format.
+                            barrier(s.nl, last, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
+                            D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+                            cs.pResource = last;
+                            cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            cs.SubresourceIndex = 0;
+                            cd.pResource = s.sr_nrout;
+                            cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            cd.SubresourceIndex = 0;
+                            D3D12_BOX cb{ s.vr_x, s.vr_y, 0, s.vr_x + s.vr_w, s.vr_y + s.vr_h, 1 };
+                            s.nl->CopyTextureRegion(&cd, 0, 0, 0, &cs, &cb);
+                            barrier(s.nl, last, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            barrier(s.nl, s.sr_nrout, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                            sr_c = s.sr_nrout; cbx = 0u; cby = 0u;
+                            // Depth and vectors: LOADED from the box, no filter.
+                            const bool m_cut = m_ok && s.vr_mv != nullptr;
+                            const float a[4] = { (float)dbx, (float)dby, (float)dbw, (float)dbh };
+                            const float b[4] = { (float)mbx, (float)mby, (float)mbw, (float)mbh };
+                            vr_dispatch(s, true, 4u + ii, a, b, s.vr_w, s.vr_h,
+                                        (d_ok ? 1u : 0u) | (m_cut ? 2u : 0u) |
+                                        ((s.vr_mv != nullptr) ? 4u : 0u));
+                            g_ran = true;
+                            sr_d = s.vr_depth;
+                            sr_m = s.vr_mv;   // the box's vectors, or zeros
+                        }
+                        else
+                        {
+                            barrier(s.nl, last, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                            // No depth or no vectors this frame: SR gets zeros
+                            // for the missing one.
+                            if (!d_ok || (!m_ok && s.vr_mv != nullptr))
+                            {
+                                const float z[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+                                vr_dispatch(s, true, 4u + ii, z, z, s.vr_w, s.vr_h,
+                                            (s.vr_mv != nullptr) ? 4u : 0u);
+                                g_ran = true;
+                            }
+                            if (d_ok) { sr_d = s.tex_depth[ii]; dsx = dbx; dsy = dby; }
+                            else      { sr_d = s.vr_depth; }
+                            if (m_ok) { sr_m = s.tex_mvec_r[ii]; msx = mbx; msy = mby; }
+                            else      { sr_m = s.vr_mv; }
+                        }
+                        if (g_ran)
+                        {
+                            barrier(s.nl, s.vr_depth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                            if (s.vr_mv != nullptr)
+                                barrier(s.nl, s.vr_mv, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        }
+                        if (cut) vr_mark(s, 15u);
+
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Color,  sr_c);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Output, s.vr_full);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Depth,  sr_d);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_MotionVectors, sr_m);
+                        // The box is at the display's pixel scale, so a vector
+                        // in the game's buffer is width/mvec_w output pixels
+                        // per buffer pixel - in both variants.
+                        s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_X,
+                                         s.mvec_scale_x * (float)s.width  / (float)s.mvec_w);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_Y,
+                                         s.mvec_scale_y * (float)s.height / (float)s.mvec_h);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_ExposureTexture, s.sr_expose);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.0f);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_Reset, s.sr_first ? 1u : 0u);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                                         (unsigned int)s.vr_w);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                                         (unsigned int)s.vr_h);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, (unsigned int)cbx);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, (unsigned int)cby);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, (unsigned int)dsx);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, (unsigned int)dsy);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, (unsigned int)msx);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, (unsigned int)msy);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, 0u);
+                        s.sr_params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, 0u);
+                        s.sr_first = false;
+                        const NVSDK_NGX_Result vres =
+                            s.sr_eval(s.nl, s.sr_handle, s.sr_params, nullptr);
+                        ++s.vr_sr_evals;
+                        if (vres != NVSDK_NGX_Result_Success)
+                        {
+                            ++s.vr_sr_fails;
+                            if (s.vr_sr_fails <= 3)
+                            {
+                                snprintf(line, sizeof line,
+                                         "[MGPU][R216] crop + SR EvaluateFeature f=%llu: 0x%08X (%s)",
+                                         f, (unsigned)vres, ngx_result_name(vres));
+                                mgpu::diag::error(line);
+                            }
+                        }
+                        barrier(s.nl, sr_c, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        if (g_ran)
+                        {
+                            barrier(s.nl, s.vr_depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            if (s.vr_mv != nullptr)
+                                barrier(s.nl, s.vr_mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        }
+                        vr_mark(s, cut ? 17u : 16u);
+                        vr_done = (vres == NVSDK_NGX_Result_Success);
+                    }
+                }
+                if (s.ev_ok && s.ev_count > 0u)
+                    s.nl->ResolveQueryData(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                           s.ev_count + 1u, s.evread, 0);
                 s.nr_first = false;
                 // P6.4: `passes` can change between frames now, so the final
                 // texture is recomputed here rather than fixed at arm time.
@@ -18979,18 +20552,24 @@ void stream_poll()
                     s.sr_params->Set(NVSDK_NGX_Parameter_Color,  s.sr_nrout);
                     s.sr_params->Set(NVSDK_NGX_Parameter_Output, s.tex_out);
                     s.sr_params->Set(NVSDK_NGX_Parameter_Depth,  s.sr_depth);
-                    s.sr_params->Set(NVSDK_NGX_Parameter_MotionVectors,
-                                     (s.mvec_mode != 0 && s.tex_mvec_r[ii] != nullptr)
-                                         ? s.tex_mvec_r[ii] : nullptr);
+                    // R217: SRVectors. off (default): as shipped. multiply: the
+                    // scale times the game frames elapsed. chain: the chained
+                    // field, when this frame was chained.
+                    ID3D12Resource *sr_mv = (s.mvec_mode != 0 && s.tex_mvec_r[ii] != nullptr)
+                                              ? s.tex_mvec_r[ii] : nullptr;
+                    float sr_k = 1.0f;
+                    if (s.cv_sr == 2u && cv_ran)  sr_mv = s.cv_out;
+                    else if (s.cv_sr == 1u)       sr_k = mv_el_frame;
+                    s.sr_params->Set(NVSDK_NGX_Parameter_MotionVectors, sr_mv);
                     // The vectors are already at R, so the scale is the game's
                     // own and not a ratio between two extents.
                     // The game's scale, corrected by R/mvec. At SRScale=0 the two
                     // extents are equal, the factors are 1.0, and this is
                     // byte-identical to what shipped before.
                     s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_X,
-                                     s.mvec_scale_x * s.sr_mv_fix_x);
+                                     s.mvec_scale_x * s.sr_mv_fix_x * sr_k);   // R217: x1 = shipped
                     s.sr_params->Set(NVSDK_NGX_Parameter_MV_Scale_Y,
-                                     s.mvec_scale_y * s.sr_mv_fix_y);
+                                     s.mvec_scale_y * s.sr_mv_fix_y * sr_k);
                     // JITTER IS ZERO, AND THAT IS CORRECT HERE - but read the
                     // consequence. The frame we hand SR has already been
                     // resolved by the GAME'S DLSS and tone mapped; it carries
@@ -19035,6 +20614,10 @@ void stream_poll()
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
 
+                if (cv_ran)   // R217: back to its resting state
+                    barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                ID3D12Resource *const vr_keep = s.nr_final;   // R216
                 if (final_pass_ok)
                 {
                     // C2-SR writes the display-extent result into tex_out
@@ -19042,7 +20625,12 @@ void stream_poll()
                     // tex_out directly rather than the ping-pong winner.
                     s.nr_final = s.sr_ready
                                    ? s.tex_out
-                                   : ((s.passes % 2u == 1u) ? s.tex_out : s.tex_pong);
+                                   : ((npass % 2u == 1u) ? s.tex_out : s.tex_pong);   // R217: npass
+                    // R216: crop shows vr_full. If SR did not write it this
+                    // frame, the previous frame stays on screen.
+                    if (vr_c)
+                        s.nr_final = vr_done ? s.vr_full
+                                             : ((vr_keep != nullptr) ? vr_keep : s.nr_final);
                 }
                 else
                 {
@@ -19475,6 +21063,76 @@ void stream_poll()
                                       "with it on, so the min-to-mean spread here is the model's "
                                       "own variance rather than contention from the present.");
             mgpu::diag::info(line);
+
+            // R214: one line, each evaluate's own time (EvalTimes=1).
+            if (s.ev_ok)
+            {
+                static const char *const rn[stream_state::EV_ROLES] = {
+                    "pass 1", "pass 1 centre", "pass 1 strip L", "pass 1 strip R",
+                    "pass 1 window L", "pass 1 window R", "pass 2",
+                    "pass 2 centre", "pass 2 strip L", "pass 2 strip R",     // R215
+                    "shrink", "pass 1 small", "stretch", "pass 1 crop", "pass 2 crop",
+                    "cut box", "SR window", "SR cut",                         // R216
+                    "chain" };                                                // R217
+                char el[2000];
+                int w = snprintf(el, sizeof el,
+                                 "[MGPU][R214] PER-EVALUATE GPU TIME on GPU 1, ms (each from the "
+                                 "mark before it to the mark after it; a span includes the "
+                                 "barriers and the pass-2 copy recorded before that evaluate)");
+                // R216: the scale mode's steps are marked the same way.
+                for (unsigned ri = 0; ri < stream_state::EV_ROLES; ++ri)
+                {
+                    if (s.ev_n[ri] == 0 || w <= 0 || (size_t)w >= sizeof el) continue;
+                    w += snprintf(el + w, sizeof el - (size_t)w,
+                                  " | %s n=%llu mean=%.3f min=%.3f max=%.3f", rn[ri], s.ev_n[ri],
+                                  s.ev_sum[ri] / (double)s.ev_n[ri], s.ev_min[ri], s.ev_max[ri]);
+                }
+                mgpu::diag::info(el);
+            }
+
+            // R217: one line when a late-frame vector mode was set.
+            if (s.cv_nr != 0u || s.cv_sr != 0u)
+            {
+                char cl[520];
+                snprintf(cl, sizeof cl,
+                         "[MGPU][R217] LATE-FRAME VECTORS: NR %s, SR %s | late frames=%llu, "
+                         "chained=%llu | fell back: more than %u skipped=%llu, slot too close "
+                         "to the producer=%llu, slot not this frame's or no vectors=%llu. A "
+                         "frame that fell back used the defaults: NR multiply, SR as given.",
+                         (s.cv_nr == 1u) ? "chain" : "multiply",
+                         (s.cv_sr == 2u) ? "chain" : ((s.cv_sr == 1u) ? "multiply" : "off"),
+                         s.cv_late, s.cv_built, stream_state::CV_MAX, s.cv_fb_far,
+                         s.cv_fb_old, s.cv_fb_slot);
+                mgpu::diag::info(cl);
+            }
+
+            // R218: the camera switch, when crop ran.
+            if (s.vr_mode == 1u)
+            {
+                char sl2[360];
+                snprintf(sl2, sizeof sl2,
+                         "[MGPU][R218] CAMERA SWITCH: frames cropped=%llu, whole frame=%llu | "
+                         "switches by key=%llu, automatic=%llu (CropAuto=%u).",
+                         s.vr_fr_crop, s.vr_fr_full, s.vr_sw_key, s.vr_sw_auto,
+                         s.vr_auto ? 1u : 0u);
+                mgpu::diag::info(sl2);
+            }
+
+            // R216: one line when a scale mode ran.
+            if (s.vr_mode != 0u)
+            {
+                char vl[400];
+                snprintf(vl, sizeof vl,
+                         "[MGPU][R216] SCALE MODE: %s, ScaleStep=%u%% per side (%ux%u)%s%s. "
+                         "SR evaluates %llu, failed %llu.",
+                         (s.vr_mode == 1u) ? "crop" : "whole", s.vr_pct, s.vr_w, s.vr_h,
+                         (s.vr_mode == 1u) ? ", CropUpscale=" : "",
+                         (s.vr_mode != 1u) ? ""
+                             : ((s.vr_up == 1u) ? "srwindow"
+                                                : ((s.vr_up == 2u) ? "srcut" : "stretch")),
+                         s.vr_sr_evals, s.vr_sr_fails);
+                mgpu::diag::info(vl);
+            }
 
             // D5. Printed as its own line because P2.2 is already at the edge
             // of its buffer, and because this answers a different question:

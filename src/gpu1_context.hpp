@@ -445,6 +445,20 @@ struct ui_state
     // draw a verdict from it - backlog_mean is the verdict.
     int  reflex_was = -1, reflex_now = -1;   // -1 unknown, 0 off, 1 on
     bool reflex_applied = false;             // SetSleepMode returned 0
+
+    // ---- R219: crop, as mgpu.ini said it at arm ----
+    // The panel compares its own choice with these to decide whether to say
+    // "restart". Read at arm, before any rule turns the mode off, so a rule
+    // (SRUpscale on, no vectors) does not show up as a pending restart.
+    unsigned crop_ini_mode = 0;   // 0 off, 1 crop, 2 whole
+    bool     crop_ini_auto = true;
+    // False until the neural stage has read them this arm (it is created a
+    // few frames after arm, and not at all with Neural=0 or a failed NGX).
+    bool     crop_ini_ok = false;
+    // R219-2: the 16-bit colour path as the last arm read it, for the same
+    // restart line. n16_ini_ok false until the neural stage has read it.
+    bool     n16_ini_ok = false, n16_ini_on = false;
+    float    n16_ini_power = 2.2f;
 };
 void ui_read(ui_state &out);
 
@@ -583,6 +597,16 @@ bool ui_ini_write(const char *key, int value);
 // the two disagree until the next launch, and that difference is the whole
 // point of showing it.
 int ui_ini_read(const char *key, int dflt);
+
+// R219. ScaleMode and CropAuto as the file has them, parsed exactly as the arm
+// does (ScaleMode crop|whole or 1|2; CropAuto 0|off|false turns it off).
+// ScaleMode is a word in the file, so it cannot go through ui_ini_read. Reads
+// the file on every call: the panel calls it once and keeps the result.
+void ui_ini_read_crop(unsigned &mode, bool &crop_auto);
+
+// R219-2. A decimal key, written with two decimals by the same line-anchored
+// writer as ui_ini_write.
+bool ui_ini_write_float(const char *key, float value);
 
 // ---- V46: THE INSTALL LAYOUT, AND IT IS NOT A COSMETIC WARNING ----
 //

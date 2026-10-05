@@ -62,8 +62,8 @@
 // a wrong name, on the one line whose entire job is to stop a report
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
-// R210 diagnostic build: the R141 line must say which build wrote the log.
-#define MGPU_VERSION_STR "0.2.5-dev-r210"
+// R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
+#define MGPU_VERSION_STR "0.3.0-discovery-lat"
 
 
 // ---- P6.4: the overlay panel ----
@@ -103,6 +103,9 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "nr16.hpp"       // R219-2: the panel reads the 16-bit keys with nr16's reader
+#include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
+#include "latency_probe.hpp"  // D1.5a (0.3.0 R&D): read-only latency probe, off unless LatencyProbe=1
 #include "calibrator.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
@@ -199,6 +202,10 @@ static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long r
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // D1: the discovery map. Off (one load) unless Discovery=1.
+    if (swapchain != nullptr)
+        mgpu::discovery::on_swapchain(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), true, resize);
     // The only place the bridge thread is started - see the note above
     // on_init_device. This event fires on the real render device, after
     // the probe cycles are over, so the thread is never alive inside an
@@ -251,6 +258,12 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                     const LUID sl = sd12->GetAdapterLuid();
                     sc_is_game = (sl.LowPart == ssel.game_luid.LowPart &&
                                   sl.HighPart == ssel.game_luid.HighPart);
+                    // D1.5a: the latency probe takes the game's device and chain
+                    // only here, where the chain is proved by LUID to be the
+                    // game's. Off (one ini read, then one load) unless LatencyProbe=1.
+                    if (sc_is_game)
+                        mgpu::latprobe::note_game_chain(
+                            sd12, reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
                 }
             }
             const reshade::api::resource bb = swapchain->get_back_buffer(0);
@@ -831,6 +844,112 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         mgpu::gpu1::ui_set_neural(neural);
     ImGui::SameLine();
     ImGui::TextDisabled(st.nr_ok ? "(running)" : "(transport only)");
+
+    // ---- R219: EXPERIMENTAL SETTINGS (operator, 2026-10-04) ----
+    //
+    // Behind a toggle that is off by default, so it is clear these are not
+    // something to bother with yet. Crop: Off | On (crop, the key switches it
+    // and the whole frame) | Auto crop (CropAuto=1: whole frame while the game
+    // has no motion vectors, which is also why it does not work with the
+    // game's frame generation). Written to mgpu.ini and read at arm, so before
+    // arm it applies to this session and after arm on the next launch. The
+    // size (ScaleStep) and the key (CropKey) stay in mgpu.ini.
+    {
+        static bool show_exp = false;
+        static bool crop_loaded = false;
+        static unsigned want_mode = 0u;
+        static bool want_auto = true;
+        if (!crop_loaded)
+        {
+            crop_loaded = true;
+            mgpu::gpu1::ui_ini_read_crop(want_mode, want_auto);
+        }
+        ImGui::Checkbox("Experimental settings", &show_exp);
+        if (show_exp)
+        {
+            ImGui::SeparatorText("Crop");
+            // R216 turns crop off at arm whenever super resolution is on: the file
+            // asks for it (only 1 turns it on, as the reader has it) and, once the
+            // stream runs, it actually started - arm can refuse it (Passes above
+            // 1, Subrect), and then crop runs.
+            const bool sr_ini = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) == 1) &&
+                                (!st.armed || st.sr_on);
+            // ScaleMode=whole set by hand selects no radio.
+            int crop_i = (want_mode == 0u) ? 0 : ((want_mode == 1u) ? (want_auto ? 2 : 1) : -1);
+            ImGui::BeginDisabled(sr_ini);
+            if (ImGui::RadioButton("Off##crop", &crop_i, 0))
+            {
+                // The panel follows the file: it changes only when the write lands.
+                if (mgpu::gpu1::ui_ini_write("ScaleMode", 0)) want_mode = 0u;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("On##crop", &crop_i, 1))
+            {
+                if (mgpu::gpu1::ui_ini_write("CropAuto", 0))
+                {
+                    want_auto = false;
+                    if (mgpu::gpu1::ui_ini_write("ScaleMode", 1)) want_mode = 1u;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Auto crop##crop", &crop_i, 2))
+            {
+                if (mgpu::gpu1::ui_ini_write("CropAuto", 1))
+                {
+                    want_auto = true;
+                    if (mgpu::gpu1::ui_ini_write("ScaleMode", 1)) want_mode = 1u;
+                }
+            }
+            ImGui::TextDisabled("Auto crop does not work with frame generation.");
+            ImGui::EndDisabled();
+            // R165's rule: the restart line only while the file differs from
+            // what this session armed with.
+            if (sr_ini)
+                ImGui::TextDisabled("Crop runs with DLSS Super Resolution on GPU 1 off.");
+            else if (st.armed && st.crop_ini_ok && (want_mode != st.crop_ini_mode ||
+                                  (want_mode == 1u && want_auto != st.crop_ini_auto)))
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Restart the game once to apply.");
+
+            // ---- R219-2: 16-bit colour (R208, NRInput16 / NRInput16Power) ----
+            // Read at arm like crop. nr16 is on only for NRInput16=4 and takes a
+            // power of 1.0-3.0, else 2.2. The slider writes when it is let go,
+            // not on every frame of the drag.
+            static bool n16_loaded = false;
+            static bool want_n16 = false;
+            static float want_pw = 2.2f, file_pw = 2.2f;
+            if (!n16_loaded)
+            {
+                n16_loaded = true;
+                // nr16's own reader, so the panel parses exactly what arm will.
+                mgpu::nr16::ini_file_values(want_n16, file_pw);
+                want_pw = file_pw;
+            }
+            ImGui::SeparatorText("16-bit colour");
+            bool n16 = want_n16;
+            if (ImGui::Checkbox("16-bit colour", &n16))
+            {
+                if (mgpu::gpu1::ui_ini_write("NRInput16", n16 ? 4 : 0)) want_n16 = n16;
+            }
+            ImGui::BeginDisabled(!want_n16);
+            // AlwaysClamp: a CTRL+click typed value stays in nr16's 1.0-3.0.
+            ImGui::SliderFloat("power##n16", &want_pw, 1.0f, 3.0f, "%.2f",
+                               ImGuiSliderFlags_AlwaysClamp);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                if (mgpu::gpu1::ui_ini_write_float("NRInput16Power", want_pw)) file_pw = want_pw;
+                else want_pw = file_pw;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Runs with x1, Super Resolution off and crop off.");
+            if (st.armed && st.n16_ini_ok &&
+                (want_n16 != st.n16_ini_on ||
+                 (want_n16 && (file_pw - st.n16_ini_power > 0.005f ||
+                               st.n16_ini_power - file_pw > 0.005f))))
+                ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                                   "Restart the game once to apply.");
+        }
+    }
 
     // ---- Intensity ----
     ImGui::SeparatorText("Intensity");
@@ -2196,6 +2315,14 @@ static void on_present(reshade::api::command_queue *queue,
                        const reshade::api::rect *, const reshade::api::rect *,
                        uint32_t, const reshade::api::rect *)
 {
+    // D1: the discovery map counts presents per chain. Off (one load) unless Discovery=1.
+    if (swapchain != nullptr)
+        mgpu::discovery::on_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    // D1.5a: the latency probe samples on the game chain. Off (one load) unless LatencyProbe=1.
+    if (swapchain != nullptr)
+        mgpu::latprobe::on_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
     if (queue == nullptr) return;
     mgpu::gpu1::stream_on_present(
         reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
@@ -2703,6 +2830,20 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                                      reshade::api::resource_usage::shader_resource);
 }
 
+// D1: the discovery map sees a chain go away (resize, or the game recreating
+// it when frame generation is switched). Off (one load) unless Discovery=1.
+static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+    if (swapchain != nullptr)
+        mgpu::discovery::on_swapchain(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), false, resize);
+    // D1.5a: the latency probe stops using the device when the game chain goes. Off (one load)
+    // unless LatencyProbe=1.
+    if (swapchain != nullptr)
+        mgpu::latprobe::on_chain_destroyed(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+}
+
 // T3 instrumentation: in a clean run, no destroy_device with the game's
 // LUID appears while the game is running (acceptance). Every line carries
 // the device's LUID, so a removal names whose device it was. When the
@@ -2794,6 +2935,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         }
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         // T3: device lifecycle instrumentation + teardown trigger.
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         // P1.5: capture one real frame. Registered last because it is the only
@@ -2899,6 +3041,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // restoring them leaves every one of those slots aimed at unmapped
         // memory, and the next GetProcAddress anywhere in the process walks
         // into it. This is what stopped Dragon Sword launching.
+        // D1: the same for the discovery map's NvAPI thunks. A no-op unless
+        // Discovery=1 installed them.
+        mgpu::discovery::uninstall();
         mgpu::calibrator::uninstall();
         reshade::unregister_addon(hModule);
         break;
