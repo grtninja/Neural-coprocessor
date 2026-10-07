@@ -8211,6 +8211,7 @@ namespace
         unsigned long long rw_skipped = 0;  // frames skipped BY the window
         unsigned rw_hist[7] = {};           // how long each depth was held
         unsigned long long produced = 0;   // frames recorded into the game's list
+        unsigned long long gsignaled = 0;  // last value actually signalled on gfence
 
         // ---- L1: WHERE THE 62 ms ACTUALLY IS ----
         //
@@ -10232,13 +10233,23 @@ namespace
         // a leak, which is the same reasoning R26 states a few lines up. Two
         // seconds is longer than any frame this project has measured and
         // shorter than the TDR it is trying to avoid.
-        if (s.nfence != nullptr && s.produced != 0
-            && s.nfence->GetCompletedValue() < (UINT64)s.produced)
+        //
+        // gfence, not nfence: nfence is released a few lines above, so testing
+        // it here meant this drain never ran. gfence is the same fence on the
+        // game's side and is still alive.
+        //
+        // The target is the last value actually SIGNALLED, not `produced`: the
+        // newest frame is only signalled at the next event, so at teardown it
+        // usually never is, and waiting for `produced` would sit out the full
+        // two seconds on a normal exit.
+        const unsigned long long drain_to = s.gsignaled;
+        if (s.gfence != nullptr && drain_to != 0
+            && s.gfence->GetCompletedValue() < (UINT64)drain_to)
         {
             HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (dev0 != nullptr)
             {
-                if (SUCCEEDED(s.nfence->SetEventOnCompletion((UINT64)s.produced, dev0)))
+                if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)drain_to, dev0)))
                 {
                     if (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0)
                         mgpu::diag::warn(
@@ -15820,7 +15831,8 @@ void stream_on_present(void *cmd_queue_v)
     ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
     if (gq == nullptr) return;
 
-    (void)gq->Signal(s.gfence, s.produced);
+    if (SUCCEEDED(gq->Signal(s.gfence, s.produced)))
+        s.gsignaled = s.produced;
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -17238,8 +17250,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // L3: at SignalAt=1 the signal is issued from the PRESENT event
         // instead, one event earlier, which is a whole frame earlier. See
         // stream_on_present.
-        if (s.signal_at == 0u)
-            (void)gq->Signal(s.gfence, s.produced);
+        if (s.signal_at == 0u && SUCCEEDED(gq->Signal(s.gfence, s.produced)))
+            s.gsignaled = s.produced;
     }
 
     if (s.produced >= s.max_frames)
