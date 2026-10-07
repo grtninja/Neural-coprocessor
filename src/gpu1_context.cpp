@@ -1963,6 +1963,21 @@ namespace
         const NVSDK_NGX_FeatureCommonInfo *InFeatureInfo,
         NVSDK_NGX_Version InSDKVersion);
 
+    // THE CORE'S Init TAKES FOUR ARGUMENTS. The five-argument form above is the
+    // one an application sees when it links the SDK's own library; the driver's
+    // _nvngx.dll export is the NGX_SNIPPET_BUILD form in nvsdk_ngx.h:
+    //   NVSDK_NGX_D3D12_Init(AppId, DataPath, Device, NVSDK_NGX_Version)
+    // Disassembled (driver 617.14), it compares the 4th argument (r9d) with
+    // 0x15 - "jle ok", else FAIL_OutOfDate - and never reads a 5th. Called
+    // through ngx_pf_init, r9 held the address of the FeatureCommonInfo: its
+    // low 32 bits, read as a SIGNED int, are <= 0x15 only when bit 31 is set,
+    // which ASLR decides per process. That is the intermittent FAIL_OutOfDate.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_core)(
+        unsigned long long InApplicationId,
+        const wchar_t *InApplicationDataPath,
+        ID3D12Device *InDevice,
+        NVSDK_NGX_Version InSDKVersion);
+
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_ext)(
         unsigned long long InApplicationId,
         const wchar_t *InApplicationDataPath,
@@ -2755,7 +2770,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     char w_init[48]{}, w_init_ext[48]{}, w_caps[48]{}, w_create[48]{};
     char w_release[48]{}, w_destroy[48]{}, w_shutdown[48]{}, w_evaluate[48]{};
 
-    ngx_pf_init            p_init     = (ngx_pf_init)           ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
+    ngx_pf_init_core       p_init     = (ngx_pf_init_core)      ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
     ngx_pf_init_ext        p_init_ext = (ngx_pf_init_ext)       ngx_resolve(mods, "NVSDK_NGX_D3D12_Init_Ext",                ngx_prefer::core,    w_init_ext, sizeof w_init_ext);
     ngx_pf_get_cap_params  p_caps     = (ngx_pf_get_cap_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w_caps,     sizeof w_caps);
     ngx_pf_destroy_params  p_destroy  = (ngx_pf_destroy_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_DestroyParameters",       ngx_prefer::core,    w_destroy,  sizeof w_destroy);
@@ -3147,8 +3162,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         if (p_init != nullptr)
         {
             which = "Init";
-            callback_installed = true;
-            r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
+            // The core's Init has no FeatureCommonInfo parameter, so the log
+            // callback in `common` cannot be handed over here.
+            callback_installed = false;
+            r = p_init(0ULL, data_path, dev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
         }
         else
         {
@@ -11818,7 +11835,7 @@ namespace
         }
 
         char w[9][160] = {};
-        ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        ngx_pf_init_core      p_init  = (ngx_pf_init_core)     ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
         ngx_pf_get_cap_params p_caps  = (ngx_pf_get_cap_params)ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w[1], sizeof w[1]);
         ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
         ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
@@ -11872,7 +11889,7 @@ namespace
         common.LoggingInfo.LoggingCallback = ngx_log_callback;
         common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
         common.LoggingInfo.DisableOtherLoggingSinks = false;
-        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
+        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
                  (unsigned)r, ngx_result_name(r));
         mgpu::diag::info(line);
