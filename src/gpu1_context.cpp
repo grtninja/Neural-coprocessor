@@ -1963,6 +1963,21 @@ namespace
         const NVSDK_NGX_FeatureCommonInfo *InFeatureInfo,
         NVSDK_NGX_Version InSDKVersion);
 
+    // THE CORE'S Init TAKES FOUR ARGUMENTS. The five-argument form above is the
+    // one an application sees when it links the SDK's own library; the driver's
+    // _nvngx.dll export is the NGX_SNIPPET_BUILD form in nvsdk_ngx.h:
+    //   NVSDK_NGX_D3D12_Init(AppId, DataPath, Device, NVSDK_NGX_Version)
+    // Disassembled (driver 617.14), it compares the 4th argument (r9d) with
+    // 0x15 - "jle ok", else FAIL_OutOfDate - and never reads a 5th. Called
+    // through ngx_pf_init, r9 held the address of the FeatureCommonInfo: its
+    // low 32 bits, read as a SIGNED int, are <= 0x15 only when bit 31 is set,
+    // which ASLR decides per process. That is the intermittent FAIL_OutOfDate.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_core)(
+        unsigned long long InApplicationId,
+        const wchar_t *InApplicationDataPath,
+        ID3D12Device *InDevice,
+        NVSDK_NGX_Version InSDKVersion);
+
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_ext)(
         unsigned long long InApplicationId,
         const wchar_t *InApplicationDataPath,
@@ -2755,7 +2770,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     char w_init[48]{}, w_init_ext[48]{}, w_caps[48]{}, w_create[48]{};
     char w_release[48]{}, w_destroy[48]{}, w_shutdown[48]{}, w_evaluate[48]{};
 
-    ngx_pf_init            p_init     = (ngx_pf_init)           ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
+    ngx_pf_init_core       p_init     = (ngx_pf_init_core)      ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
     ngx_pf_init_ext        p_init_ext = (ngx_pf_init_ext)       ngx_resolve(mods, "NVSDK_NGX_D3D12_Init_Ext",                ngx_prefer::core,    w_init_ext, sizeof w_init_ext);
     ngx_pf_get_cap_params  p_caps     = (ngx_pf_get_cap_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w_caps,     sizeof w_caps);
     ngx_pf_destroy_params  p_destroy  = (ngx_pf_destroy_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_DestroyParameters",       ngx_prefer::core,    w_destroy,  sizeof w_destroy);
@@ -3147,8 +3162,10 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         if (p_init != nullptr)
         {
             which = "Init";
-            callback_installed = true;
-            r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
+            // The core's Init has no FeatureCommonInfo parameter, so the log
+            // callback in `common` cannot be handed over here.
+            callback_installed = false;
+            r = p_init(0ULL, data_path, dev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
         }
         else
         {
@@ -8211,6 +8228,7 @@ namespace
         unsigned long long rw_skipped = 0;  // frames skipped BY the window
         unsigned rw_hist[7] = {};           // how long each depth was held
         unsigned long long produced = 0;   // frames recorded into the game's list
+        unsigned long long gsignaled = 0;  // last value actually signalled on gfence
 
         // ---- L1: WHERE THE 62 ms ACTUALLY IS ----
         //
@@ -10232,13 +10250,23 @@ namespace
         // a leak, which is the same reasoning R26 states a few lines up. Two
         // seconds is longer than any frame this project has measured and
         // shorter than the TDR it is trying to avoid.
-        if (s.nfence != nullptr && s.produced != 0
-            && s.nfence->GetCompletedValue() < (UINT64)s.produced)
+        //
+        // gfence, not nfence: nfence is released a few lines above, so testing
+        // it here meant this drain never ran. gfence is the same fence on the
+        // game's side and is still alive.
+        //
+        // The target is the last value actually SIGNALLED, not `produced`: the
+        // newest frame is only signalled at the next event, so at teardown it
+        // usually never is, and waiting for `produced` would sit out the full
+        // two seconds on a normal exit.
+        const unsigned long long drain_to = s.gsignaled;
+        if (s.gfence != nullptr && drain_to != 0
+            && s.gfence->GetCompletedValue() < (UINT64)drain_to)
         {
             HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (dev0 != nullptr)
             {
-                if (SUCCEEDED(s.nfence->SetEventOnCompletion((UINT64)s.produced, dev0)))
+                if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)drain_to, dev0)))
                 {
                     if (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0)
                         mgpu::diag::warn(
@@ -11807,7 +11835,7 @@ namespace
         }
 
         char w[9][160] = {};
-        ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        ngx_pf_init_core      p_init  = (ngx_pf_init_core)     ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
         ngx_pf_get_cap_params p_caps  = (ngx_pf_get_cap_params)ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w[1], sizeof w[1]);
         ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
         ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
@@ -11861,7 +11889,7 @@ namespace
         common.LoggingInfo.LoggingCallback = ngx_log_callback;
         common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
         common.LoggingInfo.DisableOtherLoggingSinks = false;
-        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, &common, NVSDK_NGX_Version_API);
+        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
         snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
                  (unsigned)r, ngx_result_name(r));
         mgpu::diag::info(line);
@@ -15820,7 +15848,8 @@ void stream_on_present(void *cmd_queue_v)
     ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
     if (gq == nullptr) return;
 
-    (void)gq->Signal(s.gfence, s.produced);
+    if (SUCCEEDED(gq->Signal(s.gfence, s.produced)))
+        s.gsignaled = s.produced;
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -17238,8 +17267,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // L3: at SignalAt=1 the signal is issued from the PRESENT event
         // instead, one event earlier, which is a whole frame earlier. See
         // stream_on_present.
-        if (s.signal_at == 0u)
-            (void)gq->Signal(s.gfence, s.produced);
+        if (s.signal_at == 0u && SUCCEEDED(gq->Signal(s.gfence, s.produced)))
+            s.gsignaled = s.produced;
     }
 
     if (s.produced >= s.max_frames)
