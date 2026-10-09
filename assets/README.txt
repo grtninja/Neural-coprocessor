@@ -52,6 +52,12 @@ mgpu.ini, change that one key by hand.
 MvecFromEval and CalibRung. The commentary in the shipped file is the current
 one.
 
+0.3.0 adds DirectX 11 support, switched on by DX11=1 in mgpu.ini. An edited
+mgpu.ini from an earlier version does not have that key: add DX11=1 by hand,
+or take the new file. One display (DcompOverlay=1) is the default since 0.3.0,
+also when the key is absent. An mgpu.ini that says DcompOverlay=0 keeps the
+bridge's own window.
+
 WHAT YOU NEED FIRST
 -------------------
 
@@ -90,23 +96,26 @@ already seen two independent NGX consumers sharing one parameter block produce
 a visibly wrong image while every transport counter stayed clean. One neural
 path at a time.
 
-A DISPLAY ARRANGEMENT. TWO WORK, AND YOU PICK BY YOUR HARDWARE.
+A DISPLAY ARRANGEMENT. ONE DISPLAY IS THE DEFAULT SINCE 0.3.0.
 
-TWO MONITORS, ONE ON EACH CARD. Everything published about this project was
-measured this way. The neural output is displayed by the card that produced
-it, so nothing travels back across the link. With both monitors on the render
-card, the same build measured 33% lower throughput and roughly double the
-latency on the development machine.
-
-ONE MONITOR, ON THE NEURAL CARD. Set DcompOverlay=1 in mgpu.ini. The bridge
-then creates no window at all and draws the neural output onto the game's own
-window instead. The game keeps the mouse and the keyboard, so no controller
-and no third-party tool are needed.
+ONE MONITOR, ON THE NEURAL CARD. DcompOverlay=1 is set in mgpu.ini. The
+bridge creates no window at all and draws the neural output onto the game's
+own window instead. The game keeps the mouse and the keyboard, so no
+controller and no third-party tool are needed.
 
 The display goes on the NEURAL card - the second card, the one the bridge
 presents from - and the card that RENDERS the game has nothing plugged into
 it. That is the arrangement this mode is built for, and the add-on refuses it
 if it finds more than one active display.
+
+MORE THAN ONE DISPLAY. Set DcompMultiDisplay=1 in mgpu.ini.
+
+TWO MONITORS, ONE ON EACH CARD, WITH THE BRIDGE'S OWN WINDOW. Set
+DcompOverlay=0. Everything published about this project was measured this
+way. The neural output is displayed by the card that produced it, so nothing
+travels back across the link. With both monitors on the render card, the same
+build measured 33% lower throughput and roughly double the latency on the
+development machine.
 
 OPEN THE RESHADE OVERLAY AS NORMAL AND THE NEURAL OUTPUT STEPS ASIDE BY
 ITSELF. It is drawn on top of the game's window, including on top of the
@@ -120,15 +129,16 @@ the recommended way:
 
     https://github.com/maohgad-web/Neural-coprocessor/tree/main/workarounds/single-display
 
-A DIRECTX 12 GAME. D3D11 AND VULKAN TITLES DO NOTHING - the add-on loads,
-finds no D3D12 render device, stands down, and says so in the log and in the
-ReShade overlay panel. There is no bridge window on those titles: no D3D12
-device means no window at all, which is why the message is in the panel. Some
-Unity titles can be forced with -force-d3d12.
+A DIRECTX 12 OR DIRECTX 11 GAME. DirectX 11 is supported since 0.3.0 and
+is on by default (DX11=1 in mgpu.ini). On some games DirectX 12 is still
+better, because the game runs the full NGX suite and the add-on gets the
+correct motion vectors. Some Unity titles can be forced to DirectX 12 with
+-force-d3d12.
 
-This is a limit of this add-on, not of DLSS Neural Rendering itself, which
-NVIDIA documents against Vulkan. Everything here is built on ReShade's D3D12
-path.
+VULKAN TITLES DO NOTHING - the add-on loads, finds no D3D12 render device,
+stands down, and says so in the log and in the ReShade overlay panel. This is
+a limit of this add-on, not of DLSS Neural Rendering itself, which NVIDIA
+documents against Vulkan.
 
 NOTHING FROM NVIDIA IS INCLUDED HERE, AND NONE OF IT MAY BE. The two NGX
 modules do not arrive the same way:
@@ -529,13 +539,18 @@ badly, on a machine that was also failing on ordinary settings changes, so
 nothing is established either way. It is not recommended and it has not been
 characterised.
 
+Some games with frame generation on can crash at startup, when the bridge
+arms itself. Workaround: set AutoArm=0 in mgpu.ini, get into gameplay, and
+press CTRL+ALT+F10 to arm by hand.
+
 WASHED OR FLAT COLOUR? Open the panel (Home over the bridge window) and take
 the "tone" slider down - 0.00 fixed it on the development rig, and yours may
 differ. Colour handling is not implemented in this add-on and on one of the
 two titles tested the output comes back washed; the cause is not established.
 Motion vectors for UI and HUD elements are also still missing.
 
-THE BRIDGE WINDOW SHOULD OPEN ON THE SECOND MONITOR BY ITSELF. If it opens on
+WITH DcompOverlay=0, THE BRIDGE WINDOW SHOULD OPEN ON THE SECOND MONITOR BY
+ITSELF. If it opens on
 the game's display instead, set Monitor= in mgpu.ini and check the
 [MGPU][P7.10] line in ReShade.log - it names which monitor it chose and how.
 Earlier builds always opened on the game's display and had to be dragged once
