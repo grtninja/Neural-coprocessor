@@ -61,7 +61,7 @@ results that had accumulated in it are in `history/RECORD.md`.
 
 | Directory | Contents |
 | --- | --- |
-| `src/` | the add\-on sources |
+| `src/` | the add\-on sources \- see the module table below |
 | `assets/` | what the artifact is built from, plus `README.txt` |
 | `.github/` | `workflows/build.yml` (CI and packaging), `FUNDING.yml` |
 | `tests/` | adapter selection and ini parser tests, and the script that runs them |
@@ -70,6 +70,38 @@ results that had accumulated in it are in `history/RECORD.md`.
 | `reference/` | a sample `ReShade.ini` and a complete `ReShade.log` |
 | `history/` | the working record \- see below |
 | `workarounds/` | unsupported arrangements that worked here. Not part of the add\-on |
+
+### `src/` \- the modules
+
+One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1.
+
+| Module | What it is |
+| --- | --- |
+| `dllmain.cpp/.hpp` | ReShade entry: registration, the event callbacks, the overlay panel |
+| `worker.cpp/.hpp` | the bridge thread: everything on GPU 1 is created, used and destroyed here |
+| `gpu1_context.cpp/.hpp` | GPU 1: the private D3D12 device, the stream, ring and seals, NR / SR, the arm |
+| `adapter.cpp/.hpp` | adapter enumeration and selection |
+| `adapter_selection.cpp/.hpp` | the pure adapter\-choice policy (tested in `tests/`) |
+| `mgpu_ini_parser.hpp` | bounded `mgpu.ini` parser primitives (header only, tested in `tests/`) |
+| `diag.cpp/.hpp` | structured logging, the `[MGPU]` prefix |
+| `log_queue.cpp/.hpp` | log lines leave the game's present thread through this queue |
+| `probe.cpp/.hpp` | the lateral acquisition probe: depth and velocity binds |
+| `calibrator.cpp/.hpp` | the NGX calibrator: the game's DLSS create and evaluate, D3D12 and D3D11 |
+| `sl_probe.cpp/.hpp` | the Streamline interposer probe |
+| `sl_tags.cpp/.hpp` | the Streamline tag tap |
+| `screen.cpp/.hpp` | the idle and status screen (E2xx codes) |
+| `nr16.cpp/.hpp` | FP16 input path (experimental, off by default) |
+| `dx11_probe.cpp/.hpp` | DirectX 11: the transport\-hop probe |
+| `dx11_producer.cpp/.hpp` | DirectX 11: the producer that feeds the D3D12 stream |
+| `mvec_census.cpp/.hpp` | the motion\-vector census and tap (no NGX contract; D3D11 first, R253) |
+| `mvec_extract.cpp/.hpp` | the virtual velocity target for D3D12 titles without an NGX contract |
+| `tex_census.cpp/.hpp` | screen\-sized texture census (instrument, one key) |
+| `fg_map.cpp/.hpp` | the frame\-generation vector map |
+| `own_reflex.cpp/.hpp` | own Reflex for titles where the game does not run it |
+| `latency_probe.cpp/.hpp` | read\-only latency probe |
+| `journal.cpp/.hpp` | what the add\-on did to the game's subsystems, when and why |
+| `stall_watch.cpp/.hpp` | the stall watch (`StallWatch`) |
+| `discovery.cpp/.hpp` | the discovery calibrator (R&D scouting path) |
 
 ### `history/` \- the working record
 

@@ -85,6 +85,8 @@ Also in 0.2.0:
 
 **0.3.0** - DirectX 11 support, motion vectors for games without DLSS, single display as the default mode, multi display support, and the launcher. See New in 0.3.0.
 
+**0.3.1** - improves the input vector selector to support more setups and systems.
+
 * * *
 
 ## Performance Results
@@ -268,12 +270,17 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `DcompOverlay=1` | Draws the neural output onto the game's own window instead of opening one. The default since 0.3.0. `0` opens the bridge's own window - see Display setup |
 | `DcompMultiDisplay` | Absent by default. `1` for more than one display - see Display setup. New in 0.3.0 |
 | `DX11=1` | DirectX 11 support. On by default. New in 0.3.0 |
+| `NgxProbeAfterScene` | Absent by default, which means `1`: the add-on starts its DLSS 5 after the game's own DLSS is running. `0` starts it at the game's first frame, as in 0.3.0. New in 0.3.1 |
+| `DepthHoldMax` | Absent by default, which means 180 seconds: how long the bridge waits for the game's depth while the game's DLSS is running, before it starts without depth. `0` waits without a limit. New in 0.3.1 |
+| `NRFrameFilter=0` | The frame-generation vector filter, in the panel's Experimental settings. Off in the shipped file since 0.3.1 |
 | `SFPath` | Absent by default, and absent is not off: the detector runs, the repair does not, and the add-on sets `1` itself if it sees the fault. `0` stops that. New in 0.2.5 |
 | `Frames=0` | Stop after this many frames. `0` runs until you quit. A bounded run is what prints a summary |
 
 Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after editing it.** The same applies to changing resolution or DLSS mode in the game's own settings while the bridge is running.
 
 **Troubleshooting Note:** If output appears washed out, reduce the `tone` parameter in the panel (default `0.00` on development machine).
+
+**Reading latency.** `lat=` on a `[MGPU][SEAL] new` line in `ReShade.log` is one frame, logged every 61st frame. The panel's `submit-to-consume` is the mean of the same measure over the whole run. The panel's `ready-to-consume` is a different measure. The three numbers do not have to match.
 
 * * *
 
@@ -304,7 +311,7 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 - **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6 (0.2.2): 96-98% of frames with DLSS or DLAA, none with TAA. Since 0.3.0 the add-on also finds the game's own motion vectors on games without DLSS, tested on Resident Evil 4 (2023).
 - **DLAA sends more data than DLSS.** It renders at native, so depth and motion vectors cross the link at full resolution.
 - **No resolution/DLSS changes while armed** (requires swapchain rebuild)
-- **Frame generation:** Untested and not recommended
+- **Frame generation:** Untested and not recommended. Some games with frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
 - **No Vulkan support.** DirectX 12 and DirectX 11 only. Some Unity titles can be forced to D3D12, optional since 0.3.0 - see Forcing D3D12 on Unity titles
