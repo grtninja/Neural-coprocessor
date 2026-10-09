@@ -20,11 +20,13 @@
 // D3D12 side is GPU work only: Wait(fence), execute, Signal(gfence) by the
 // producer at the next event, as on D3D12.
 //
-// WHAT IT DOES NOT DO IN THIS BUILD. Real vectors (MVec=3): the probe's bind
-// hook and the calibrator's NGX tap are D3D12 in this build, so the module
-// tells the stream to treat MVec=3 as the synthetic field (MVec=1) with a
-// warning. Own Reflex: not wired to the D3D11 device yet. Both are the next
-// items; neither blocks NR on screen.
+// REAL VECTORS (MVec=3). When the producer is built, the module tells the
+// stream that no real vectors are known yet (R227): an arm that comes before
+// any vectors uses the synthetic field (MVec=1) with a warning, for that run.
+// The game's vectors reach on_mvec from the calibrator's D3D11 evaluate tap
+// (R232) and from the census tap (R254, MVecTap); the first one clears R227
+// (stream_note_real_vectors) and MVec=3 stays as requested. Own Reflex: not
+// wired to the D3D11 device yet; it does not block NR on screen.
 //
 // GATES. (1) dllmain calls in only from a D3D11 game device/swap chain
 // (get_api() == d3d11); the D3D12 path never reaches this file, and init

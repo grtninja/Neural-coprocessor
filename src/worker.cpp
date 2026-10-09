@@ -876,6 +876,7 @@ namespace
                             mgpu::diag::info("[MGPU][R246] NgxProbeAtStart=1: the NGX probe runs now, "
                                              "before the present loop (the pre-R246 place).");
                             (void)mgpu::gpu1::ngx_probe(1280, 720);
+                            mgpu::gpu1::note_ngx_probe_ran();   // R290
                             if (mgpu::gpu1::ngx_probe_init_was_outofdate())
                             {
                                 ngx_retry_pending = true; ngx_retry_n = 0;
@@ -1179,11 +1180,15 @@ namespace
                         r282_state = mgpu::gpu1::ngx_probe_scene_hold_decide(why, sizeof why) ? 1 : 2;
                         mgpu::diag::info(why);
                     }
-                    if (r282_state == 1 && mgpu::gpu1::ngx_probe_scene_seen())
+                    // R290: the depth hold's fallback also releases it (it fires only once
+                    // the game's DLSS has been seen).
+                    if (r282_state == 1 && (mgpu::gpu1::ngx_probe_scene_seen() || mgpu::gpu1::depth_fallback_requested()))
                     {
                         r282_state = 3;
-                        snprintf(line, sizeof line, "[MGPU][R282] probe released %llu ms after the present chain: "
-                                                    "the game's first DLSS evaluate was seen.", waited);
+                        const bool seen = mgpu::gpu1::ngx_probe_scene_seen();
+                        snprintf(line, sizeof line, "[MGPU][R282] probe released %llu ms after the present chain: %s", waited,
+                                 seen ? "the game's first DLSS evaluate was seen."
+                                      : "R290 - the game's DLSS was seen and the depth hold reached DepthHoldMax.");
                         mgpu::diag::info(line);
                     }
                     const bool ready = shipped_ready && r282_state != 1;
@@ -1233,6 +1238,7 @@ namespace
                                  gf, waited, (gf == 0ull) ? " - BOUND reached, the game has rendered nothing yet" : "");
                         mgpu::diag::info(line);
                         (void)mgpu::gpu1::ngx_probe(1280, 720);
+                        mgpu::gpu1::note_ngx_probe_ran();   // R290
                         if (mgpu::gpu1::ngx_probe_init_was_outofdate())
                         {
                             ngx_retry_pending = true; ngx_retry_n = 0;

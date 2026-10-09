@@ -377,6 +377,12 @@ bool ngx_probe_at_start();                  // NgxProbeAtStart=1 (default 0: def
 void note_game_d3d12();                     // R282: dllmain, the LUID-proved D3D12 game chain
 bool ngx_probe_scene_hold_decide(char *why, size_t n);   // R282: once; true = hold the probe for the game's scene
 bool ngx_probe_scene_seen();                // R282: the game's first DLSS evaluate has been read (lock-free)
+void depth_fallback_request();              // R290: the depth hold reached DepthHoldMax with evidence (game thread)
+bool depth_fallback_requested();            // R290: read by the worker's probe block
+void note_ngx_probe_ran();                  // R290: the startup or a manual probe ran
+bool ngx_probe_ran();                       // R290: the fallback arm follows the probe
+unsigned long long own_route_copies();      // R289: transport copies not made by the R277 tap, counted directly (lock-free)
+int  own_route_delivered();                 // R289: 0 none, 1 evaluate route (R280o), 2 the game's own route on a D3D12 contract title
 
 // R247. RELOAD-AND-RETRY AFTER A REFUSED FIRST INIT, ON A NO-CONTRACT TITLE.
 // A first Init that returns FAIL_OutOfDate decides for the process: a second
