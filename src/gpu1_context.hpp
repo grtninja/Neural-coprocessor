@@ -47,6 +47,10 @@ namespace mgpu::gpu1
     // mgpu.ini DcompOverlay=1. Read at present-chain creation and at window
     // creation, nowhere else.
     bool dcomp_overlay_mode();
+    bool dcomp_overlay_undecided();                  // R273b: the detection has no definitive input yet
+    bool dcomp_overlay_mode_settled(unsigned timeout_ms);   // R273b: bridge thread - wait for it, bounded, then decide
+    // R242: DcompForceWindowed (absent = 1). See dllmain's create_swapchain / set_fullscreen_state.
+    bool dcomp_force_windowed();
     // V55. Pushed from worker.cpp at T4: does the BRIDGE adapter drive any
     // display? Also starts the hint clock.
     void note_bridge_headless(bool headless);
@@ -109,6 +113,17 @@ namespace mgpu::gpu1
     // sticky once removed (brief section 09), so the caller logs only on the
     // transition away from S_OK.
     bool device_removed_reason(HRESULT &out);
+
+    // R267: the build string for mgpu\last_launch.ini; dllmain sets it once at load.
+    void set_build_string(const char *s);
+
+    // R261 (DEBUG, OwnReflexDevice=gpu1|both only). The one exception to the
+    // rule above: an AddRef'd IUnknown reference to our GPU 1 device, taken
+    // under this file's lock, so own_reflex can make NvAPI_D3D_* calls on it
+    // for the latency comparison Marcelo asked for (2026-10-06 22:22). The
+    // caller owns the reference and releases it at its teardown; it never
+    // casts it to ID3D12Device. Returns false when no device exists.
+    bool device_ref_for_reflex(void **out);
 
     // ---- T5: the present chain (brief section 06) ----
     //
@@ -322,6 +337,66 @@ int monitor_index();
 // the graphics menu - leaves the consumer bound to an arrangement that is about
 // to be replaced.
 unsigned autoarm_frames();
+
+// R246. THE STARTUP NGX PROBE IS DEFERRED UNTIL THE GAME HAS RENDERED.
+//
+// Skyrim SE (SK-6..SK-14): the add-on's first NGX Init - P1.0c, on the bridge
+// thread ~1 s into the process, right after the present chain and before the
+// present loop - returns FAIL_OutOfDate on some launches and Success on others
+// with every input identical (R245 trace: same nvapi sequence, same DRS
+// answers, same statuses up to the fork). Every launch that passed had the
+// game further along at that moment (Options first, launcher from the folder,
+// alt-tab at launch); every launch that failed had the game still in its own
+// startup. A failed first Init decides for the process: P4.1 at arm, and a
+// manual arm minutes later (AutoArm=0), fail the same way. Requiem shows the
+// same shape on the same module. So the first Init must not happen in that
+// window. The probe now runs from the present loop once the game has delivered
+// its first finish_effects frame - the game's own progress, not a constant -
+// bounded by NGX_PROBE_DEFER_MAX_MS so a title that never reaches that event
+// still gets its probe. NgxProbeAtStart=1 in mgpu.ini restores the old place.
+unsigned long long game_effects_frames();   // finish_effects events seen, armed or not
+void set_mvec_eligible_count(unsigned n);   // R278: probe's eligible velocity candidates, via dllmain
+void set_mvec_extract_active(bool on);     // R280c: mvec_extract's virtual target exists (units uv by construction; no verdict keys on that path)
+int  mvec_extract_edge_request();         // R280e: which write edge of the source the module should hold (0 = last of the frame, 1 = first) - the judge decides
+void set_mvec_extract_edges(unsigned n);  // R280e: the module reports the last frame's write-edge count
+void set_mvec_extract_deciding(bool on); // R280j: armed, no source yet, candidates being written - the arm's hold does not count these frames (bounded by the module's give-up)
+// R280k: a contract title = the game's NGX Init was seen OR the calibrator holds the game's
+// own NGX table (DW-R1: Dawnwalker's Init never reaches the hook, its table does). Lock-free.
+bool game_contract_seen();
+// R280o. dllmain brackets the R277 tap with this (game render thread): a
+// motion-vector copy made inside the bracket, on that thread, is a TAP copy and
+// is counted apart, so R118's "the barrier route produced zero copies" is not
+// defeated by the tap's own copies (SF-R1). Thread-local: barrier-route copies
+// on the engine's recording threads and evaluate-route copies are never tagged.
+void tap_copy_scope(bool on);
+int mvec_tap_live();   // R278b: tap mode the first-launch learning turned on (0 = none)
+void set_mvec_neighbours(int cur, int next_same, int next_class);   // R278f: from probe, via dllmain
+int mvec_candidate_request();   // R278f: the learning's live switch (-1 = none)
+bool stream_producing();   // R278f-r: the stream has sealed a frame (lock-free)
+bool ngx_probe_at_start();                  // NgxProbeAtStart=1 (default 0: deferred)
+void note_game_d3d12();                     // R282: dllmain, the LUID-proved D3D12 game chain
+bool ngx_probe_scene_hold_decide(char *why, size_t n);   // R282: once; true = hold the probe for the game's scene
+bool ngx_probe_scene_seen();                // R282: the game's first DLSS evaluate has been read (lock-free)
+
+// R247. RELOAD-AND-RETRY AFTER A REFUSED FIRST INIT, ON A NO-CONTRACT TITLE.
+// A first Init that returns FAIL_OutOfDate decides for the process: a second
+// Init on another device (P4.1), or minutes later by hand, answers the same
+// (SK-6..SK-15). On a title with no NGX contract the core is ours (R240 loaded
+// it) and the snippet is the private instance, so the refused state can be
+// dropped with them: FreeLibrary both, let the locator load them again, Init
+// again. worker.cpp drives it: up to NGX_RETRY_MAX tries, spaced by the game's
+// own frames. ngx_reload_for_retry reports what it freed and whether the
+// modules actually left the process. A core the game owns is never freed.
+bool ngx_probe_init_was_outofdate();
+bool ngx_reload_for_retry(char *why, size_t why_n);
+
+// R248. How many OTHER processes with this executable's name are alive (a
+// previous session still tearing down), and the first one's pid. Marcelo's
+// reliable repro for the refused Init ends "close, then Steam Play": the new
+// process makes its first NGX Init while the old one is still exiting. The
+// worker logs this at every Init and, when one is present, waits (bounded)
+// for it to leave before the Init.
+unsigned other_instances_of_this_exe(unsigned long *first_pid);
 
 // ---- P6.4: what the overlay panel reads and writes ----
 //
@@ -717,6 +792,14 @@ void ui_set_game_fx_absent(bool absent);
 // Reads Fault= from mgpu.ini beside the add-on - absent means no fault, so the
 // shipped default is a clean run and a missing file is never an error.
 void stream_request();
+
+// R227 (DX11 producer). Real vectors (MVec=3) need the bind hook or the NGX
+// tap, both D3D12 in this build. The producer says so once; stream_request
+// then treats MVec=3 as the synthetic field (MVec=1) and logs it, instead of
+// holding the arm forever for a lane that cannot deliver.
+void stream_note_no_real_vectors(const char *why);
+// R232: the producer saw real vectors (D3D11 DLSS evaluate tapped) - clears the above.
+void stream_note_real_vectors();
 
 // GAME thread, every frame, with the game's command list open. Filters by
 // adapter LUID; signals the previous frame's fence value before recording the

@@ -18,6 +18,16 @@
 //     bUseMarkersToOptimize @12. NvBool is one byte.
 //   NV_GET_SLEEP_STATUS_PARAMS_V1, 136 bytes: bLowLatencyMode @4,
 //     fgMultiplier @14 (the gpu1_context layout names it fg_multiplier).
+// D1-M (2026-10-05), the frame markers, from nvapi_interface.h and nvapi.h in
+// dlss5\0.3.0 POTENTIAL\nvapi-main:
+//   0xD9984C05             NvAPI_D3D_SetLatencyMarker (IUnknown *dev, params *)
+//   0x13C98F73             NvAPI_D3D12_SetAsyncFrameMarker (ID3D12CommandQueue *, params *)
+//   NV_LATENCY_MARKER_PARAMS_V1, 88 bytes: version @0, frameID @8 (NvU64),
+//     markerType @16 (enum, 4 bytes). NV_ASYNC_FRAME_MARKER_PARAMS_V1, 88
+//     bytes: the same two, plus presentFrameID @24.
+//   Marker types: 0 SIMULATION_START, 1 SIMULATION_END, 2 RENDERSUBMIT_START,
+//     3 RENDERSUBMIT_END, 4 PRESENT_START, 5 PRESENT_END, 6 INPUT_SAMPLE,
+//     7 TRIGGER_FLASH, 8 PC_LATENCY_PING, 9-12 OUT_OF_BAND_*.
 // No field is read past the size the caller's own version word declares.
 //
 // WHAT IT CANNOT SEE. A caller that resolves a function and keeps it only in a
@@ -37,6 +47,7 @@
 
 #include "discovery.hpp"
 #include "diag.hpp"
+#include "journal.hpp"   // D2.0: every write into another module is journaled (Journal=1)
 #include "mgpu_ini_parser.hpp"
 
 #pragma intrinsic(_ReturnAddress)
@@ -53,6 +64,8 @@ constexpr unsigned ID_SET_SLEEP  = 0xAC1CA9E0u;
 constexpr unsigned ID_GET_STATUS = 0xAEF96CA1u;
 constexpr unsigned ID_SLEEP      = 0x852CD1D2u;
 constexpr unsigned ID_LATENCY    = 0x1A587F9Cu;
+constexpr unsigned ID_MARKER     = 0xD9984C05u;   // D1-M: SetLatencyMarker
+constexpr unsigned ID_AMARKER    = 0x13C98F73u;   // D1-M: D3D12_SetAsyncFrameMarker
 
 typedef void *(__cdecl *pf_qi)(unsigned int);
 typedef int   (__cdecl *pf_dev_p)(IUnknown *, void *);
@@ -64,6 +77,8 @@ pf_dev_p g_real_set   = nullptr;
 pf_dev_p g_real_get   = nullptr;
 pf_dev   g_real_sleep = nullptr;
 pf_dev_p g_real_lat   = nullptr;
+pf_dev_p g_real_mark  = nullptr;   // D1-M (the queue of the async one is an IUnknown too)
+pf_dev_p g_real_amark = nullptr;   // D1-M
 HMODULE  g_nvapi      = nullptr;
 HMODULE  g_self       = nullptr;
 
@@ -92,7 +107,7 @@ std::atomic<unsigned long long> g_presents_all{0};
 std::atomic<unsigned> g_chain_inits{0};
 
 // ---- callers, by module ----
-enum kind { K_SET = 0, K_SLEEP, K_GET, K_LAT, K_QI, K_KINDS };
+enum kind { K_SET = 0, K_SLEEP, K_GET, K_LAT, K_QI, K_MARK, K_AMARK, K_KINDS };
 constexpr unsigned CALLERS = 12u;
 struct caller_ent
 {
@@ -200,10 +215,19 @@ __declspec(noinline) int __cdecl th_set(IUnknown *dev, void *p)
 
 std::atomic<void *> g_last_sleep_dev{nullptr};
 
+// R284: defined with the D1-S event ring further down; th_sleep feeds it.
+void ev_put(unsigned what, unsigned type, unsigned long long fid, unsigned long long pfid, long long qpc);
+
 __declspec(noinline) int __cdecl th_sleep(IUnknown *dev)
 {
     void *ra = _ReturnAddress();
+    // R284: the call itself goes into the D1-S event stream - when it starts,
+    // how long it blocks, on which thread - beside the markers and presents,
+    // so a burst shows where the game's own Reflex sleeps in its frame.
+    LARGE_INTEGER c0{}; QueryPerformanceCounter(&c0);
     const int r = (g_real_sleep != nullptr) ? g_real_sleep(dev) : -1;
+    LARGE_INTEGER c1{}; QueryPerformanceCounter(&c1);
+    ev_put(3u, 0u, 0ull, (unsigned long long)(c1.QuadPart - c0.QuadPart), c0.QuadPart);   // R284
     const HMODULE m = module_of(ra);
     const bool first = count_call(m, K_SLEEP);
     void *was_dev = g_last_sleep_dev.exchange((void *)dev, std::memory_order_relaxed);
@@ -269,6 +293,261 @@ __declspec(noinline) int __cdecl th_lat(IUnknown *dev, void *p)
     return r;
 }
 
+// ---- D1-M: the frame markers ----
+//
+// What it answers: WHO sends the frame markers the driver's latency reports
+// are built from (L1: reports full with frame gen off and nobody sleeping),
+// which marker types, and WHERE each sits in the frame on OUR clock (QPC),
+// beside our own present stamps. Read only: the arguments go to the driver
+// untouched, the QPC is taken before the call.
+constexpr unsigned MTYPES = 16u;                 // types 0..12 used; 15 = out of range
+std::atomic<unsigned long long> g_mtype[2][MTYPES];       // [sync/async][type], whole run
+std::atomic<unsigned long long> g_mtype_win[2][MTYPES];   // value at the last window line
+
+// One frame of markers, keyed by frameID. A slot is claimed by the first
+// marker of a new frameID (CAS on fid); later markers of that frame fill
+// their type's QPC. Two rings: sync markers and async markers.
+constexpr unsigned MRING = 8u;
+struct mframe
+{
+    std::atomic<unsigned long long> fid{0};
+    std::atomic<long long> q[MTYPES];
+    std::atomic<void *> mod{nullptr};            // module of the last marker in this frame
+    std::atomic<unsigned long long> pfid{0};     // async only: presentFrameID of the last one
+};
+mframe g_mring[2][MRING];
+std::atomic<unsigned long long> g_mnewest[2];   // newest frameID seen
+
+// Present ring for the trace line: QPC and chain slot of the last presents.
+constexpr unsigned PRING = 16u;
+struct pent
+{
+    std::atomic<unsigned long long> n{0};
+    std::atomic<long long> qpc{0};
+    std::atomic<unsigned> chain{0};
+};
+pent g_pring[PRING];
+
+// ---- D1-S: one ordered event stream (2026-10-05) ----
+//
+// Why: M3 showed async OUT_OF_BAND_PRESENT markers firing once per PRESENTED
+// frame (generated included), but the per-frameID ring keeps only the last
+// marker of each type, so it cannot say which of the two presents of a
+// frame-gen pair each marker belongs to. This ring keeps EVERY marker call
+// and every present in arrival order, with QPC, frameID, presentFrameID and
+// thread, and dumps a burst of 96 consecutive events every 10 s (30 bursts).
+// Read only, like the rest: it records what passes through the thunks.
+constexpr unsigned ERING = 512u;
+struct evt
+{
+    std::atomic<unsigned long long> seq{0};      // 1-based; 0 = being written
+    std::atomic<long long> qpc{0};
+    std::atomic<unsigned long long> fid{0};
+    std::atomic<unsigned long long> pfid{0};
+    std::atomic<unsigned> what{0};               // 0 present, 1 sync marker, 2 async marker, 3 Sleep (R284: pfid = QPC ticks inside)
+    std::atomic<unsigned> type{0};               // marker type, or the chain slot for a present
+    std::atomic<unsigned> tid{0};
+};
+evt g_ering[ERING];
+std::atomic<unsigned long long> g_eseq{0};
+
+void ev_put(unsigned what, unsigned type, unsigned long long fid, unsigned long long pfid, long long qpc)
+{
+    const unsigned long long n = g_eseq.fetch_add(1, std::memory_order_acq_rel) + 1ull;
+    evt &e = g_ering[(n - 1ull) % ERING];
+    e.seq.store(0ull, std::memory_order_release);
+    e.qpc.store(qpc, std::memory_order_release);
+    e.fid.store(fid, std::memory_order_release);
+    e.pfid.store(pfid, std::memory_order_release);
+    e.what.store(what, std::memory_order_release);
+    e.type.store(type, std::memory_order_release);
+    e.tid.store((unsigned)GetCurrentThreadId(), std::memory_order_release);
+    e.seq.store(n, std::memory_order_release);
+}
+
+// First (module, kind, type) seen, logged once each.
+constexpr unsigned MSEEN = 128u;
+std::atomic<unsigned long long> g_mseen[MSEEN];
+std::atomic<unsigned> g_mseen_n{0};
+bool mseen_first(unsigned long long key)
+{
+    const unsigned n = g_mseen_n.load(std::memory_order_acquire);
+    for (unsigned i = 0; i < n && i < MSEEN; ++i)
+        if (g_mseen[i].load(std::memory_order_relaxed) == key) return false;
+    const unsigned slot = g_mseen_n.fetch_add(1, std::memory_order_acq_rel);
+    if (slot >= MSEEN) return false;
+    g_mseen[slot].store(key, std::memory_order_release);
+    return true;   // a racing duplicate can log twice; harmless
+}
+
+void note_marker(int async, void *ra, const void *p, long long qpc_now, int r)
+{
+    unsigned long long fid = 0, pfid = 0;
+    unsigned type = MTYPES - 1u;
+    if (p != nullptr)
+    {
+        const unsigned char *b = (const unsigned char *)p;
+        unsigned ver = 0; memcpy(&ver, b, 4);
+        const unsigned size = ver & 0xFFFFu;
+        if (size >= 16u) memcpy(&fid, b + 8, 8);
+        if (size >= 20u) { unsigned t = 0; memcpy(&t, b + 16, 4); type = t < MTYPES - 1u ? t : MTYPES - 1u; }
+        if (async && size >= 32u) memcpy(&pfid, b + 24, 8);
+    }
+    ev_put(async ? 2u : 1u, type, fid, pfid, qpc_now);   // D1-S
+    const HMODULE m = module_of(ra);
+    const int ci = caller_index(m);
+    if (ci >= 0) g_callers[ci].n[async ? K_AMARK : K_MARK].fetch_add(1, std::memory_order_relaxed);
+    g_mtype[async][type].fetch_add(1, std::memory_order_relaxed);
+
+    mframe &f = g_mring[async][fid % MRING];
+    unsigned long long cur = f.fid.load(std::memory_order_acquire);
+    if (cur != fid)
+    {
+        if (cur < fid && f.fid.compare_exchange_strong(cur, fid, std::memory_order_acq_rel))
+            for (unsigned k = 0; k < MTYPES; ++k) f.q[k].store(0, std::memory_order_relaxed);
+    }
+    if (f.fid.load(std::memory_order_acquire) == fid)
+    {
+        f.q[type].store(qpc_now, std::memory_order_release);
+        f.mod.store((void *)m, std::memory_order_relaxed);
+        if (async) f.pfid.store(pfid, std::memory_order_relaxed);
+    }
+    unsigned long long nw = g_mnewest[async].load(std::memory_order_relaxed);
+    while (fid > nw && !g_mnewest[async].compare_exchange_weak(nw, fid, std::memory_order_relaxed)) {}
+
+    const unsigned long long key = ((unsigned long long)(async ? 2u : 1u) << 60) |
+                                   ((unsigned long long)type << 48) | (unsigned)(ci + 1);
+    if (mseen_first(key) && line_budget())
+    {
+        char mn[96]; mod_name(m, mn, sizeof mn);
+        char l[300];
+        snprintf(l, sizeof l, "[MGPU][DSC] %s t=%.2fs P=%llu by %s type=%u frameID=%llu%s -> %d | FIRST "
+                 "of this type from this module",
+                 async ? "SetAsyncFrameMarker" : "SetLatencyMarker", now_s(),
+                 g_presents_all.load(std::memory_order_relaxed), mn, type, fid,
+                 async ? " (async)" : "", r);
+        mgpu::diag::info(l);
+    }
+}
+
+__declspec(noinline) int __cdecl th_mark(IUnknown *dev, void *p)
+{
+    void *ra = _ReturnAddress();
+    LARGE_INTEGER c{}; QueryPerformanceCounter(&c);
+    const int r = (g_real_mark != nullptr) ? g_real_mark(dev, p) : -1;
+    note_marker(0, ra, p, c.QuadPart, r);
+    return r;
+}
+
+__declspec(noinline) int __cdecl th_amark(IUnknown *queue, void *p)
+{
+    void *ra = _ReturnAddress();
+    LARGE_INTEGER c{}; QueryPerformanceCounter(&c);
+    const int r = (g_real_amark != nullptr) ? g_real_amark(queue, p) : -1;
+    note_marker(1, ra, p, c.QuadPart, r);
+    return r;
+}
+
+// Every 2 s (60 lines), then every 10 s, 150 at most: one complete frame of
+// markers (two frames behind the newest, so it is finished) with each type's
+// QPC, and our last presents with their chain slot. 0 = type not seen.
+std::atomic<long long> g_next_trace_qpc{0};
+std::atomic<unsigned> g_traces{0};
+std::atomic<bool> g_tracing{false};
+std::atomic<long long> g_next_burst_qpc{0};   // D1-S
+void trace_line(int async)
+{
+    const unsigned long long nw = g_mnewest[async].load(std::memory_order_relaxed);
+    if (nw < 3ull) return;
+    const unsigned long long want = nw - 2ull;
+    const mframe &f = g_mring[async][want % MRING];
+    if (f.fid.load(std::memory_order_acquire) != want) return;
+    long long q[MTYPES];
+    for (unsigned k = 0; k < MTYPES; ++k) q[k] = f.q[k].load(std::memory_order_acquire);
+    if (f.fid.load(std::memory_order_acquire) != want) return;   // reused while reading
+    char mn[96]; mod_name((HMODULE)f.mod.load(std::memory_order_relaxed), mn, sizeof mn);
+    char l[1400];
+    int w = snprintf(l, sizeof l, "[MGPU][DSC] marker frame%s t=%.2fs id=%llu by %s | QPC: simStart=%lld "
+                     "simEnd=%lld rsStart=%lld rsEnd=%lld presentStart=%lld presentEnd=%lld "
+                     "inputSample=%lld",
+                     async ? " (async)" : "", now_s(), want, mn, q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+    for (unsigned k = 7; k < MTYPES && w > 0 && w < (int)sizeof l - 40; ++k)
+        if (q[k] != 0) w += snprintf(l + w, sizeof l - (size_t)w, " type%u=%lld", k, q[k]);
+    if (async && w > 0 && w < (int)sizeof l - 40)
+        w += snprintf(l + w, sizeof l - (size_t)w, " presentFrameID=%llu",
+                      f.pfid.load(std::memory_order_relaxed));
+    if (w > 0 && w < (int)sizeof l - 40)
+        w += snprintf(l + w, sizeof l - (size_t)w, " | our presents (P:QPC:chain slot):");
+    const unsigned long long top = g_presents_all.load(std::memory_order_acquire);
+    const unsigned long long n = top < PRING ? top : PRING;
+    for (unsigned long long k = top - n; k < top && w > 0 && w < (int)sizeof l - 40; ++k)
+    {
+        const pent &e = g_pring[k % PRING];
+        const unsigned long long n1 = e.n.load(std::memory_order_acquire);
+        const long long qq = e.qpc.load(std::memory_order_acquire);
+        const unsigned ch = e.chain.load(std::memory_order_acquire);
+        const unsigned long long n2 = e.n.load(std::memory_order_acquire);
+        if (n1 != k + 1ull || n2 != n1) continue;
+        w += snprintf(l + w, sizeof l - (size_t)w, " %llu:%lld:%u", n1, qq, ch);
+    }
+    mgpu::diag::info(l);
+}
+
+// D1-S: the last 96 events in order (about five rendered frames with frame gen x2), 12 per line. Format per event:
+//   P<slot>@<qpc>            our present on that chain slot (0 = first chain)
+//   S<type>#<fid>@<qpc>      SetLatencyMarker
+//   A<type>#<fid>/<pfid>@<qpc>  SetAsyncFrameMarker (pfid = presentFrameID)
+//   Z@<qpc>+<us>us           NvAPI_D3D_Sleep (R284): when it was entered, how long it blocked
+//   a " t<id>" suffix when the thread differs from the previous event.
+// An event being rewritten while read is skipped and counted.
+std::atomic<unsigned> g_bursts{0};
+void burst_lines()
+{
+    const unsigned bn = g_bursts.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const unsigned long long top = g_eseq.load(std::memory_order_acquire);
+    if (top < 96ull) return;
+    const unsigned long long from = top - 96ull + 1ull;
+    unsigned prev_tid = 0, skipped = 0;
+    char l[1400];
+    int w = 0;
+    unsigned in_line = 0, line_no = 0;
+    for (unsigned long long k = from; k <= top; ++k)
+    {
+        const evt &e = g_ering[(k - 1ull) % ERING];
+        const unsigned long long s1 = e.seq.load(std::memory_order_acquire);
+        const long long q = e.qpc.load(std::memory_order_acquire);
+        const unsigned long long fid = e.fid.load(std::memory_order_acquire);
+        const unsigned long long pfid = e.pfid.load(std::memory_order_acquire);
+        const unsigned what = e.what.load(std::memory_order_acquire);
+        const unsigned type = e.type.load(std::memory_order_acquire);
+        const unsigned tid = e.tid.load(std::memory_order_acquire);
+        const unsigned long long s2 = e.seq.load(std::memory_order_acquire);
+        if (s1 != k || s2 != s1) { ++skipped; continue; }
+        if (in_line == 0)
+            w = snprintf(l, sizeof l, "[MGPU][DSC] events b%u.%u t=%.2fs (seq %llu-%llu):", bn, ++line_no,
+                         now_s(), from, top);
+        if (w > 0 && w < (int)sizeof l - 80)
+        {
+            if (what == 0)      w += snprintf(l + w, sizeof l - (size_t)w, " P%u@%lld", type, q);
+            else if (what == 1) w += snprintf(l + w, sizeof l - (size_t)w, " S%u#%llu@%lld", type, fid, q);
+            else if (what == 3) w += snprintf(l + w, sizeof l - (size_t)w, " Z@%lld+%lluus", q,   // R284
+                                              g_freq.QuadPart ? pfid * 1000000ull / (unsigned long long)g_freq.QuadPart : 0ull);
+            else                w += snprintf(l + w, sizeof l - (size_t)w, " A%u#%llu/%llu@%lld", type, fid, pfid, q);
+            if (tid != prev_tid && w > 0 && w < (int)sizeof l - 20)
+                w += snprintf(l + w, sizeof l - (size_t)w, " t%u", tid);
+        }
+        prev_tid = tid;
+        if (++in_line == 12u) { mgpu::diag::info(l); in_line = 0; }
+    }
+    if (in_line != 0) mgpu::diag::info(l);
+    if (skipped != 0)
+    {
+        char m[120];
+        snprintf(m, sizeof m, "[MGPU][DSC] events b%u: %u event(s) skipped (rewritten while read)", bn, skipped);
+        mgpu::diag::info(m);
+    }
+}
+
 // Distinct (id, module) pairs seen through QueryInterface, logged once each.
 constexpr unsigned QI_SEEN = 128u;
 std::atomic<unsigned long long> g_qi_seen[QI_SEEN];   // (id << 32) | module index
@@ -304,7 +583,15 @@ __declspec(noinline) void *__cdecl th_qi(unsigned int id)
         else if (id == ID_SLEEP && r == (void *)g_real_sleep)  { out = (void *)&th_sleep; wrapped = " -> WRAPPED"; }
         else if (id == ID_GET_STATUS && r == (void *)g_real_get) { out = (void *)&th_get; wrapped = " -> WRAPPED"; }
         else if (id == ID_LATENCY && r == (void *)g_real_lat)  { out = (void *)&th_lat;   wrapped = " -> WRAPPED"; }
-        else if ((id == ID_SET_SLEEP || id == ID_SLEEP || id == ID_GET_STATUS || id == ID_LATENCY))
+        else if (id == ID_MARKER && r == (void *)g_real_mark)  { out = (void *)&th_mark;  wrapped = " -> WRAPPED"; }
+        else if (id == ID_AMARKER && r == (void *)g_real_amark) { out = (void *)&th_amark; wrapped = " -> WRAPPED"; }
+        else if (r == (void *)&th_set || r == (void *)&th_sleep || r == (void *)&th_get ||
+                 r == (void *)&th_lat || r == (void *)&th_mark || r == (void *)&th_amark)
+            // D1-M: the driver's own table was swapped by a scan, so the
+            // driver itself handed out our thunk. (Was logged as NOT WRAPPED.)
+            wrapped = " -> ALREADY OUR THUNK (the driver's own table is swapped)";
+        else if ((id == ID_SET_SLEEP || id == ID_SLEEP || id == ID_GET_STATUS || id == ID_LATENCY ||
+                  id == ID_MARKER || id == ID_AMARKER))
             wrapped = " -> NOT WRAPPED: the driver returned a different address than at install";
     }
     if (qi_first(id, ci) && line_budget())
@@ -447,12 +734,17 @@ bool learn_nvapi()
     g_real_sleep = (pf_dev)  q(ID_SLEEP);
     g_real_get   = (pf_dev_p)q(ID_GET_STATUS);
     g_real_lat   = (pf_dev_p)q(ID_LATENCY);
+    mgpu::diag::info("[MGPU][DSC] step 2b/3 (D1-M): QueryInterface for SetLatencyMarker (0xD9984C05) "
+                     "and D3D12_SetAsyncFrameMarker (0x13C98F73)");
+    g_real_mark  = (pf_dev_p)q(ID_MARKER);
+    g_real_amark = (pf_dev_p)q(ID_AMARKER);
     g_real_qi    = q;
     g_nvapi      = m;
     char l[300];
     snprintf(l, sizeof l, "[MGPU][DSC] step 3/3: QueryInterface=%p SetSleepMode=%p Sleep=%p "
-             "GetSleepStatus=%p GetLatency=%p", (void *)q, (void *)g_real_set,
-             (void *)g_real_sleep, (void *)g_real_get, (void *)g_real_lat);
+             "GetSleepStatus=%p GetLatency=%p SetLatencyMarker=%p SetAsyncFrameMarker=%p",
+             (void *)q, (void *)g_real_set, (void *)g_real_sleep, (void *)g_real_get,
+             (void *)g_real_lat, (void *)g_real_mark, (void *)g_real_amark);
     mgpu::diag::info(l);
     return true;
 }
@@ -464,13 +756,15 @@ DWORD WINAPI scan_thread(LPVOID)
         if (!learn_nvapi()) { g_scanning.store(false, std::memory_order_release); return 0; }
         g_installed.store(true, std::memory_order_release);
     }
-    pair_ent pairs[5];
+    pair_ent pairs[7];
     unsigned np = 0;
     if (g_real_qi)    pairs[np++] = { (void *)g_real_qi,    (void *)&th_qi,    "nvapi_QueryInterface" };
     if (g_real_set)   pairs[np++] = { (void *)g_real_set,   (void *)&th_set,   "NvAPI_D3D_SetSleepMode" };
     if (g_real_sleep) pairs[np++] = { (void *)g_real_sleep, (void *)&th_sleep, "NvAPI_D3D_Sleep" };
     if (g_real_get)   pairs[np++] = { (void *)g_real_get,   (void *)&th_get,   "NvAPI_D3D_GetSleepStatus" };
     if (g_real_lat)   pairs[np++] = { (void *)g_real_lat,   (void *)&th_lat,   "NvAPI_D3D_GetLatency" };
+    if (g_real_mark)  pairs[np++] = { (void *)g_real_mark,  (void *)&th_mark,  "NvAPI_D3D_SetLatencyMarker" };
+    if (g_real_amark) pairs[np++] = { (void *)g_real_amark, (void *)&th_amark, "NvAPI_D3D12_SetAsyncFrameMarker" };
 
     const unsigned scan_no = g_scans.fetch_add(1, std::memory_order_relaxed) + 1u;
     const unsigned nm = list_modules();
@@ -491,6 +785,9 @@ DWORD WINAPI scan_thread(LPVOID)
         snprintf(l, sizeof l, "[MGPU][DSC]   swapped %s in %s section %s +0x%X",
                  pairs[g_hits[i].what].name, mn, g_hits[i].section, g_hits[i].rva);
         mgpu::diag::info(l);
+        // D2.0 journal: the write into another module's memory.
+        mgpu::journal::event(l + 12, "Discovery=1: R102 data scan swaps a cached NvAPI pointer for "
+                                     "our logging thunk (calls through unchanged)");
     }
     g_scanning.store(false, std::memory_order_release);
     return 0;
@@ -546,10 +843,25 @@ void window_line()
         if (sum == 0) continue;
         any = true;
         char mn[96]; mod_name((HMODULE)m, mn, sizeof mn);
-        w += snprintf(l + w, sizeof l - (size_t)w, " %s[set=%llu sleep=%llu status=%llu lat=%llu qi=%llu]",
-                      mn, d[K_SET], d[K_SLEEP], d[K_GET], d[K_LAT], d[K_QI]);
+        w += snprintf(l + w, sizeof l - (size_t)w,
+                      " %s[set=%llu sleep=%llu status=%llu lat=%llu qi=%llu mark=%llu amark=%llu]",
+                      mn, d[K_SET], d[K_SLEEP], d[K_GET], d[K_LAT], d[K_QI], d[K_MARK], d[K_AMARK]);
     }
     if (!any) w += snprintf(l + w, sizeof l - (size_t)w, " none");
+    // D1-M: markers this window by type (sync, then async); only non-zero types.
+    for (int a = 0; a < 2 && w < (int)sizeof l - 120; ++a)
+    {
+        bool first_t = true;
+        for (unsigned t = 0; t < MTYPES && w < (int)sizeof l - 40; ++t)
+        {
+            const unsigned long long n = g_mtype[a][t].load(std::memory_order_relaxed);
+            const unsigned long long dlt = n - g_mtype_win[a][t].exchange(n, std::memory_order_relaxed);
+            if (dlt == 0) continue;
+            w += snprintf(l + w, sizeof l - (size_t)w, "%s%u=%llu",
+                          first_t ? (a ? " | async markers by type: " : " | markers by type: ") : " ", t, dlt);
+            first_t = false;
+        }
+    }
     const unsigned long long full = g_callers_full.load(std::memory_order_relaxed);
     if (full != 0 && w < (int)sizeof l - 60)
         snprintf(l + w, sizeof l - (size_t)w, " | %llu call(s) from modules past the table", full);
@@ -618,10 +930,11 @@ void on_present(void *chain)
 
     // Per chain. A chain first seen here rather than at init is said.
     bool found = false;
+    unsigned slot_i = CHAINS;   // D1-M: chain slot for the present ring
     for (unsigned i = 0; i < CHAINS && !found; ++i)
     {
         void *cur = g_chains[i].chain.load(std::memory_order_acquire);
-        if (cur == chain) { g_chains[i].presents.fetch_add(1, std::memory_order_relaxed); found = true; }
+        if (cur == chain) { g_chains[i].presents.fetch_add(1, std::memory_order_relaxed); found = true; slot_i = i; }
         else if (cur == nullptr)
         {
             void *expect = nullptr;
@@ -629,6 +942,7 @@ void on_present(void *chain)
             {
                 g_chains[i].presents.fetch_add(1, std::memory_order_relaxed);
                 found = true;
+                slot_i = i;
                 char l[200];
                 snprintf(l, sizeof l, "[MGPU][DSC] chain %p first seen at present (no init seen) "
                          "t=%.2fs P=%llu", chain, now_s(), all);
@@ -638,6 +952,60 @@ void on_present(void *chain)
             {
                 g_chains[i].presents.fetch_add(1, std::memory_order_relaxed);
                 found = true;
+                slot_i = i;
+            }
+        }
+    }
+
+    // D1-M: our present stamps, same clock as the marker stamps.
+    {
+        pent &e = g_pring[(all - 1ull) % PRING];
+        e.n.store(0ull, std::memory_order_release);
+        e.qpc.store(c.QuadPart, std::memory_order_release);
+        e.chain.store(slot_i, std::memory_order_release);
+        e.n.store(all, std::memory_order_release);
+    }
+    ev_put(0u, slot_i, 0ull, 0ull, c.QuadPart);   // D1-S
+
+    // D1-S: one burst every 10 s after install, 30 at most.
+    if (g_installed.load(std::memory_order_acquire) && g_bursts.load(std::memory_order_relaxed) < 30u)
+    {
+        const long long nb = g_next_burst_qpc.load(std::memory_order_relaxed);
+        if (nb == 0)
+        {
+            long long expect = 0;
+            g_next_burst_qpc.compare_exchange_strong(expect, c.QuadPart + g_freq.QuadPart * 10,
+                                                     std::memory_order_relaxed);
+        }
+        else if (c.QuadPart >= nb)
+        {
+            long long expect = nb;
+            if (g_next_burst_qpc.compare_exchange_strong(expect, c.QuadPart + g_freq.QuadPart * 10,
+                                                         std::memory_order_relaxed) &&
+                !g_tracing.exchange(true, std::memory_order_acquire))
+            {
+                burst_lines();
+                g_tracing.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    // D1-M: the marker frame trace, after install.
+    if (g_installed.load(std::memory_order_acquire) && g_traces.load(std::memory_order_relaxed) < 150u)
+    {
+        const long long nt = g_next_trace_qpc.load(std::memory_order_relaxed);
+        if (c.QuadPart >= nt)
+        {
+            long long expect = nt;
+            const unsigned tn = g_traces.load(std::memory_order_relaxed);
+            if (g_next_trace_qpc.compare_exchange_strong(expect,
+                    c.QuadPart + g_freq.QuadPart * (tn < 60u ? 2 : 10), std::memory_order_relaxed) &&
+                !g_tracing.exchange(true, std::memory_order_acquire))
+            {
+                g_traces.fetch_add(1, std::memory_order_relaxed);
+                trace_line(0);
+                trace_line(1);
+                g_tracing.store(false, std::memory_order_release);
             }
         }
     }
@@ -730,13 +1098,15 @@ void uninstall()
     // already running finishes on its own thread; this does not wait for it
     // (DllMain holds the loader lock).
     g_mode.store(0, std::memory_order_release);
-    pair_ent back[5];
+    pair_ent back[7];
     unsigned np = 0;
     if (g_real_qi)    back[np++] = { (void *)&th_qi,    (void *)g_real_qi,    "nvapi_QueryInterface" };
     if (g_real_set)   back[np++] = { (void *)&th_set,   (void *)g_real_set,   "NvAPI_D3D_SetSleepMode" };
     if (g_real_sleep) back[np++] = { (void *)&th_sleep, (void *)g_real_sleep, "NvAPI_D3D_Sleep" };
     if (g_real_get)   back[np++] = { (void *)&th_get,   (void *)g_real_get,   "NvAPI_D3D_GetSleepStatus" };
     if (g_real_lat)   back[np++] = { (void *)&th_lat,   (void *)g_real_lat,   "NvAPI_D3D_GetLatency" };
+    if (g_real_mark)  back[np++] = { (void *)&th_mark,  (void *)g_real_mark,  "NvAPI_D3D_SetLatencyMarker" };
+    if (g_real_amark) back[np++] = { (void *)&th_amark, (void *)g_real_amark, "NvAPI_D3D12_SetAsyncFrameMarker" };
     // The last scan's module list: no snapshot under the loader lock. A module
     // unloaded since then faults inside scan_module's handler and is skipped.
     g_hit_n = 0;
@@ -747,5 +1117,6 @@ void uninstall()
              "(%llu swapped by the scans; the rest were handed out by QueryInterface).",
              restored, g_hits_total.load(std::memory_order_relaxed));
     mgpu::diag::info(l);
+    mgpu::journal::event_direct(l + 12, "DLL_PROCESS_DETACH: put our thunks back before this image unmaps");
 }
 }   // namespace mgpu::discovery

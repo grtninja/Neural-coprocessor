@@ -36,6 +36,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi.h>   // R241d: IDXGISwapChain::GetFullscreenState
 #include <cstdio>     // P1.6: snprintf. This file had no formatted logging before.
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
 #include <cwchar>     // R142: wcsrchr, to split our own module path for [R142].
@@ -63,7 +64,7 @@
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
 // R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
-#define MGPU_VERSION_STR "0.3.0-discovery-lat"
+#define MGPU_VERSION_STR "0.3.0"
 
 
 // ---- P6.4: the overlay panel ----
@@ -106,6 +107,16 @@
 #include "nr16.hpp"       // R219-2: the panel reads the 16-bit keys with nr16's reader
 #include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
 #include "latency_probe.hpp"  // D1.5a (0.3.0 R&D): read-only latency probe, off unless LatencyProbe=1
+#include "journal.hpp"        // D2.0: what / when / why journal, off unless Journal=1
+#include "stall_watch.hpp"    // D2.0: stall watch, off unless StallWatch=N
+#include "own_reflex.hpp"     // D2.0: our Reflex for case-B titles, off unless OwnReflex=1
+#include "log_queue.hpp"      // D2.0: the log queue (its worker starts only with a D2.0 line)
+#include "fg_map.hpp"         // D2.0 NR step one: read-only frame-gen vector map, off unless NRFrameFilter=1
+#include "dx11_probe.hpp"     // DX11 transport-hop probe, off unless Dx11Probe=1 (DX11_CONTRACT_LEDGER.md)
+#include "dx11_producer.hpp"  // R227: the DX11 producer, off unless DX11=1 (DX11_CONTRACT_LEDGER.md section 7)
+#include "mvec_census.hpp"
+#include "mvec_extract.hpp"   // R280: the virtual velocity target (D3D12, no NGX contract) - own file pair, own keys
+#include "tex_census.hpp"     // R279: TexCensus=1 instrument, off by default (removable)    // R253: what a D3D11 title exposes for vectors, off unless MVecCensus=1 (section 13)
 #include "calibrator.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
@@ -195,13 +206,243 @@ static void on_init_device(reshade::api::device *device)
 //
 // Inert unless MVec=3 and the stream is armed - the check is inside
 // stream_mvec_copy, under the mutex that owns the answer.
+// D2.0: finish_present is subscribed in DllMain with every other event; with
+// OwnReflex off the handler returns after one load. Declared here because
+// on_finish_present is defined beside on_present.
+static void on_finish_present(reshade::api::command_queue *, reshade::api::swapchain *swapchain);
+
 static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long resource)
 {
     mgpu::gpu1::stream_mvec_copy(cmd_list_native, resource);
 }
+// R232: the D3D11 twin - the game's context and its DLSS MotionVectors go to
+// the DX11 producer, which hops them. Inert unless DX11=1 (one load).
+static void mgpu_mvec_transport_hook_d3d11(void *context, unsigned long long resource)
+{
+    mgpu::dx11producer::on_mvec(context, reinterpret_cast<void *>(static_cast<uintptr_t>(resource)));
+}
+
+// R241d. DirectComposition composes through DWM, and DWM does not compose
+// over an exclusive-fullscreen surface: a ROOTED visual shows nothing (Skyrim
+// SK-3: Windowed=FALSE, DISCARD, ALLOW_MODE_SWITCH; NR on screen per the log,
+// nothing visible). Our own IDXGISwapChain query on the game chain, one line.
+static void note_game_fullscreen(reshade::api::swapchain *swapchain, const char *when)
+{
+    if (swapchain == nullptr || !mgpu::gpu1::dcomp_overlay_mode()) return;
+    IDXGISwapChain *sc = reinterpret_cast<IDXGISwapChain *>(static_cast<uintptr_t>(swapchain->get_native()));
+    if (sc == nullptr) return;
+    BOOL fs = FALSE;
+    if (FAILED(sc->GetFullscreenState(&fs, nullptr))) return;
+    char l[640];
+    if (fs)
+    {
+        snprintf(l, sizeof l,
+                 "[MGPU][R241] the game's swap chain is EXCLUSIVE FULLSCREEN (%s). With DcompOverlay=1 the neural "
+                 "output is a GPU 1 surface that reaches the display only through DWM composition; while the game "
+                 "holds the display's direct flip (fullscreen, with or without optimizations) it is NOT shown - it "
+                 "appears only on alt-tab. Set the game to windowed or borderless (Skyrim launcher: Windowed Mode + "
+                 "Borderless), or leave DcompForceWindowed on so the add-on does it (R242).", when);
+        mgpu::diag::error(l);
+    }
+    else
+    {
+        snprintf(l, sizeof l, "[MGPU][R241] the game's swap chain is windowed/borderless (%s): DirectComposition can show over it.", when);
+        mgpu::diag::info(l);
+    }
+}
+// R242. With DcompOverlay=1 on a D3D11 title, the composed output is not
+// shown while the game holds the display's direct flip (fullscreen with
+// optimizations: visible only on alt-tab, SK-3). Our output is a GPU 1
+// surface and reaches a GPU 0 display only through DWM composition, so the
+// game's chain must be windowed: created windowed here, and a later request
+// for fullscreen refused. The game's fullscreen window is already a popup
+// covering the monitor, so windowed in it is borderless - ReShade's own
+// ForceWindowed does the same. D3D12 titles and DcompOverlay=0 are untouched.
+// DcompForceWindowed=0 turns it off. Our own composition chain is D3D12 and
+// never reaches the condition.
+static std::atomic<unsigned> g_force_windowed_n{0};
+static int g_mvec_tap12 = 0;   // R277: MVecTap on a D3D12 game chain, read once at init
+static bool g_r280o_eval_yield = false;   // R280o: the evaluate route has delivered - the tap yields for the session (game render thread only)
+// R273c. The R242 rule under the R273 detection: on a rig with more than one
+// display the composition decision can still be PENDING when the game creates
+// its first D3D11 chain (create_swapchain fires before the chain exists, so
+// before the window and the game's card are known). A chain created exclusive
+// fullscreen there would hold the display's direct flip, and a composition
+// accepted a moment later would show nothing - SK-3's symptom, with no error
+// anywhere. So while the decision is pending the chain is kept windowed as if
+// composition were on; if the decision then refuses, the game simply runs
+// windowed under the own-window mode, which works. Single display: the mode
+// is never pending, so this is R242 exactly as it was.
+static bool force_windowed_active(reshade::api::device_api api)
+{
+    // R277: D3D12 too. RE4 (2026-10-07) asked for exclusive fullscreen every
+    // frame for two minutes; a D3D12 title that KEEPS it hides the composed
+    // output exactly as SK-3 did on D3D11 (the chain holds the direct flip).
+    // Same ReShade events, same mechanism; DcompForceWindowed=0 opts out.
+    // R277c: back to D3D11 only. RE4-4 (mv52): refusing a D3D12 title's
+    // exclusive request left it in a BORDERED window; on its own the game
+    // ended borderless. A D3D12 title that really keeps exclusive still hides
+    // the composition - a known limit until a title shows it.
+    if (api != reshade::api::device_api::d3d11 || !mgpu::gpu1::dcomp_force_windowed()) return false;
+    return mgpu::gpu1::dcomp_overlay_mode() || mgpu::gpu1::dcomp_overlay_undecided();
+}
+static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *)
+{
+    if (!force_windowed_active(api) || !desc.fullscreen_state) return false;
+    desc.fullscreen_state = false;
+    const unsigned n = g_force_windowed_n.fetch_add(1) + 1;
+    char l[360];
+    snprintf(l, sizeof l,
+             "[MGPU][R242] the game asked for an EXCLUSIVE FULLSCREEN D3D11 chain; created WINDOWED instead so the composed "
+             "neural output can show (DcompOverlay=1%s). Its window already covers the monitor: borderless in effect. "
+             "DcompForceWindowed=0 in mgpu.ini leaves the game's mode alone. (%u so far)",
+             mgpu::gpu1::dcomp_overlay_undecided() ? ", composition decision still PENDING - kept windowed so it can show if accepted; if refused the game runs windowed under the own window" : "", n);
+    mgpu::diag::warn(l);
+    return true;
+}
+static bool on_set_fullscreen_state(reshade::api::swapchain *swapchain, bool fullscreen, void *)
+{
+    reshade::api::device *dev = (swapchain != nullptr) ? swapchain->get_device() : nullptr;
+    if (fullscreen && dev != nullptr && force_windowed_active(dev->get_api()))
+    {
+        const unsigned n = g_force_windowed_n.fetch_add(1) + 1;
+        if (n <= 8u || (n % 100u) == 0u)
+        {
+            char l[300];
+            snprintf(l, sizeof l, "[MGPU][R242] the game asked to enter EXCLUSIVE FULLSCREEN (set_fullscreen_state); refused, "
+                                  "the chain stays windowed so the composed output can show. (%u so far)", n);
+            mgpu::diag::warn(l);
+        }
+        return true;   // prevent
+    }
+    // R277: capped like the R242 lines. RE4 called SetFullscreenState every
+    // frame: 5156 observe lines in two minutes, one log post per frame on the
+    // game thread (G1).
+    static std::atomic<unsigned> s_observe_n{0};
+    const unsigned on = s_observe_n.fetch_add(1) + 1;
+    if (on <= 8u || (on % 100u) == 0u)
+    {
+        char l[240];
+        snprintf(l, sizeof l, fullscreen ? "[MGPU][R241] set_fullscreen_state -> EXCLUSIVE FULLSCREEN: the composed neural output will not be visible from here (%u so far)"
+                                         : "[MGPU][R241] set_fullscreen_state -> windowed: the composed neural output can be visible again (%u so far)", on);
+        mgpu::diag::info(l);
+    }
+    return false;   // observe only
+}
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // D2.0: journal and stall watch read their keys once, here (never in
+    // DllMain). Off: one ini read each, then one load.
+    mgpu::lq::rearm();   // a new game device after a destroy_device in the same load
+    // D2.0-9: start the log worker now, whatever the keys. From here on every
+    // mgpu::diag line is posted to the queue and written by the worker, never
+    // on the game's render thread or under s.cs (Requiem, C6 14:42:19-25:
+    // our lines took 0.4-1.4 s each to write; DEFECT E).
+    mgpu::lq::start();
+    mgpu::journal::init(MGPU_VERSION_STR " built " __DATE__ " " __TIME__);
+    mgpu::gpu1::set_build_string(MGPU_VERSION_STR);   // R267
+    mgpu::stallwatch::init();
+    mgpu::fgmap::init();   // D2.0 NR step one: reads NRFrameFilter once; off = nothing
+    // DX11 probe: a D3D11 game swap chain only (the bridge's own chain is
+    // D3D12). Reads Dx11Probe once; off = one ini read, then one load.
+    if (swapchain != nullptr)
+    {
+        if (reshade::api::device *pd = swapchain->get_device())
+        {
+            if (pd->get_api() == reshade::api::device_api::d3d11)
+            {
+                const reshade::api::resource bb0 = swapchain->get_back_buffer(0);
+                const reshade::api::resource_desc bd0 = pd->get_resource_desc(bb0);
+                mgpu::dx11probe::init(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(pd->get_native())),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())),
+                    bd0.texture.width, bd0.texture.height, (unsigned)bd0.texture.format);
+                // R227: the DX11 producer. Off unless DX11=1 (one ini read, then one
+                // load). A second D3D11 chain after it is up is a rebuild.
+                if (mgpu::dx11producer::on())
+                    mgpu::dx11producer::on_chain_rebuilt(bd0.texture.width, bd0.texture.height,
+                                                         (unsigned)bd0.texture.format);
+                else
+                    mgpu::dx11producer::init(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(pd->get_native())),
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())),
+                        bd0.texture.width, bd0.texture.height, (unsigned)bd0.texture.format);
+                // R231: the GAME's HWND for DirectComposition (V49), as the D3D12
+                // path does below once the chain is proved to be the game's. On
+                // D3D11 the proof is the producer being up on this chain. Without
+                // this, TR-8 fell back to the bridge's own window ("the game's HWND
+                // was never seen") and the NR output was not seen on screen.
+                // R273: the game's HWND before anything latches the composition
+                // mode - the gate now reads which card the window's display is on.
+                if (mgpu::dx11producer::on()) { if (void *ghwnd0 = (void *)swapchain->get_hwnd()) mgpu::gpu1::set_game_hwnd(ghwnd0); }
+                if (mgpu::dx11producer::on()) note_game_fullscreen(swapchain, "D3D11 game chain at init");   // R241d
+                // R260: own Reflex on the D3D11 game chain. The same note the
+                // D3D12 site makes once its chain is proved the game's; here
+                // the proof is the producer being up on this chain (R231). The
+                // NvAPI_D3D_* calls own_reflex makes take an IUnknown device
+                // and are the same for D3D11 and D3D12. Off (one ini read)
+                // unless OwnReflex=1; a rebuilt chain notes again (fresh settle).
+                if (mgpu::dx11producer::on())
+                {
+                    mgpu::own_reflex::note_game_chain(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(pd->get_native())),
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+                    // R261: our GPU 1 device for OwnReflexDevice=gpu1|both (an
+                    // AddRef'd reference; own_reflex releases it, at once when
+                    // the key is not set).
+                    void *g1 = nullptr;
+                    if (mgpu::own_reflex::device_mode() != 0 && mgpu::gpu1::device_ref_for_reflex(&g1))
+                        mgpu::own_reflex::note_gpu1_device(g1);
+                }
+                mgpu::mvec_census::init(bd0.texture.width, bd0.texture.height);   // R253: off unless MVecCensus=1
+                if (mgpu::dx11producer::on() && mgpu::gpu1::dcomp_overlay_mode())
+                {
+                    if (void *ghwnd = (void *)swapchain->get_hwnd())
+                        mgpu::gpu1::set_game_hwnd(ghwnd);
+                }
+            }
+            else if (pd->get_api() == reshade::api::device_api::d3d12)
+            {
+                {   // R279: the texture census instrument, off unless TexCensus=1
+                    const reshade::api::resource bb12 = swapchain->get_back_buffer(0);
+                    const reshade::api::resource_desc bd12 = pd->get_resource_desc(bb12);
+                    mgpu::tex_census::init(reinterpret_cast<void *>(static_cast<uintptr_t>(pd->get_native())), bd12.texture.width, bd12.texture.height);
+                    // R280: the virtual velocity target - off on MVecExtractOff=1 / MVecLearned=99, inert on a contract
+                    // R280f: only on the GAME's D3D12 chain. SK-R1: on Skyrim (D3D11) the bridge's own
+                    // D3D12 swapchain on GPU 1 (1280x720) armed it. A chain whose adapter is not the
+                    // known game adapter is the bridge's; an unknown game adapter is not a reason to skip.
+                    bool r280_game_chain = true;
+                    {
+                        mgpu::adapter::selection_result sel280;
+                        mgpu::adapter::get_selection(sel280);
+                        if (sel280.game_luid_known)
+                            if (auto *d280 = reinterpret_cast<ID3D12Device *>(static_cast<uintptr_t>(pd->get_native())))
+                            {
+                                const LUID l280 = d280->GetAdapterLuid();
+                                r280_game_chain = (l280.LowPart == sel280.game_luid.LowPart && l280.HighPart == sel280.game_luid.HighPart);
+                            }
+                    }
+                    if (r280_game_chain)
+                        mgpu::mvec_extract::init(reinterpret_cast<void *>(static_cast<uintptr_t>(pd->get_native())), bd12.texture.width, bd12.texture.height);
+                    else
+                    {   // R280g: never silent - a wrong provisional LUID would otherwise read as a title with no source
+                        char l280[200];
+                        snprintf(l280, sizeof l280, "[MGPU][R280] D3D12 chain %ux%u is not on the game's adapter (R280f): not armed here.", bd12.texture.width, bd12.texture.height);
+                        mgpu::diag::info(l280);
+                    }
+                }
+                // R277: the D3D12 tap key, read once per game chain. Off = 0.
+                const int t = mgpu::gpu1::ui_ini_read("MVecTap", 0);
+                g_mvec_tap12 = (t == 1 || t == 2) ? t : 0;
+                if (g_mvec_tap12 != 0)
+                    mgpu::diag::warn(g_mvec_tap12 == 2
+                        ? "[MGPU][R277] MVecTap=2 on a D3D12 chain: the census candidate is copied at finish_effects when no barrier delivered it, before-state ASSUMED common. Off by default."
+                        : "[MGPU][R277] MVecTap=1 on a D3D12 chain: the census candidate is copied at finish_effects when no barrier delivered it, before-state ASSUMED shader_resource. Off by default.");
+            }
+        }
+    }
+    mgpu::stallwatch::scope sw_sc(mgpu::stallwatch::S_SWAPCHAIN);
     // D1: the discovery map. Off (one load) unless Discovery=1.
     if (swapchain != nullptr)
         mgpu::discovery::on_swapchain(
@@ -264,6 +505,21 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
                     if (sc_is_game)
                         mgpu::latprobe::note_game_chain(
                             sd12, reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+                    // D2.0: own Reflex and the stall watch take the game's chain
+                    // from the same LUID-proved site. Off: one ini read, then a load.
+                    if (sc_is_game)
+                    {
+                        void *gch = reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native()));
+                        mgpu::gpu1::note_game_d3d12();   // R282: one store; read once by the probe's scene-hold decision
+                        mgpu::own_reflex::note_game_chain(sd12, gch);
+                        {   // R261: same hand-over on the D3D12 site
+                            void *g1 = nullptr;
+                            if (mgpu::own_reflex::device_mode() != 0 && mgpu::gpu1::device_ref_for_reflex(&g1))
+                                mgpu::own_reflex::note_gpu1_device(g1);
+                        }
+                        mgpu::stallwatch::note_game_chain(gch);
+                        mgpu::journal::note_game_chain(gch);
+                    }
                 }
             }
             const reshade::api::resource bb = swapchain->get_back_buffer(0);
@@ -276,6 +532,8 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // GATED. In mode 0 not one instruction of this runs: the ini read
             // is the whole cost of the ghost existing, and that read is the
             // same one the present chain and the window creation already do.
+            if (sc_is_game) { if (void *ghwnd0 = (void *)swapchain->get_hwnd()) mgpu::gpu1::set_game_hwnd(ghwnd0); }   // R273: before the latch
+            if (sc_is_game) note_game_fullscreen(swapchain, resize ? "D3D12 game chain at resize" : "D3D12 game chain at init");   // R241d
             if (sc_is_game && mgpu::gpu1::dcomp_overlay_mode())
             {
                 if (void *ghwnd = (void *)swapchain->get_hwnd())
@@ -335,6 +593,7 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             // two possible triggers, so the two can be compared directly
             // instead of being two different pieces of code.
             mgpu::calibrator::set_mvec_hook(&mgpu_mvec_transport_hook);
+            mgpu::calibrator::set_mvec_hook_d3d11(&mgpu_mvec_transport_hook_d3d11);   // R232
             mgpu::calibrator::set_eval_copy(mgpu::probe::eval_copy_mode());
             mgpu::calibrator::set_sf_path(mgpu::probe::sf_path_mode());   // R180
         }
@@ -948,6 +1207,48 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                st.n16_ini_power - file_pw > 0.005f))))
                 ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
                                    "Restart the game once to apply.");
+
+            // ---- Frame generation (D2.0 NR2 / NR3), moved here (2026-10-08) ----
+            // Live switches on fg_map's own state, as before; each change is
+            // now also written to mgpu.ini (NRFrameFilter, NRFrameKeep), so it
+            // is the launch default from the next start. Off by default (the
+            // shipped mgpu.ini has no NRFrameFilter). With frame generation on,
+            // NRFrameFilter=1 crashed Dawnwalker at the bridge start on some
+            // launches (2026-10-08) - hence the warning. Mode 1 (the read-only
+            // map) stays ini-only: the radios show none selected while it runs.
+            ImGui::SeparatorText("Frame generation");
+            ImGui::TextColored(ImVec4(1.0f, 0.92f, 0.23f, 1.0f),
+                               "Warning: may crash the game at startup. Off by default.");
+            int fm = mgpu::fgmap::ui_mode();
+            if (ImGui::RadioButton("off##fg", &fm, 0))
+            { mgpu::fgmap::ui_set_mode(0); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 0); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("fix vectors##fg", &fm, 2))
+            { mgpu::fgmap::ui_set_mode(2); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 2); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("fix + thin##fg", &fm, 3))
+            { mgpu::fgmap::ui_set_mode(3); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 3); }
+            if (fm == 3)
+            {
+                int n = (int)mgpu::fgmap::ui_keep();
+                if (ImGui::SliderInt("keep 1 generated frame in", &n, 2, 8))
+                    mgpu::fgmap::ui_set_keep((unsigned)n);
+                if (ImGui::IsItemDeactivatedAfterEdit())
+                    (void)mgpu::gpu1::ui_ini_write("NRFrameKeep", (int)mgpu::fgmap::ui_keep());
+            }
+            if (fm == 1)
+                ImGui::TextDisabled("Map only (NRFrameFilter=1): reading, not acting.");
+            bool fg_now = false;
+            unsigned long long reused = 0, thinned = 0;
+            mgpu::fgmap::ui_counters(fg_now, reused, thinned);
+            char fl[200];
+            snprintf(fl, sizeof fl, "frame generation %s   reused %llu   thinned %llu",
+                     fg_now ? "ACTIVE" : "not seen", reused, thinned);
+            ImGui::TextUnformatted(fl);
+            ImGui::TextDisabled("fix: one presented step of motion on every frame; a frame without a");
+            ImGui::TextDisabled("fresh vector binds the kept one. thin: evaluate 1 generated frame in N.");
+            if (st.mvec_mode != 3)
+                ImGui::TextDisabled("Needs MVec=3 (the game's own vectors). This run is not.");
         }
     }
 
@@ -2310,22 +2611,60 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
     return false;   // never block the overlay that was actually asked for
 }
 
+// D2.0: after the game's Present returns; anchor=finish sleeps here. Off
+// (one load each) unless StallWatch / OwnReflex are set.
+static void on_finish_present(reshade::api::command_queue *, reshade::api::swapchain *swapchain)
+{
+    mgpu::stallwatch::scope sw(mgpu::stallwatch::S_FINISH_CB);
+    if (swapchain != nullptr)
+        mgpu::own_reflex::on_finish_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+}
+
 static void on_present(reshade::api::command_queue *queue,
                        reshade::api::swapchain *swapchain,
                        const reshade::api::rect *, const reshade::api::rect *,
                        uint32_t, const reshade::api::rect *)
 {
+    // D2.0: the stall watch marks this callback and each step in it. Off: one load per scope.
+    mgpu::stallwatch::scope sw_cb(mgpu::stallwatch::S_PRESENT_CB);
+    if (swapchain != nullptr)
+        mgpu::stallwatch::on_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    // DX11 probe: one load when off. The immediate context and the current
+    // back buffer, as natives; the module holds no ReShade type.
+    if (swapchain != nullptr && queue != nullptr && mgpu::dx11probe::on())
+    {
+        if (reshade::api::command_list *icl = queue->get_immediate_command_list())
+            mgpu::dx11probe::on_present(
+                reinterpret_cast<void *>(static_cast<uintptr_t>(icl->get_native())),
+                reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_current_back_buffer().handle)));
+    }
     // D1: the discovery map counts presents per chain. Off (one load) unless Discovery=1.
     if (swapchain != nullptr)
+    {
+        mgpu::stallwatch::scope sw(mgpu::stallwatch::S_DISCOVERY);
         mgpu::discovery::on_present(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    }
     // D1.5a: the latency probe samples on the game chain. Off (one load) unless LatencyProbe=1.
     if (swapchain != nullptr)
+    {
+        mgpu::stallwatch::scope sw(mgpu::stallwatch::S_PROBE);
         mgpu::latprobe::on_present(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    }
+    // D2.0: our Reflex (anchor=present sleeps here, before the game's Present). Off (one load)
+    // unless OwnReflex=1.
+    if (swapchain != nullptr)
+        mgpu::own_reflex::on_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
     if (queue == nullptr) return;
-    mgpu::gpu1::stream_on_present(
-        reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
+    {
+        mgpu::stallwatch::scope sw(mgpu::stallwatch::S_STREAM);
+        mgpu::gpu1::stream_on_present(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
+    }
 
     // ---- R166: THE OVERLAY MIRROR APPLIES FROM PRESENT, NOT FROM EFFECTS ----
     //
@@ -2533,6 +2872,74 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // resource on the bridge runtime's GPU 1 list is not a subtle error.
     bool rt_is_game = false;
     if (dev == nullptr) return;
+
+    // 2026-10-06, Rise of the Tomb Raider in DX11 (DX11_CONTRACT_LEDGER.md
+    // section 6): everything below hands D3D12 natives to the capture, the
+    // stream and the probe. stream_on_finish_effects casts the queue native
+    // to ID3D12CommandQueue and calls GetDevice on it once per process for
+    // the Reflex residue clear; on a D3D11 runtime that native is an
+    // ID3D11DeviceContext, whose same vtable slot is VSSetConstantBuffers.
+    // That was the crash on every DX11 title at the first finish_effects,
+    // whatever the ini. A non-D3D12 runtime has nothing for this handler -
+    // except the R227 DX11 producer, which takes the D3D11 natives and feeds
+    // the existing producer on its own D3D12 device (see dx11_producer.hpp).
+    if (dev->get_api() != reshade::api::device_api::d3d12)
+    {
+        if (dev->get_api() == reshade::api::device_api::d3d11 && mgpu::dx11producer::on())
+        {
+            // The depth tap, resolved the same way as on D3D12 (R63): the
+            // probe reads MGPU_DepthOutTex through ReShade's API, which is
+            // API-neutral, and publishes the native handle - an
+            // ID3D11Texture2D here.
+            mgpu::probe::note_effects(runtime, cmd_list);
+            // R238: the calibrator's frame counter is what hook_evaluate11's
+            // once-per-frame copy filter compares against; the D3D12 branch
+            // advances it below and this branch never reached that line, so
+            // every evaluate after the first was skipped (TR-14: vectors=1).
+            mgpu::calibrator::note_frame();
+            mgpu::mvec_census::note_frame();   // R253
+            const unsigned long long depth11 = mgpu::probe::depth_source();
+            mgpu::gpu1::ui_set_tap_state(mgpu::probe::tap_state());
+            mgpu::gpu1::ui_set_game_fx_absent(false);
+            const reshade::api::resource res11 = dev->get_resource_from_view(rtv);
+            reshade::api::command_queue *q11 = runtime->get_command_queue();
+            reshade::api::command_list *icl = (q11 != nullptr) ? q11->get_immediate_command_list() : nullptr;
+            // R254: the tap. The census's candidate for THIS frame goes to the
+            // producer through the same entry the calibrator feeds on a
+            // contract title; a frame with no bound target feeds nothing and
+            // the producer's absent/hold logic reads it as "no vectors".
+            // R278d: the learning turned the tap on at arm (D3D11: one atomic load per frame when off).
+            if (!mgpu::mvec_census::tap_on() && mgpu::gpu1::mvec_tap_live() != 0) mgpu::mvec_census::tap_enable_live();
+            if (icl != nullptr && mgpu::mvec_census::tap_on())
+            {
+                unsigned tw = 0, th = 0, tf = 0; unsigned long long fb = 0, ft = 0;
+                const unsigned long long tap = mgpu::mvec_census::tap_candidate(&tw, &th, &tf, &fb, &ft);
+                static unsigned long long s_tap_said = 0;
+                if (tap != 0)
+                {
+                    if (s_tap_said != tap)
+                    {
+                        s_tap_said = tap;
+                        char tl[300];
+                        snprintf(tl, sizeof tl,
+                                 "[MGPU][R254] MVEC TAP: feeding the game's target 0x%016llX %ux%u (format %u) to the "
+                                 "producer - bound in %llu of %llu frames so far. Vectors from here on are the game's own.",
+                                 tap, tw, th, tf, fb, ft);
+                        mgpu::diag::info(tl);
+                    }
+                    mgpu::dx11producer::on_mvec(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(icl->get_native())),
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(tap)));
+                }
+            }
+            if (res11.handle != 0 && icl != nullptr)
+                mgpu::dx11producer::on_finish_effects(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(icl->get_native())),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(res11.handle)),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(depth11)));
+        }
+        return;
+    }
 
     // P1.6. Which runtime is this? The same LUID comparison on_destroy_device
     // already makes. Log-only and one-shot per side; nothing below changes
@@ -2818,6 +3225,47 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // published one, which holds the arm - see stream_on_finish_effects.
     const unsigned long long mvec_h = rt_is_game ? mgpu::probe::mvec_source() : 0ull;
 
+    // R277: the D3D12 tap, off unless MVecTap=1/2 (read once at the game chain's
+    // init). Copies the census candidate here when no barrier delivered it this
+    // frame. See probe.cpp tap_finish_effects for the state assumption.
+    // R278b: the key, or the mode the first-launch learning turned on at arm.
+    // R280: the virtual velocity target's extraction for this frame (D3D12, game
+    // runtime only; a no-op unless the module armed at the chain's init). BEFORE
+    // the tap: the target must hold this frame's x,y, in shader_resource, when
+    // the tap copies it.
+    if (rt_is_game && dev->get_api() == reshade::api::device_api::d3d12)
+        mgpu::mvec_extract::on_finish_effects(cmd_list, q);
+    int tap_mode = (g_mvec_tap12 != 0) ? g_mvec_tap12 : mgpu::gpu1::mvec_tap_live();
+    // R280o (Fable's ladder; SF-R1 vs SF-R2): the tap is the last rung. Once the evaluate
+    // route has delivered (R118: the calibrator copies the vectors the game hands DLSS, at
+    // the DLSS pass), the tap yields for the rest of the session - one route at a time
+    // (R106b), and no end-of-frame copy with an assumed state on top of the right one.
+    // Latched rather than per frame: the evaluate route is absent in menus, and a tap that
+    // came back there would copy at the wrong moment and flip the source in and out.
+    // A title whose evaluate route never delivers (RE4, no table) taps exactly as before.
+    if (rt_is_game && tap_mode != 0 && (g_r280o_eval_yield || mgpu::calibrator::eval_copies() != 0ull))
+    {
+        if (!g_r280o_eval_yield)
+        {
+            g_r280o_eval_yield = true;
+            mgpu::diag::info("[MGPU][R280o] the evaluate route has delivered this title's own vectors: the R277 tap "
+                             "yields to it for the rest of this session (one route at a time, R106b).");
+        }
+        tap_mode = 0;
+    }
+    if (rt_is_game && tap_mode != 0)
+    {
+        mgpu::gpu1::tap_copy_scope(true);    // R280o: copies made inside this call are the tap's, counted apart
+        mgpu::probe::tap_finish_effects(cmd_list, tap_mode);
+        mgpu::gpu1::tap_copy_scope(false);   // R280o
+        mgpu::gpu1::set_mvec_eligible_count(mgpu::probe::mvec_eligible_count());   // R278
+        // R278f: the probe's neighbours to gpu1, and gpu1's live switch to the probe.
+        mgpu::gpu1::set_mvec_neighbours(mgpu::probe::mvec_pick_index(), mgpu::probe::mvec_next_same(), mgpu::probe::mvec_next_class());
+        mgpu::probe::mvec_pick_lock(mgpu::gpu1::stream_producing());   // R278f-r
+        const int req = mgpu::gpu1::mvec_candidate_request();
+        if (req >= 0 && req != mgpu::probe::mvec_pick_index()) mgpu::probe::mvec_pick_live(req);
+    }
+
     mgpu::gpu1::stream_on_finish_effects(
         reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
         q_native,
@@ -2834,6 +3282,13 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 // it when frame generation is switched). Off (one load) unless Discovery=1.
 static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize)
 {
+    // DX11 probe: everything it made lives on this chain's device. One load when off.
+    // R228: only when THIS chain is the one it was built on - the bridge's own
+    // present chain is resized at arm, and that resize destroyed the probe from the
+    // bridge thread while the game thread was in the same resize path (TR-6 freeze).
+    if (mgpu::dx11probe::on() && swapchain != nullptr &&
+        mgpu::dx11probe::is_chain(reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native()))))
+        mgpu::dx11probe::shutdown();
     if (swapchain != nullptr)
         mgpu::discovery::on_swapchain(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())), false, resize);
@@ -2842,6 +3297,15 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
     if (swapchain != nullptr)
         mgpu::latprobe::on_chain_destroyed(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
+    // D2.0: the game chain gone for good (resize=0) is our Reflex's teardown restore point -
+    // a vendor call, so here and never in DllMain. Off (one load) unless OwnReflex=1.
+    if (swapchain != nullptr)
+    {
+        mgpu::stallwatch::scope sw(mgpu::stallwatch::S_SWAPCHAIN);
+        void *dch = reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native()));
+        mgpu::journal::on_chain_destroyed(dch, resize);
+        mgpu::own_reflex::on_chain_destroyed(dch, resize);
+    }
 }
 
 // T3 instrumentation: in a clean run, no destroy_device with the game's
@@ -2853,6 +3317,27 @@ static void on_destroy_swapchain(reshade::api::swapchain *swapchain, bool resize
 static void on_destroy_device(reshade::api::device *device)
 {
     mgpu::adapter::log_device_luid("destroy_device", device);
+    // R227: the D3D11 game device going away is the DX11 producer's teardown
+    // point, mirroring the D3D12 game-device teardown below: the stream
+    // first (its drain uses our queue and fences), then the producer.
+    if (device != nullptr && device->get_api() == reshade::api::device_api::d3d11 &&
+        mgpu::dx11producer::on() &&
+        mgpu::dx11producer::is_game_device(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(device->get_native()))))
+    {
+        mgpu::diag::info("[MGPU][T3] D3D11 game device released - signaling bridge thread "
+                         "teardown (final log lines are best effort)");
+        mgpu::gpu1::stream_shutdown();
+        mgpu::worker::stop();
+        mgpu::journal::on_game_device_destroyed();
+        mgpu::stallwatch::signal_stop();
+        mgpu::dx11producer::shutdown();
+        mgpu::mvec_census::shutdown();   // R253: unregisters its events; nothing of its own on the device
+        mgpu::tex_census::shutdown();    // R279: the instrument's events, if on
+        mgpu::mvec_extract::shutdown();  // R280: releases its objects, writes MVecExtract if decided
+        mgpu::lq::signal_stop();
+        return;
+    }
 
     mgpu::adapter::selection_result sel;
     mgpu::adapter::get_selection(sel);
@@ -2889,6 +3374,15 @@ static void on_destroy_device(reshade::api::device *device)
                 mgpu::gpu1::stream_shutdown();
 
                 mgpu::worker::stop();
+
+                // D2.0: our two threads leave their loops now (the queue drains
+                // first), so none of them is inside this image if ReShade
+                // unloads the add-on next. A new game device re-arms them.
+                mgpu::journal::on_game_device_destroyed();
+                mgpu::stallwatch::signal_stop();
+                mgpu::tex_census::shutdown();    // R279: the instrument's events, if on (D3D12 game device)
+                mgpu::mvec_extract::shutdown();  // R280 (D3D12 game device)
+                mgpu::lq::signal_stop();
             }
         }
     }
@@ -2936,6 +3430,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
+        reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
+        reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242
         // T3: device lifecycle instrumentation + teardown trigger.
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         // P1.5: capture one real frame. Registered last because it is the only
@@ -2946,6 +3442,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // side decides whether to act on it, so the ini can turn the behaviour
         // on and off without a rebuild.
         reshade::register_event<reshade::addon_event::present>(on_present);
+        // D2.0: after the game's Present. Registered here with every other
+        // event (registering later, from a render thread, races ReShade's
+        // unsynchronised event list). Off: the handler returns after a load.
+        reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
         // V65: the bridge steps aside while the game's overlay is open.
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(
             on_reshade_open_overlay);
@@ -3023,6 +3523,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // log names which one.
         if (lpReserved == nullptr)
         {
+            mgpu::mvec_extract::shutdown();   // R280c: the only teardown a clean exit reaches (V21); releases the module's objects
             mgpu::diag::info("[MGPU][T3] FreeLibrary unload - closing the NGX session from "
                              "DllMain, because ReShade does not always raise destroy_device "
                              "and an unclosed session poisons the next launch.");
@@ -3045,6 +3546,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // Discovery=1 installed them.
         mgpu::discovery::uninstall();
         mgpu::calibrator::uninstall();
+        // D2.0: our two threads leave their loops (waited for only on the
+        // FreeLibrary path, max 300 ms each), then the journal's close line,
+        // written directly. All three are no-ops when their key was off.
+        mgpu::stallwatch::stop(lpReserved != nullptr);
+        mgpu::lq::stop(lpReserved != nullptr);
+        mgpu::journal::session_close_direct(lpReserved != nullptr ? "DLL_PROCESS_DETACH, process exit"
+                                                                  : "DLL_PROCESS_DETACH, FreeLibrary unload");
         reshade::unregister_addon(hModule);
         break;
     }

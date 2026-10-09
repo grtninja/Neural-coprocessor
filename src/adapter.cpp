@@ -52,6 +52,7 @@
 #include "adapter.hpp"
 #include "adapter_selection.hpp"
 #include "diag.hpp"
+#include "mgpu_ini_parser.hpp"   // R269: the Display= key
 
 // get_native() returns uint64_t: unwrapping it to ID3D12Device * needs
 // reinterpret_cast, not static_cast (integer to pointer is only
@@ -133,6 +134,67 @@ namespace
         std::atomic<unsigned> game_sc_events{0};
         std::atomic<unsigned> non_d3d12_sc{0};
     };
+
+    // ---- R269: Display= - THE DISPLAY THE USER CHOSE, AND THE CARD BEHIND IT ----
+    //
+    // LAUNCHER_LEDGER stage 4. The launcher writes Display=\\.\DISPLAYn (and
+    // DisplayName= beside it) into mgpu.ini. ABSENT = this function returns
+    // false and selection runs exactly as it always has. Present: the GDI
+    // name is resolved by the kernel's own display -> adapter mapping
+    // (D3DKMTOpenAdapterFromGdiDisplayName; R265/SK-44 showed it follows the
+    // cable where DXGI's output count follows the composition owner). The
+    // LUID it returns is in the namespace this table binds on. What the
+    // caller does with it: that adapter takes the neural load if it is a
+    // candidate; if it is the game's own card, selection refuses and says
+    // what to change; if it is no candidate (an iGPU), selection refuses too.
+    bool read_display_key(LUID &out, char *gdi_utf8, size_t gdi_n, char *why, size_t why_n)
+    {
+        wchar_t path[MAX_PATH * 2] = {};
+        {
+            HMODULE h = nullptr;
+            static const int anchor = 0;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    reinterpret_cast<LPCWSTR>(&anchor), &h) || h == nullptr) return false;
+            const DWORD got = GetModuleFileNameW(h, path, MAX_PATH * 2);
+            if (got == 0 || got >= MAX_PATH * 2) return false;
+            wchar_t *sl = wcsrchr(path, L'\\');
+            if (sl == nullptr) return false;
+            sl[1] = L'\0';
+            wcscat_s(path, L"mgpu.ini");
+        }
+        FILE *f = nullptr;
+        if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr) return false;
+        static char buf[mgpu::config::MAX_BYTES + 2u];
+        const size_t got = fread(buf, 1, mgpu::config::MAX_BYTES + 1u, f);
+        fclose(f);
+        if (got > mgpu::config::MAX_BYTES) return false;
+        buf[got] = '\0';
+        const char *v = mgpu::config::find(buf, got, "Display");
+        if (v == nullptr) return false;
+        char gdi[64] = {};
+        size_t n = 0;
+        while (v[n] != '\0' && v[n] != '\r' && v[n] != '\n' && n < sizeof gdi - 1) { gdi[n] = v[n]; ++n; }
+        while (n > 0 && (gdi[n - 1] == ' ' || gdi[n - 1] == '\t')) gdi[--n] = '\0';
+        if (n == 0) return false;   // "Display=" with nothing after it: as absent
+        strncpy(gdi_utf8, gdi, gdi_n - 1); gdi_utf8[gdi_n - 1] = '\0';
+
+        struct kmt_open { WCHAR DeviceName[32]; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
+        struct kmt_close { UINT hAdapter; };
+        typedef LONG (WINAPI *pfn_kmt_open)(kmt_open *);
+        typedef LONG (WINAPI *pfn_kmt_close)(const kmt_close *);
+        HMODULE g = GetModuleHandleW(L"gdi32.dll");
+        pfn_kmt_open p_open = g ? (pfn_kmt_open)(void *)GetProcAddress(g, "D3DKMTOpenAdapterFromGdiDisplayName") : nullptr;
+        pfn_kmt_close p_close = g ? (pfn_kmt_close)(void *)GetProcAddress(g, "D3DKMTCloseAdapter") : nullptr;
+        if (p_open == nullptr) { snprintf(why, why_n, "D3DKMTOpenAdapterFromGdiDisplayName did not resolve"); return false; }
+        kmt_open ko{};
+        MultiByteToWideChar(CP_UTF8, 0, gdi, -1, ko.DeviceName, 32);
+        const LONG ks = p_open(&ko);
+        if (ks != 0) { snprintf(why, why_n, "the kernel does not know a display named \"%s\" (status 0x%08lX) - is it still connected and active?", gdi, (unsigned long)ks); return false; }
+        out = ko.AdapterLuid;
+        if (p_close) { kmt_close kc{ ko.hAdapter }; p_close(&kc); }
+        why[0] = '\0';
+        return true;
+    }
 
     state &st()
     {
@@ -323,7 +385,7 @@ namespace
         // == the swapchain LUID, by the gate above.
         const LUID game = S.result.game_luid;
 
-        char line[512];
+        char line[700];   // R269: the Display= refusal lines are long
 
         // [rule 3] the software filter, plus exclusion of the game's own
         // adapter (a LUID match, never an index match).
@@ -447,6 +509,65 @@ namespace
                          cand.size(), n_with_outputs);
                 mgpu::diag::error(line);
                 rule = "none (refused: ambiguous)";
+            }
+        }
+
+        // ---- R269: the Display= key, applied after the rules, never around them ----
+        {
+            LUID dl{}; char gdi[64] = {}; char why[200] = {};
+            const bool have = read_display_key(dl, gdi, sizeof gdi, why, sizeof why);
+            if (!have && why[0] != '\0')
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][R269] Display= is set in mgpu.ini but could not be resolved: %s. "
+                         "Selection proceeds as if the key were absent.", why);
+                mgpu::diag::warn(line);
+            }
+            else if (have)
+            {
+                if (luid_eq(dl, game))
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][R269] REFUSING: the display you chose (%s) is on the card the game "
+                             "renders on (luid=0x%08X-0x%08X). The neural work must run on the other card "
+                             "and show on a display connected to it. Connect this display to the other "
+                             "card, or set the game to run on the other GPU in Windows Graphics settings, "
+                             "or clear Display= in mgpu.ini to let the add-on choose.",
+                             gdi, (unsigned)dl.HighPart, (unsigned)dl.LowPart);
+                    mgpu::diag::error(line);
+                    sel = static_cast<size_t>(-1);
+                    rule = "none (refused: Display= is on the game's card)";
+                }
+                else
+                {
+                    size_t pick = static_cast<size_t>(-1);
+                    for (size_t c : cand) if (luid_eq(S.table[c].luid, dl)) pick = c;
+                    if (pick != static_cast<size_t>(-1))
+                    {
+                        const bool same = (pick == sel);
+                        sel = pick; degenerate = false;
+                        rule = same ? "Display= key (the adapter driving the chosen display; the rules chose the same)"
+                                    : "Display= key (the adapter driving the chosen display)";
+                        snprintf(line, sizeof line,
+                                 "[MGPU][R269] Display=%s -> the kernel says it is driven by adapter luid=0x%08X-0x%08X "
+                                 "(adapter[%zu] \"%s\"): the neural load goes there%s.",
+                                 gdi, (unsigned)dl.HighPart, (unsigned)dl.LowPart, pick, S.table[pick].desc,
+                                 same ? " - the same card the rules chose" : "");
+                        mgpu::diag::info(line);
+                    }
+                    else
+                    {
+                        snprintf(line, sizeof line,
+                                 "[MGPU][R269] REFUSING: the display you chose (%s) is driven by adapter "
+                                 "luid=0x%08X-0x%08X, which cannot take the neural work (not an NVIDIA card in "
+                                 "this table, or software). Connect the display to the card that does the "
+                                 "neural work, or clear Display= in mgpu.ini.",
+                                 gdi, (unsigned)dl.HighPart, (unsigned)dl.LowPart);
+                        mgpu::diag::error(line);
+                        sel = static_cast<size_t>(-1);
+                        rule = "none (refused: Display= is on a card that cannot do the neural work)";
+                    }
+                }
             }
         }
 
@@ -696,6 +817,42 @@ void on_swapchain(::reshade::api::swapchain *swapchain, bool resize)
         }
     }
 
+    if (!S.table_enumerated)
+        enumerate_table_locked(S);
+    try_select_locked(S);
+}
+
+// R227. See adapter.hpp. Written the same way as on_swapchain's D3D12 tail
+// so the two cannot drift: record, log, enumerate, select, set the event.
+void note_game_luid_d3d11(unsigned long long luid_low, long luid_high)
+{
+    ensure_init();
+    LUID luid{};
+    luid.LowPart = (DWORD)luid_low;
+    luid.HighPart = (LONG)luid_high;
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    char line[320];
+    if (S.result.game_luid_from_swapchain)
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] dx11 producer luid=0x%08X-0x%08X - swapchain-derived game luid "
+                 "0x%08X-0x%08X already established; not re-selecting",
+                 (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+                 (unsigned)S.result.game_luid.HighPart, (unsigned)S.result.game_luid.LowPart);
+        mgpu::diag::info(line);
+        return;
+    }
+    S.result.game_luid = luid;
+    S.result.game_luid_known = true;
+    S.result.game_luid_from_swapchain = true;
+    snprintf(line, sizeof line,
+             "[MGPU][T2] dx11 producer: game luid=0x%08X-0x%08X established from the game's D3D11 "
+             "device's adapter (a D3D11 chain cannot say it)%s",
+             (unsigned)luid.HighPart, (unsigned)luid.LowPart,
+             S.provisional_known ? " - overrides the provisional init_device value"
+                                 : " - no provisional value had been captured");
+    mgpu::diag::info(line);
     if (!S.table_enumerated)
         enumerate_table_locked(S);
     try_select_locked(S);

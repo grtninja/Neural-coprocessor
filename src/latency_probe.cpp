@@ -45,6 +45,8 @@
 
 #include "latency_probe.hpp"
 #include "diag.hpp"
+#include "journal.hpp"       // D2.0: what / when / why of every NvAPI call (Journal=1)
+#include "stall_watch.hpp"   // D2.0: stage marks (StallWatch=N)
 #include "mgpu_ini_parser.hpp"
 
 namespace mgpu::latprobe
@@ -307,15 +309,30 @@ void sample(IUnknown *dev, long long now)
     memset(&g_status_buf, 0, sizeof g_status_buf);
     g_status_buf.version = ver(sizeof(sleep_status), 1u);
     if (g_samples == 1u) mgpu::diag::info("[MGPU][LAT] first GetSleepStatus call");
-    const int rs = g_get(dev, &g_status_buf);
+    int rs = 0, rl = 0;
+    long long q_before = 0, q_after = 0;
+    {
+        mgpu::stallwatch::scope sn(mgpu::stallwatch::S_PROBE_NVAPI);   // D2.0
+        rs = g_get(dev, &g_status_buf);
 
-    // ---- 2. latency reports ----
-    memset(&g_lat_buf, 0, sizeof g_lat_buf);
-    g_lat_buf.version = ver(sizeof(latency_params), 1u);
-    if (g_samples == 1u) mgpu::diag::info("[MGPU][LAT] first GetLatency call");
-    const long long q_before = qpc();
-    const int rl = g_lat(dev, &g_lat_buf);
-    const long long q_after = qpc();
+        // ---- 2. latency reports ----
+        memset(&g_lat_buf, 0, sizeof g_lat_buf);
+        g_lat_buf.version = ver(sizeof(latency_params), 1u);
+        if (g_samples == 1u) mgpu::diag::info("[MGPU][LAT] first GetLatency call");
+        q_before = qpc();
+        rl = g_lat(dev, &g_lat_buf);
+        q_after = qpc();
+    }
+    // D2.0 journal: what, when, why of the two calls (queued, not written here).
+    // Formatted only when the journal is on: off adds nothing on this thread.
+    if (mgpu::journal::on())
+    {
+        char jw[200];
+        snprintf(jw, sizeof jw, "probe s%u: GetSleepStatus(dev=%p) -> %d, GetLatency(dev=%p) -> %d",
+                 g_samples, (void *)dev, rs, (void *)dev, rl);
+        mgpu::journal::event(jw, "LatencyProbe=1: read-only sample (every 2 s, then every 10 s)");
+    }
+    mgpu::stallwatch::scope slog(mgpu::stallwatch::S_PROBE_LOG);   // D2.0: the log lines below
 
     unsigned valid = 0;
     int newest = -1;

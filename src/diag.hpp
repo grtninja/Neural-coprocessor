@@ -8,11 +8,20 @@
 //
 // Called from the game thread (ReShade callbacks) and the bridge thread;
 // reshade::log::message is used concurrently by ReShade itself.
+//
+// D2.0-5: info / warn / error never write on the calling thread while the
+// log queue's worker runs - they post the line and return (see diag.cpp). The
+// *_direct forms write now; they are for the queue's worker and for windows
+// where no worker may run.
 #pragma once
 
 namespace mgpu::diag
 {
-    void info (const char *line);   // reshade::log::level::info
-    void warn (const char *line);   // reshade::log::level::warning
-    void error(const char *line);   // reshade::log::level::error
+    void info (const char *line);   // reshade::log::level::info, via the queue when it runs
+    void warn (const char *line);   // reshade::log::level::warning, via the queue when it runs
+    void error(const char *line);   // reshade::log::level::error, via the queue when it runs
+
+    void info_direct (const char *line);   // written now, on this thread
+    void warn_direct (const char *line);
+    void error_direct(const char *line);
 }
