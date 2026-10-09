@@ -495,3 +495,354 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
     (void)other;   // the game's device stays alive until the process exits
     return 1;
 }
+
+// =====================================================================
+// R268: THE BENCH - what this card sustains for DLSS-NR, without a game.
+//
+// LAUNCHER_LEDGER stage 2. The launcher's "test" button: the user picks a
+// display, the launcher resolves the adapter behind it (kernel mapping,
+// R265) and asks this for the numbers at a resolution and a pass count.
+// No game runs. Nothing is read from or written to any game file.
+//
+// WHAT IT RUNS. The same NGX session as nrcheck_run (Init -> caps ->
+// snippet Init_Ext -> Populate), CreateFeature(Reserved18) at WxH, then the
+// add-on's own synthetic evaluate (P1.2's parameter block: namespaced
+// DLSSNR.* keys, subrects at full size, MVecScale 1.0, depth null, the
+// three strengths and UseAutoMask held), `frames` times, `passes` evaluates
+// per frame - pass 2 takes pass 1's output as its colour, as the add-on's
+// second pass does. Each evaluate is bracketed by GPU timestamps on the
+// queue that runs it (the add-on's P2.2/R214 method), the list is executed
+// and waited each frame, so the figure is the card's own execution time
+// per evaluate, not wall-clock. Colour is noise uploaded once; vectors are
+// zero; Reset=1 on the first frame only (temporal history runs from then,
+// as in the add-on).
+//
+// WHAT IT REPORTS. Per pass: mean / min / max ms over the frames after the
+// first 10 (warm-up excluded, said so). Per frame: the sum. And the frame
+// budget the sum fits: 60 (16.7 ms), 120 (8.3), 144 (6.9) or none. Written
+// to `result_path` as key=value lines for the launcher, and to the log.
+//
+// WHAT IT DOES NOT DO (v1). The SR path (NR at a scaled size + DLSS SR up
+// to WxH) - that needs the add-on's C2-SR parameter set and is the next
+// step once these numbers reproduce the Skyrim ledger on Marcelo's rig
+// (13.4 ms one whole-frame pass at 2560x1440; 28.7 ms two).
+//
+// Exit codes: 0 ok, 3 could not start (devices/modules/exports/resources),
+// 4 CreateFeature failed, 5 an evaluate failed or faulted (bench ends).
+// =====================================================================
+namespace
+{
+    ID3D12Resource *make_tex2d(ID3D12Device *dev, UINT w, UINT h, DXGI_FORMAT f,
+                               D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st)
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = w; d.Height = h; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.Format = f; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN; d.Flags = flags;
+        ID3D12Resource *r = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, st, nullptr, IID_PPV_ARGS(&r))))
+            return nullptr;
+        return r;
+    }
+
+    ID3D12Resource *make_buffer(ID3D12Device *dev, UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES st)
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = type;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = bytes; d.Height = 1;
+        d.DepthOrArraySize = 1; d.MipLevels = 1; d.Format = DXGI_FORMAT_UNKNOWN;
+        d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource *r = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, st, nullptr, IID_PPV_ARGS(&r))))
+            return nullptr;
+        return r;
+    }
+
+    typedef NVSDK_NGX_Result (NVSDK_CONV *pf_evaluate)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *,
+                                                       const NVSDK_NGX_Parameter *, void *);
+
+    NVSDK_NGX_Result evaluate_guarded(pf_evaluate fn, ID3D12GraphicsCommandList *cl, NVSDK_NGX_Handle *h,
+                                      NVSDK_NGX_Parameter *p, unsigned long *code)
+    {
+        __try { return fn(cl, h, p, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { *code = (unsigned long)GetExceptionCode(); return (NVSDK_NGX_Result)SEH_FAULT; }
+    }
+
+    struct bench_stat { double sum = 0, mn = 1e30, mx = 0; unsigned n = 0;
+                        void add(double v) { sum += v; if (v < mn) mn = v; if (v > mx) mx = v; ++n; }
+                        double mean() const { return n ? sum / n : 0.0; } };
+}
+
+extern "C" __declspec(dllexport)
+int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, const wchar_t *log_path,
+                unsigned width, unsigned height, unsigned passes, unsigned frames, const wchar_t *result_path)
+{
+    if (log_path != nullptr && log_path[0] != L'\0') _wfopen_s(&g_out, log_path, L"a");
+    if (passes < 1u) passes = 1u; if (passes > 2u) passes = 2u;
+    if (frames < 20u) frames = 20u; if (frames > 5000u) frames = 5000u;
+    if (width < 64u || height < 64u || width > 8192u || height > 8192u)
+    { out("BENCH: resolution %ux%u refused", width, height); return 3; }
+
+    out("---- BENCH on neural adapter[%d]: %ux%u, %u pass(es), %u frames ----", neural_index, width, height, passes, frames);
+    ID3D12Device *other = (other_index >= 0) ? make_device((UINT)other_index, "other (the game's)") : nullptr;
+    ID3D12Device *dev = make_device((UINT)neural_index, "neural");
+    if (dev == nullptr) { out("BENCH: SKIPPED (no device on the neural GPU)"); return 3; }
+
+    HMODULE core = load_core();
+    HMODULE snip = LoadLibraryW(snippet_path);
+    out("snippet \"%ls\": %s", snippet_path, snip ? "loaded" : "NOT loaded");
+    if (core == nullptr || snip == nullptr) { out("BENCH: SKIPPED (modules)"); return 3; }
+
+    ngx_api n;
+    const char *w1, *w2, *w3, *w4, *w5, *w6;
+    n.init    = (pf_init)    pick(core, snip, "NVSDK_NGX_D3D12_Init", &w1, "core", "snippet!FALLBACK");
+    n.caps    = (pf_get_caps)pick(core, snip, "NVSDK_NGX_D3D12_GetCapabilityParameters", &w2, "core", "snippet!FALLBACK");
+    n.destroy = (pf_destroy) pick(core, snip, "NVSDK_NGX_D3D12_DestroyParameters", &w3, "core", "snippet!FALLBACK");
+    n.create  = (pf_create)  pick(snip, core, "NVSDK_NGX_D3D12_CreateFeature", &w4, "snippet", "core!FALLBACK");
+    n.release = (pf_release) pick(snip, core, "NVSDK_NGX_D3D12_ReleaseFeature", &w5, "snippet", "core!FALLBACK");
+    pf_evaluate evaluate = (pf_evaluate)pick(snip, core, "NVSDK_NGX_D3D12_EvaluateFeature", &w6, "snippet", "core!FALLBACK");
+    n.s_iext  = (pf_init_ext)GetProcAddress(snip, "NVSDK_NGX_D3D12_Init_Ext");
+    n.s_pop   = (pf_populate)GetProcAddress(snip, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
+    // R256: the core's own Init_Ext is the entry point the core accepts when it refuses Init.
+    pf_init_ext core_iext = (pf_init_ext)GetProcAddress(core, "NVSDK_NGX_D3D12_Init_Ext");
+    out("exports: Init=%s Caps=%s Destroy=%s CreateFeature=%s Release=%s Evaluate=%s snippet Init_Ext=%s Populate=%s core Init_Ext=%s",
+        w1, w2, w3, w4, w5, w6, n.s_iext ? "yes" : "no", n.s_pop ? "yes" : "no", core_iext ? "yes" : "no");
+    if (!n.init || !n.caps || !n.create || !evaluate) { out("BENCH: SKIPPED (missing exports)"); return 3; }
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&nrbench_run, &self);
+        GetModuleFileNameW(self, n.data_path, MAX_PATH);
+        wchar_t *sl = wcsrchr(n.data_path, L'\\');
+        if (sl != nullptr) sl[1] = L'\0';
+    }
+    n.common.LoggingInfo.LoggingCallback = ngx_cb;
+    n.common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+    n.common.LoggingInfo.DisableOtherLoggingSinks = false;
+
+    // ---- session: R256 order (core Init_Ext first), then the rest as nrcheck_run ----
+    NVSDK_NGX_Result r;
+    if (core_iext != nullptr)
+    {
+        r = core_iext(0x4D475055ULL, n.data_path, dev, NVSDK_NGX_Version_API, nullptr);
+        out("  core Init_Ext (R256): 0x%08X (%s)", (unsigned)r, rname(r));
+    }
+    else
+    {
+        r = n.init(0ULL, n.data_path, dev, &n.common, NVSDK_NGX_Version_API);
+        out("  core Init: 0x%08X (%s)", (unsigned)r, rname(r));
+    }
+    NVSDK_NGX_Parameter *params = nullptr;
+    r = n.caps(&params);
+    out("  GetCapabilityParameters: 0x%08X (%s)", (unsigned)r, rname(r));
+    if (r != NVSDK_NGX_Result_Success || params == nullptr) { out("BENCH: SKIPPED (no parameter block)"); return 3; }
+    if (n.s_iext) { r = n.s_iext(0ULL, n.data_path, dev, NVSDK_NGX_Version_API, params); out("  snippet Init_Ext: 0x%08X (%s)", (unsigned)r, rname(r)); }
+    if (n.s_pop)  { r = n.s_pop(params); out("  snippet PopulateParameters_Impl: 0x%08X (%s)", (unsigned)r, rname(r)); }
+    params->Set(NVSDK_NGX_Parameter_Width, width);
+    params->Set(NVSDK_NGX_Parameter_Height, height);
+    params->Set("DLSSNR.Width", width);
+    params->Set("DLSSNR.Height", height);
+
+    // ---- D3D12 objects ----
+    ID3D12CommandQueue *q = nullptr; ID3D12CommandAllocator *al = nullptr;
+    ID3D12GraphicsCommandList *cl = nullptr; ID3D12Fence *fe = nullptr;
+    D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fe))))
+    { out("BENCH: SKIPPED (D3D12 objects)"); return 3; }
+    UINT64 ts_freq = 0;
+    if (FAILED(q->GetTimestampFrequency(&ts_freq)) || ts_freq == 0) { out("BENCH: SKIPPED (no timestamp frequency)"); return 3; }
+    const UINT NQ = passes * 2u;
+    ID3D12QueryHeap *qh = nullptr;
+    D3D12_QUERY_HEAP_DESC qhd{}; qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qhd.Count = NQ;
+    if (FAILED(dev->CreateQueryHeap(&qhd, IID_PPV_ARGS(&qh)))) { out("BENCH: SKIPPED (query heap)"); return 3; }
+    ID3D12Resource *rb = make_buffer(dev, NQ * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // ---- resources: colour (noise, uploaded once), vectors (zero), outputs ----
+    const DXGI_FORMAT fmt_color = DXGI_FORMAT_R8G8B8A8_UNORM, fmt_mvec = DXGI_FORMAT_R16G16_FLOAT;
+    ID3D12Resource *tex_color = make_tex2d(dev, width, height, fmt_color, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *tex_mvec  = make_tex2d(dev, width, height, fmt_mvec,  D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12Resource *tex_out[2] = {
+        make_tex2d(dev, width, height, fmt_color, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        (passes > 1u) ? make_tex2d(dev, width, height, fmt_color, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) : nullptr };
+    if (!tex_color || !tex_mvec || !tex_out[0] || (passes > 1u && !tex_out[1]) || !rb)
+    { out("BENCH: SKIPPED (resources at %ux%u)", width, height); return 3; }
+    {
+        // upload: noise into colour, zeros into vectors, through one upload buffer each
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fc{}, fm{}; UINT64 szc = 0, szm = 0; UINT rows = 0; UINT64 rowb = 0;
+        D3D12_RESOURCE_DESC dc = tex_color->GetDesc(), dm = tex_mvec->GetDesc();
+        dev->GetCopyableFootprints(&dc, 0, 1, 0, &fc, &rows, &rowb, &szc);
+        dev->GetCopyableFootprints(&dm, 0, 1, 0, &fm, &rows, &rowb, &szm);
+        ID3D12Resource *upc = make_buffer(dev, szc, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource *upm = make_buffer(dev, szm, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!upc || !upm) { out("BENCH: SKIPPED (upload buffers)"); return 3; }
+        unsigned char *p = nullptr;
+        if (SUCCEEDED(upc->Map(0, nullptr, (void **)&p)) && p)
+        {
+            unsigned s = 0x12345678u;
+            for (UINT y = 0; y < height; ++y)
+            {
+                unsigned char *row = p + fc.Offset + (UINT64)y * fc.Footprint.RowPitch;
+                for (UINT x = 0; x < width * 4u; ++x) { s = s * 1664525u + 1013904223u; row[x] = (unsigned char)(s >> 24); }
+            }
+            upc->Unmap(0, nullptr);
+        }
+        if (SUCCEEDED(upm->Map(0, nullptr, (void **)&p)) && p) { memset(p, 0, (size_t)szm); upm->Unmap(0, nullptr); }
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.pResource = tex_color; src.pResource = upc; src.PlacedFootprint = fc;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        dst.pResource = tex_mvec; src.pResource = upm; src.PlacedFootprint = fm;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b[2]{};
+        for (int i = 0; i < 2; ++i)
+        {
+            b[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[i].Transition.pResource = i ? tex_mvec : tex_color;
+            b[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cl->ResourceBarrier(2, b);
+        cl->Close();
+        ID3D12CommandList *ls[1] = { cl }; q->ExecuteCommandLists(1, ls);
+        q->Signal(fe, 1);
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fe->GetCompletedValue() < 1) { fe->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 10000); }
+        CloseHandle(ev);
+        upc->Release(); upm->Release();
+        al->Reset(); cl->Reset(al, nullptr);
+    }
+
+    // ---- the add-on's constant block (P1.2) ----
+    params->Set("DLSSNR.MVec", tex_mvec);
+    params->Set("DLSSNR.ColorSubrectBaseX", 0u);  params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+    params->Set("DLSSNR.ColorSubrectWidth", width); params->Set("DLSSNR.ColorSubrectHeight", height);
+    params->Set("DLSSNR.OutputSubrectBaseX", 0u); params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+    params->Set("DLSSNR.OutputSubrectWidth", width); params->Set("DLSSNR.OutputSubrectHeight", height);
+    params->Set("DLSSNR.MVecSubrectBaseX", 0u);   params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+    params->Set("DLSSNR.MVecSubrectWidth", width); params->Set("DLSSNR.MVecSubrectHeight", height);
+    params->Set("DLSSNR.MVecScaleX", 1.0f); params->Set("DLSSNR.MVecScaleY", 1.0f);
+    params->Set("DLSSNR.DepthInverted", 0u);
+    params->Set("DLSSNR.LocalToneStrength", 1.142f);
+    params->Set("DLSSNR.LocalStructureStrength", 1.092f);
+    params->Set("DLSSNR.SkinStructureStrength", 1.025f);
+    params->Set("DLSSNR.UseAutoMask", 1u);
+    params->Set("DLSSNR.Depth", (ID3D12Resource *)nullptr);
+    params->Set("DLSSNR.Intensity", 1.0f);
+
+    // ---- create: one handle per pass, as the add-on (P4.1) ----
+    NVSDK_NGX_Handle *h[2] = {};
+    for (unsigned p = 0; p < passes; ++p)
+    {
+        unsigned long seh = 0;
+        LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        r = create_guarded(n.create, cl, params, &h[p], &seh);
+        QueryPerformanceCounter(&t1);
+        out("  CreateFeature(Reserved18) %ux%u pass %u: 0x%08X (%s) handle=%p elapsed=%.0fms", width, height, p + 1u,
+            (unsigned)r, rname(r), (void *)h[p], (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        if ((unsigned)r == SEH_FAULT) { out("BENCH: CRASH INSIDE NGX at CreateFeature (0x%08lX)", seh); return 4; }
+        if (r != NVSDK_NGX_Result_Success || h[p] == nullptr) { out("BENCH: CreateFeature failed"); return 4; }
+    }
+    cl->Close(); { ID3D12CommandList *ls[1] = { cl }; q->ExecuteCommandLists(1, ls); }
+    q->Signal(fe, 2);
+    {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fe->GetCompletedValue() < 2) { fe->SetEventOnCompletion(2, ev); WaitForSingleObject(ev, 10000); }
+        CloseHandle(ev);
+    }
+
+    // ---- the loop ----
+    bench_stat st[2], st_frame;
+    const unsigned warm = 10u;
+    UINT64 fence_v = 2;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    int rc = 0;
+    for (unsigned fr = 0; fr < frames && rc == 0; ++fr)
+    {
+        al->Reset(); cl->Reset(al, nullptr);
+        for (unsigned p = 0; p < passes; ++p)
+        {
+            params->Set("DLSSNR.Color", (p == 0) ? tex_color : tex_out[p - 1]);
+            params->Set("DLSSNR.Output", tex_out[p]);
+            params->Set("DLSSNR.Reset", (fr == 0) ? 1u : 0u);
+            cl->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, p * 2u);
+            unsigned long seh = 0;
+            r = evaluate_guarded(evaluate, cl, h[p], params, &seh);
+            cl->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, p * 2u + 1u);
+            if ((unsigned)r == SEH_FAULT) { out("BENCH: CRASH INSIDE NGX at EvaluateFeature frame %u pass %u (0x%08lX)", fr, p + 1u, seh); rc = 5; break; }
+            if (r != NVSDK_NGX_Result_Success) { out("BENCH: EvaluateFeature frame %u pass %u: 0x%08X (%s)", fr, p + 1u, (unsigned)r, rname(r)); rc = 5; break; }
+            if (p + 1u < passes)
+            {
+                // pass 2 reads what pass 1 wrote: UAV -> SRV on out[0], as the add-on's copy step orders it
+                D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = tex_out[0]; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                cl->ResourceBarrier(1, &b);
+            }
+        }
+        if (rc != 0) break;
+        if (passes > 1u)
+        {   // back to UAV for the next frame
+            D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = tex_out[0]; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            cl->ResourceBarrier(1, &b);
+        }
+        cl->ResolveQueryData(qh, D3D12_QUERY_TYPE_TIMESTAMP, 0, NQ, rb, 0);
+        cl->Close();
+        { ID3D12CommandList *ls[1] = { cl }; q->ExecuteCommandLists(1, ls); }
+        ++fence_v; q->Signal(fe, fence_v);
+        if (fe->GetCompletedValue() < fence_v) { fe->SetEventOnCompletion(fence_v, ev); if (WaitForSingleObject(ev, 10000) != WAIT_OBJECT_0) { out("BENCH: GPU did not finish frame %u in 10 s", fr); rc = 5; break; } }
+        UINT64 *ts = nullptr;
+        D3D12_RANGE rr{ 0, NQ * sizeof(UINT64) };
+        if (SUCCEEDED(rb->Map(0, &rr, (void **)&ts)) && ts)
+        {
+            double frame_ms = 0;
+            for (unsigned p = 0; p < passes; ++p)
+            {
+                const double ms = (double)(ts[p * 2u + 1u] - ts[p * 2u]) * 1000.0 / (double)ts_freq;
+                if (fr >= warm) st[p].add(ms);
+                frame_ms += ms;
+            }
+            if (fr >= warm) st_frame.add(frame_ms);
+            D3D12_RANGE none{ 0, 0 }; rb->Unmap(0, &none);
+        }
+    }
+    CloseHandle(ev);
+
+    // ---- report ----
+    const double per_frame = st_frame.mean();
+    const char *budget = (st_frame.n == 0) ? "none" : (per_frame <= 6.9) ? "144" : (per_frame <= 8.3) ? "120" : (per_frame <= 16.7) ? "60" : "below 60";
+    out("");
+    out("BENCH RESULT %ux%u, %u pass(es), %u frame(s) measured of %u (first %u warm-up excluded):", width, height, passes, st_frame.n, frames, warm);
+    for (unsigned p = 0; p < passes; ++p)
+        out("  pass %u: mean %.3f ms  min %.3f  max %.3f  (n=%u)", p + 1u, st[p].mean(), st[p].mn, st[p].mx, st[p].n);
+    out("  per frame: mean %.3f ms  min %.3f  max %.3f  -> fits a %s fps budget", per_frame, st_frame.mn, st_frame.mx, budget);
+    if (rc != 0) out("BENCH: ended early (code %d); the numbers above cover the frames that ran", rc);
+    if (result_path != nullptr && result_path[0] != L'\0')
+    {
+        FILE *rf = nullptr;
+        if (_wfopen_s(&rf, result_path, L"wb") == 0 && rf != nullptr)
+        {
+            DXGI_ADAPTER_DESC1 d{}; IDXGIAdapter1 *a = adapter_at((UINT)neural_index); if (a) { a->GetDesc1(&d); a->Release(); }
+            fprintf(rf, "; MGPU Bridge NR bench - written by nrcheck.exe --bench, read by the launcher\r\n");
+            fprintf(rf, "Result=%s\r\n", rc == 0 ? "ok" : "ended-early");
+            fprintf(rf, "AdapterIndex=%d\r\nAdapterLuid=0x%08lX-0x%08lX\r\nAdapterName=%ls\r\n", neural_index,
+                    (unsigned long)d.AdapterLuid.HighPart, (unsigned long)d.AdapterLuid.LowPart, d.Description);
+            fprintf(rf, "Width=%u\r\nHeight=%u\r\nPasses=%u\r\nFramesMeasured=%u\r\nWarmup=%u\r\n", width, height, passes, st_frame.n, warm);
+            for (unsigned p = 0; p < passes; ++p)
+                fprintf(rf, "Pass%uMeanMs=%.3f\r\nPass%uMinMs=%.3f\r\nPass%uMaxMs=%.3f\r\n", p + 1u, st[p].mean(), p + 1u, st[p].mn, p + 1u, st[p].mx);
+            fprintf(rf, "FrameMeanMs=%.3f\r\nFrameMinMs=%.3f\r\nFrameMaxMs=%.3f\r\nBudgetFps=%s\r\n", per_frame, st_frame.mn, st_frame.mx, budget);
+            fclose(rf);
+        }
+    }
+    for (unsigned p = 0; p < passes; ++p) if (h[p] && n.release) n.release(h[p]);
+    (void)other;   // the game's device stays alive until the process exits, as nrcheck_run
+    return rc;
+}

@@ -23,3 +23,15 @@ If PowerShell refuses to run the script, open a terminal in the game folder and 
 For each GPU, the check starts the other GPU first, as a game does. It then tries to start DLSS-NR on this GPU up to eight times, and changes one thing between tries. It stops at the first success and reports which try worked.
 
 The check takes about a minute.
+
+## The bench (experimental, R268)
+
+This measures what one GPU sustains for DLSS-NR at a resolution, without a game. No game runs. It reads nothing from a game and changes nothing.
+
+1. Close the game.
+2. In the game folder, beside the `mgpu\` folder, run:
+   `nrcheck.exe --bench --neural <adapter index> --res 2560x1440 --passes 1 --frames 300`
+   The adapter index is the one `nrcheck.exe` lists for your neural GPU. `--other <index>` creates the game's device first, as a game would.
+3. It prints the time of each pass and whether a frame fits 60, 120 or 144 fps, and writes `nrbench_result.ini` beside `nrcheck.exe`.
+
+The first 10 frames are warm-up and are not counted. Upscaling (SR) is not part of this bench yet.

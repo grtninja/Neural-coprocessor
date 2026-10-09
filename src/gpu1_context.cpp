@@ -13,6 +13,7 @@
 #pragma comment(lib, "dcomp.lib")
 #include <d3d11.h>
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "advapi32.lib")   // R240: RegGetValueW for the NGX core locator
 #include <combaseapi.h>
 #include <tlhelp32.h>   // R186: one module snapshot at startup, nothing else
 #include <d3d12.h>
@@ -30,7 +31,8 @@
                      // transitively by windows.h on MSVC, made explicit because a
                      // load path that fails to compile is not a fix.
 #include <mutex>
-#include <atomic>    // R78: one counter, written from the game's render thread
+#include <atomic>
+#include <vector>   // R258: the calibration profiles    // R78: one counter, written from the game's render thread
                      // without this file's mutex - it counts the times that
                      // mutex was NOT taken, so it cannot be guarded by it.
 
@@ -42,6 +44,7 @@
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
+#include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -349,6 +352,110 @@ static HWND  g_game_hwnd    = nullptr;
 static void *g_dcomp_device = nullptr;
 static void *g_dcomp_target = nullptr;
 static void *g_dcomp_visual = nullptr;
+// ---- R271: DcompFit=1 (OFF by default) - the composed visual scaled to the game window ----
+//
+// The composition visual shows the neural frame at the SOURCE size, 1:1,
+// anchored at the game window's top-left, clipped to the window (no
+// transform is set on it). When the game's backbuffer is larger than the
+// window it lands in - DSR, a render resolution above the display, a
+// backbuffer sized to a virtual desktop - the display shows a corner of the
+// neural frame while the game's own present scales. This could not be
+// reproduced on the dev rig, so it is not the default path: with the key
+// absent nothing here runs and the visual is exactly what it was. With
+// DcompFit=1 a scale transform maps source -> the window's client size, set
+// once at creation and again after the chain is resized to the source.
+static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
+// R271c. Three values: 0 never, 1 always, 2 auto (the default) - a guard
+// that engages only when the source is larger than the game window's client
+// in either axis, which is the one condition under which the 1:1 visual
+// cannot be showing the whole frame. On a rig where 1:1 is right, auto does
+// nothing and logs one line saying the sizes agreed. Applied in the same
+// launch, at the site that already resizes and commits the chain
+// (present_resize): no file write, no new lock use, no next-launch marker.
+static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
+namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
+// R278: how many velocity candidates the census found eligible (probe.cpp), handed
+// over by dllmain each frame - this file names no probe type.
+std::atomic<unsigned> g_mvec_elig_n{0};
+void set_mvec_eligible_count(unsigned n) { g_mvec_elig_n.store(n, std::memory_order_relaxed); }
+// R280c: the virtual velocity target is live (mvec_extract built it). On this path the
+// units are uv by construction and the warp test writes nothing: every launch is the same launch.
+std::atomic<bool> g_mvec_x_active{false};
+void set_mvec_extract_active(bool on) { g_mvec_x_active.store(on, std::memory_order_relaxed); }
+// R280e: the judge's choice of write edge (0 last, 1 first) and the module's report of
+// how many write edges the last frame had. The judge alternates while undecided.
+std::atomic<int> g_mvec_x_edge_req{0};
+std::atomic<unsigned> g_mvec_x_edges{0};
+int  mvec_extract_edge_request() { return g_mvec_x_edge_req.load(std::memory_order_relaxed); }
+void set_mvec_extract_edges(unsigned n) { g_mvec_x_edges.store(n, std::memory_order_relaxed); }
+std::atomic<bool> g_mvec_x_deciding{false};   // R280j
+// R280o: see gpu1_context.hpp. Thread-local so a barrier-route copy recorded
+// concurrently on another thread is never mistaken for the tap's.
+static thread_local bool t_tap_copy_scope = false;
+void tap_copy_scope(bool on) { t_tap_copy_scope = on; }
+bool game_contract_seen()   // R280k
+{
+    if (mgpu::calibrator::game_ngx_init_seen()) return true;
+    mgpu::calibrator::table ct;
+    return mgpu::calibrator::read(ct) && ct.have != 0u;
+}
+void set_mvec_extract_deciding(bool on) { g_mvec_x_deciding.store(on, std::memory_order_relaxed); }
+// R278b: the tap the learning turned on for this session (0 = none). dllmain reads it each frame.
+std::atomic<int> g_mvec_tap_live{0};
+int mvec_tap_live() { return g_mvec_tap_live.load(std::memory_order_relaxed); }
+// R278f: probe's neighbours of the current candidate (via dllmain), and the
+// learning's request to switch live (-1 = none).
+std::atomic<int> g_mv_pick_idx{0}, g_mv_next_same{-1}, g_mv_next_class{-1}, g_mv_cand_req{-1};
+void set_mvec_neighbours(int cur, int next_same, int next_class)
+{ g_mv_pick_idx.store(cur, std::memory_order_relaxed); g_mv_next_same.store(next_same, std::memory_order_relaxed); g_mv_next_class.store(next_class, std::memory_order_relaxed); }
+int mvec_candidate_request() { return g_mv_cand_req.load(std::memory_order_relaxed); }
+static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
+{
+    if (g_dcomp_fit == 0 || g_dcomp_device == nullptr || g_dcomp_visual == nullptr || g_game_hwnd == nullptr) return;
+    if (src_w == 0u || src_h == 0u) return;
+    RECT rc{};
+    if (GetClientRect(g_game_hwnd, &rc) == FALSE) return;
+    const unsigned cw = (unsigned)(rc.right - rc.left), ch = (unsigned)(rc.bottom - rc.top);
+    if (cw == 0u || ch == 0u) return;
+    if (g_dcomp_fit == 2 && !(src_w > cw || src_h > ch))
+    {
+        char l[260];
+        snprintf(l, sizeof l,
+                 "[MGPU][R271] DcompFit=auto: source %ux%u is within the game window's client %ux%u at %s - "
+                 "nothing applied, the visual stays 1:1.", src_w, src_h, cw, ch, where);
+        mgpu::diag::info(l);
+        return;
+    }
+    IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
+    IDCompositionVisual *visual = (IDCompositionVisual *)g_dcomp_visual;
+    IDCompositionScaleTransform *xf = (IDCompositionScaleTransform *)g_dcomp_scale;
+    HRESULT hr = S_OK;
+    if (xf == nullptr)
+    {
+        hr = dc->CreateScaleTransform(&xf);
+        if (FAILED(hr) || xf == nullptr)
+        {
+            char l[200];
+            snprintf(l, sizeof l, "[MGPU][R271] DcompFit=1: CreateScaleTransform hr=0x%08X at %s - the visual stays 1:1.", (unsigned)hr, where);
+            mgpu::diag::warn(l);
+            return;
+        }
+        g_dcomp_scale = xf;
+    }
+    const float sx = (float)cw / (float)src_w, sy = (float)ch / (float)src_h;
+    xf->SetCenterX(0.0f); xf->SetCenterY(0.0f);
+    xf->SetScaleX(sx); xf->SetScaleY(sy);
+    hr = visual->SetTransform(xf);
+    const HRESULT ch_hr = SUCCEEDED(hr) ? dc->Commit() : hr;
+    char l[460];
+    snprintf(l, sizeof l,
+             "[MGPU][R271] DcompFit=%s%s: composed visual scaled %.3f x %.3f (source %ux%u -> game window "
+             "client %ux%u) at %s. SetTransform hr=0x%08X Commit hr=0x%08X. The compositor does the "
+             "scaling; the neural stage still runs at the source size.",
+             (g_dcomp_fit == 2) ? "auto" : "1", (g_dcomp_fit == 2) ? " ENGAGED - the source is larger than the game window" : "",
+             (double)sx, (double)sy, src_w, src_h, cw, ch, where, (unsigned)hr, (unsigned)ch_hr);
+    if (SUCCEEDED(ch_hr)) mgpu::diag::info(l); else mgpu::diag::warn(l);
+}
 // The D3D11 device the composition device renders with. Owned here only so its
 // lifetime matches the composition device's; nothing ever draws with it.
 static void *g_dcomp_d3d11  = nullptr;
@@ -360,7 +467,36 @@ static bool  g_dcomp_rooted = false;
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
 // the game's own swapchain was created against, not a window we went looking
 // for. Only called when DcompOverlay=1, so mode 0 never reaches it.
-void set_game_hwnd(void *hwnd) { if (hwnd != nullptr) g_game_hwnd = (HWND)hwnd; }
+// R273b. The detection's bookkeeping: whether the composition decision is
+// still pending (inputs not there yet), the window it was decided on, and
+// the bridge thread's request to settle it now.
+static std::atomic<int>  g_dcomp_undecided{0};      // 1 while the R273 detection has no definitive input
+static std::atomic<int>  g_dcomp_force_decide{0};   // 1 = the bridge thread waited long enough; decide now
+static HWND              g_dcomp_decided_hwnd = nullptr;
+void set_game_hwnd(void *hwnd)
+{
+    if (hwnd == nullptr) return;
+    g_game_hwnd = (HWND)hwnd;
+    // R273b: a title that recreates its swapchain on a NEW window after the
+    // composition decision (Starfield rebuilds its chain many times) gets a
+    // line saying the decision was made on the old one - never a silent
+    // mismatch. The decision stands for the run; DcompMultiDisplay=1 skips
+    // the detection for such a title.
+    if (g_dcomp_decided_hwnd != nullptr && g_dcomp_decided_hwnd != (HWND)hwnd)
+    {
+        static std::atomic<int> said{0};
+        if (said.exchange(1) == 0)
+        {
+            char l[300];
+            snprintf(l, sizeof l,
+                     "[MGPU][R273] the game's window changed after the composition decision: decided on "
+                     "hwnd=0x%p, now 0x%p. The decision stands for this run. If [R273] refused on the first "
+                     "window and this title is meant to compose, set DcompMultiDisplay=1.",
+                     (void *)g_dcomp_decided_hwnd, hwnd);
+            mgpu::diag::warn(l);
+        }
+    }
+}
 
 // Root or unroot the visual. ONE call plus a Commit, and that is the whole
 // mechanism: the swapchain keeps presenting into the visual either way and the
@@ -421,6 +557,21 @@ void dcomp_root_on_first_neural_frame()
 // header at the top of this file for what was tried instead.
 void dcomp_set_visible(bool on)
 {
+    // R241a. Before the first neural frame there is nothing of ours worth
+    // covering the game with: an overlay-closed before the arm rooted the
+    // present chain's stale content over the game (Rise, the 'stuck logo
+    // overlay' during a hold; Skyrim SK-3 14:14:06). Rooting waits for P5.0.
+    if (on)
+    {
+        bool shown = false;
+        { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); shown = S.neural_shown; }
+        if (!shown)
+        {
+            mgpu::diag::info("[MGPU][V53] overlay closed before the first neural frame: the bridge visual stays "
+                             "UNROOTED (hidden) until NR has a frame to show (R241).");
+            return;
+        }
+    }
     (void)dcomp_set_rooted(on, on ? "overlay closed" : "overlay open");
 }
 
@@ -535,6 +686,8 @@ bool create_present_chain(HWND hwnd)
             ((IDCompositionDevice *)g_dcomp_device)->Commit();
             ((IDCompositionDevice *)g_dcomp_device)->WaitForCommitCompletion();
         }
+        if (g_dcomp_scale != nullptr)
+        { ((IDCompositionScaleTransform *)g_dcomp_scale)->Release(); g_dcomp_scale = nullptr; }   // R271
         if (g_dcomp_visual != nullptr)
         { ((IDCompositionVisual *)g_dcomp_visual)->Release(); g_dcomp_visual = nullptr; }
         if (g_dcomp_target != nullptr)
@@ -840,6 +993,8 @@ bool create_present_chain(HWND hwnd)
             g_dcomp_target = target;
             g_dcomp_visual = visual;
             g_dcomp_rooted = false;
+            g_dcomp_fit = ini_read_dcomp_fit();   // R271c, once per chain: 0 off, 1 on, 2 auto (absent = auto)
+            if (g_dcomp_fit == 1) dcomp_fit_apply(width, height, "chain creation");   // auto waits for the source size (present_resize)
 
             char v49[760];
             snprintf(v49, sizeof v49,
@@ -1883,6 +2038,18 @@ bool has_device()
     return S.device != nullptr;
 }
 
+bool device_ref_for_reflex(void **out)   // R261
+{
+    if (out == nullptr) return false;
+    *out = nullptr;
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (S.device == nullptr) return false;
+    S.device->AddRef();
+    *out = static_cast<IUnknown *>(S.device);
+    return true;
+}
+
 bool device_removed_reason(HRESULT &out)
 {
     auto &S = st();
@@ -1963,27 +2130,73 @@ namespace
         const NVSDK_NGX_FeatureCommonInfo *InFeatureInfo,
         NVSDK_NGX_Version InSDKVersion);
 
-    // THE CORE'S Init TAKES FOUR ARGUMENTS. The five-argument form above is the
-    // one an application sees when it links the SDK's own library; the driver's
-    // _nvngx.dll export is the NGX_SNIPPET_BUILD form in nvsdk_ngx.h:
-    //   NVSDK_NGX_D3D12_Init(AppId, DataPath, Device, NVSDK_NGX_Version)
-    // Disassembled (driver 617.14), it compares the 4th argument (r9d) with
-    // 0x15 - "jle ok", else FAIL_OutOfDate - and never reads a 5th. Called
-    // through ngx_pf_init, r9 held the address of the FeatureCommonInfo: its
-    // low 32 bits, read as a SIGNED int, are <= 0x15 only when bit 31 is set,
-    // which ASLR decides per process. That is the intermittent FAIL_OutOfDate.
-    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_core)(
-        unsigned long long InApplicationId,
-        const wchar_t *InApplicationDataPath,
-        ID3D12Device *InDevice,
-        NVSDK_NGX_Version InSDKVersion);
-
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_ext)(
         unsigned long long InApplicationId,
         const wchar_t *InApplicationDataPath,
         ID3D12Device *InDevice,
         NVSDK_NGX_Version InSDKVersion,
         const NVSDK_NGX_Parameter *InParameters);
+
+    // R274 (MoHasan9505, PR against 0.2.6 - "Fixes #44"). THE CORE'S Init MAY
+    // TAKE FOUR ARGUMENTS. The driver's _nvngx.dll export can be the
+    // NGX_SNIPPET_BUILD form in nvsdk_ngx.h: (AppId, DataPath, Device,
+    // Version). Disassembled by him on driver 617.14: it compares the 4th
+    // argument (r9d) with 0x15 and never reads a 5th. Called through the
+    // 5-argument ngx_pf_init, r9 held the address of the FeatureCommonInfo,
+    // and its low 32 bits read as a signed int pass the check only when ASLR
+    // sets bit 31 - the intermittent FAIL_OutOfDate, SK-23's "poisoned NGX".
+    // R256's Init_Ext puts the version in r9 by its own shape, which is why
+    // the failure went quiet here before the cause was known. This typedef is
+    // the LAST rung of a ladder, never the first: a driver whose Init really
+    // takes five arguments would read a junk FeatureCommonInfo from a 4-arg
+    // call, so the 4-arg form is tried only after the 5-arg form has answered
+    // FAIL_OutOfDate - the launches that were already failing.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_init_core)(
+        unsigned long long InApplicationId,
+        const wchar_t *InApplicationDataPath,
+        ID3D12Device *InDevice,
+        NVSDK_NGX_Version InSDKVersion);
+
+    // R274. The core Init ladder, one shape for both call sites (P1.0c and
+    // P4.1): Init_Ext (R256) when the core exports it; the 5-argument Init as
+    // shipped; the 4-argument Init only after the 5-argument one returned
+    // FAIL_OutOfDate. Each rung runs only if the previous one is absent or
+    // answered OutOfDate, so a driver that works at the first rung is
+    // byte-identical to before. `which` names the rungs taken;
+    // `callback_installed` is true only when the 5-arg rung answered (the
+    // only shape that carries the FeatureCommonInfo).
+    static NVSDK_NGX_Result ngx_core_init_ladder(ngx_pf_init_ext p_ext, ngx_pf_init p_5,
+                                                 unsigned long long app_id, const wchar_t *data_path,
+                                                 ID3D12Device *dev, const NVSDK_NGX_FeatureCommonInfo *common,
+                                                 char *which, size_t which_n, bool *callback_installed)
+    {
+        NVSDK_NGX_Result r = NVSDK_NGX_Result_FAIL_OutOfDate;
+        which[0] = '\0';
+        *callback_installed = false;
+        if (p_ext != nullptr)
+        {
+            r = p_ext(app_id, data_path, dev, NVSDK_NGX_Version_API, nullptr);   // R256
+            snprintf(which, which_n, "Init_Ext");
+            if (r != NVSDK_NGX_Result_FAIL_OutOfDate) return r;
+        }
+        if (p_5 == nullptr) return r;
+        {
+            r = p_5(app_id, data_path, dev, common, NVSDK_NGX_Version_API);   // R255
+            char w[200];
+            snprintf(w, sizeof w, "%s%sInit (5-arg%s)", which, which[0] ? " OutOfDate -> " : "", (p_ext != nullptr) ? "" : ", the core has no Init_Ext");
+            snprintf(which, which_n, "%s", w);
+            *callback_installed = true;
+            if (r != NVSDK_NGX_Result_FAIL_OutOfDate) return r;
+        }
+        {
+            r = ((ngx_pf_init_core)p_5)(app_id, data_path, dev, NVSDK_NGX_Version_API);   // R274
+            char w[260];
+            snprintf(w, sizeof w, "%s OutOfDate -> Init (4-arg, R274: the core's export reads the version from the 4th argument)", which);
+            snprintf(which, which_n, "%s", w);
+            *callback_installed = false;
+        }
+        return r;
+    }
 
     typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_get_cap_params)(
         NVSDK_NGX_Parameter **OutParameters);
@@ -2149,6 +2362,296 @@ namespace
     //
     // Formats without an sRGB variant are returned unchanged, so the Dawnwalker
     // path is byte-identical to what it was.
+    // R239. Our NGX Init must not land while one of the game's is inside the
+    // NGX core. TR-14b (Rise, D3D11): ours 77 ms after the game's Init_Ext
+    // entered -> FAIL_OutOfDate, and every later Init on our device kept
+    // that answer (P4.1 six seconds later: OutOfDate -> NotInitialized ->
+    // ERROR 302); at 217-241 ms after entry (TR-13, TR-13b, TR-14) ->
+    // Success. Bounded: a title that never inits NGX never waits, and a
+    // game Init that never returns stops holding us after the bound.
+    void ngx_wait_for_game_init(const char *tag)
+    {
+        if (!mgpu::calibrator::game_ngx_init_in_flight()) return;
+        const ULONGLONG t0 = GetTickCount64();
+        unsigned long long waited = 0;
+        while (mgpu::calibrator::game_ngx_init_in_flight() && (waited = GetTickCount64() - t0) < 3000ull)
+            Sleep(1);
+        char w[260];
+        snprintf(w, sizeof w,
+                 "[MGPU][R239] %s: waited %llu ms for the game's NGX Init to return before our own%s",
+                 tag, waited,
+                 mgpu::calibrator::game_ngx_init_in_flight() ? " - still in flight at the bound, going ahead" : "");
+        mgpu::diag::info(w);
+    }
+
+    // R245 (debug instrument). TraceNvapi=1: turn the calibrator's nvapi trace
+    // on and patch the import tables of everything loaded since install - the
+    // NGX core among them, loaded by R240 moments before this - so the core's
+    // GetProcAddress and nvapi_QueryInterface calls during the Init below go
+    // through the trace. Off (the default): one ini read, nothing else.
+    bool ini_read_flag(const char *key);   // defined with the ini readers below
+
+    // R255. THE APPLICATION ID THIS ADD-ON INITS NGX WITH. SK-21 (poisoned):
+    // the same core, device, data path and second answered OutOfDate to our
+    // Init with app id 0 and Success to Init_Ext with 0x4D475055 ("MGPU"),
+    // twice; adapter (R249), API (R250) and data path (R251 b2) made no
+    // difference. The game's own accepted call carries its app id. So ours
+    // carries one too. NgxAppId in mgpu.ini overrides (decimal); 0 restores
+    // the old call for comparison. Read once per Init, like NGXLog.
+    unsigned long long ngx_app_id()
+    {
+        const int v = ui_ini_read("NgxAppId", 0x4D475055);
+        return (unsigned long long)(unsigned)v;
+    }
+
+    void ngx_trace_before_init(const char *site)
+    {
+        if (!ini_read_flag("TraceNvapi")) return;
+        mgpu::calibrator::set_trace_nvapi(true);
+        const unsigned hits = mgpu::calibrator::rescan_now();
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][R245] %s: import tables rescanned before the Init, %u slot(s) newly patched",
+                 site, hits);
+        mgpu::diag::info(l);
+    }
+
+    // R240. THE NGX CORE LOCATOR. Every title before Skyrim had already loaded
+    // _nvngx.dll (its own DLSS did), so GetModuleHandle found it. A title with
+    // no NGX contract loads nothing, and LoadLibrary by bare name fails: the
+    // core lives in the driver store, not on the search path (SK-1:
+    // "_nvngx.dll=not found", P1.0c PROBE FAILED at exports, NR cannot start).
+    // Rungs, in order, each logged once: resident; bare name; the registry
+    // path the driver writes (HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore
+    // \FullPath - the route P0_RECORD section 09 recorded); System32. Never
+    // freed (the game may use it once loaded).
+    // R247: the locator's state lives here (not function-static) so the
+    // retry path (ngx_reload_for_retry, public, below) can drop the core we
+    // loaded and let the locator load it again.
+    HMODULE     s_core  = nullptr;
+    const char *s_how   = "not found";
+    bool        s_tried = false;
+
+    HMODULE ngx_find_core(const char **how_out)
+    {
+        if (s_core != nullptr) { if (how_out) *how_out = s_how; return s_core; }
+        HMODULE h = GetModuleHandleW(L"_nvngx.dll");
+        if (h != nullptr) { s_core = h; s_how = "already resident"; if (how_out) *how_out = s_how; return h; }
+        if (s_tried) { if (how_out) *how_out = s_how; return nullptr; }
+        s_tried = true;
+        h = LoadLibraryW(L"_nvngx.dll");
+        if (h != nullptr) { s_core = h; s_how = "loaded by name (search path)"; }
+        wchar_t path[MAX_PATH * 2] = {};
+        static char where[MAX_PATH * 2] = {};
+        if (h == nullptr)
+        {
+            DWORD cb = sizeof path;
+            const LSTATUS rs = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+                                            L"FullPath", RRF_RT_REG_SZ, nullptr, path, &cb);
+            if (rs == ERROR_SUCCESS && path[0] != L'\0')
+            {
+                const size_t n = wcslen(path);
+                if (n + 12 < MAX_PATH * 2)
+                {
+                    if (path[n - 1] != L'\\') wcscat_s(path, L"\\");
+                    wcscat_s(path, L"_nvngx.dll");
+                    h = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                    if (h != nullptr)
+                    {
+                        WideCharToMultiByte(CP_UTF8, 0, path, -1, where, sizeof where, nullptr, nullptr);
+                        s_core = h; s_how = "loaded from the registry NGXCore\\FullPath";
+                    }
+                }
+            }
+            if (h == nullptr)
+            {
+                char rl[200]; snprintf(rl, sizeof rl, "[MGPU][R240] NGX core: registry NGXCore\\FullPath %s (status %ld)",
+                                       rs == ERROR_SUCCESS ? "read, but _nvngx.dll did not load from it" : "not readable", (long)rs);
+                mgpu::diag::info(rl);
+            }
+        }
+        if (h == nullptr)
+        {
+            wchar_t sys[MAX_PATH] = {};
+            if (GetSystemDirectoryW(sys, MAX_PATH) != 0)
+            {
+                _snwprintf_s(path, MAX_PATH * 2, _TRUNCATE, L"%ls\\_nvngx.dll", sys);
+                h = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                if (h != nullptr)
+                {
+                    WideCharToMultiByte(CP_UTF8, 0, path, -1, where, sizeof where, nullptr, nullptr);
+                    s_core = h; s_how = "loaded from System32";
+                }
+            }
+        }
+        char l[MAX_PATH * 2 + 160];
+        if (h != nullptr)
+            snprintf(l, sizeof l, "[MGPU][R240] NGX core (_nvngx.dll): %s%s%s. A title with no NGX contract never loads it; "
+                                  "this add-on does, for its own session on GPU 1.", s_how, where[0] ? " path=" : "", where);
+        else
+            snprintf(l, sizeof l, "[MGPU][R240] NGX core (_nvngx.dll) NOT FOUND: not resident, not on the search path, not at the "
+                                  "registry NGXCore\\FullPath, not in System32. DLSS-NR cannot start on this title: the driver's NGX "
+                                  "core could not be located. Check the NVIDIA driver install.");
+        if (h != nullptr) mgpu::diag::info(l); else mgpu::diag::error(l);
+        if (how_out) *how_out = s_how;
+        return h;
+    }
+
+    // ---- R244: THE DEPTH-CONVENTION PROBE, ON THE CONSUMER, BOTH APIS ----
+    //
+    // DepthInverted was a plain ini key fed to the NGX DepthInverted flag at
+    // the arm; nothing ever read the bytes to check it (Skyrim inherited
+    // Rise's 1 and runs standard depth - SK-5). At seals 300, 900 and 1800
+    // the consumer copies the slot's depth region (a placed footprint in
+    // s.nxfer, GPU 1) into a readback buffer on s.nl - the frame's own fence
+    // wait completes it - and reads it the next frame. Verdict: a frame
+    // almost entirely at one value is a frame cleared to its far plane
+    // (1.0 = standard, 0.0 = reversed-Z); otherwise the top 10% of rows (sky)
+    // against the bottom 10% (near). A confident verdict that disagrees with
+    // the ini is written back with the P7.2 writer (ArmCrashed's) for the
+    // next launch: the key fixes itself for people who never open the ini.
+    // This session's NR keeps the flag it was created with; the line says so.
+    // R257. THE VECTOR-UNITS PROBE. A tapped velocity target (R254) comes with
+    // no parameter block saying what its numbers mean; NR expects pixels. One
+    // readback of the transported region at seals 300/900/1800, sampled every
+    // 2nd row / 4th column: magnitude and sign statistics, and a units verdict.
+    // No self-heal: units are a title fact, the MVecScaleX/Y keys apply them.
+    float half_to_float(unsigned short h)
+    {
+        const unsigned s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+        float v;
+        if (e == 0)       v = (float)m * (1.0f / 1024.0f) * (1.0f / 16384.0f);
+        else if (e == 31) v = (m == 0) ? 1e30f : 0.0f;
+        else { unsigned u = ((e + 112u) << 23) | (m << 13); memcpy(&v, &u, 4); }
+        return s ? -v : v;
+    }
+    struct vec_probe_result { unsigned long long n, zeros; double mean_ax, mean_ay, max_ax, max_ay, pos_x, pos_y; const char *verdict; };
+    vec_probe_result vec_probe_eval(const unsigned char *base, unsigned w, unsigned h, unsigned pitch, unsigned fmt)
+    {
+        vec_probe_result r{}; r.verdict = "UNDECIDED";
+        const bool f16 = (fmt == (unsigned)DXGI_FORMAT_R16G16_FLOAT);
+        const bool f32 = (fmt == (unsigned)DXGI_FORMAT_R32G32_FLOAT);
+        if (!f16 && !f32) { r.verdict = "format not R16G16_FLOAT / R32G32_FLOAT - not sampled"; return r; }
+        double sax = 0, say = 0; unsigned long long px = 0, py = 0;
+        for (unsigned y = 0; y < h; y += 2)
+        {
+            const unsigned char *row = base + (size_t)y * pitch;
+            for (unsigned x = 0; x < w; x += 4)
+            {
+                float vx, vy;
+                if (f16) { const unsigned short *p = (const unsigned short *)(row + (size_t)x * 4); vx = half_to_float(p[0]); vy = half_to_float(p[1]); }
+                else     { const float *p = (const float *)(row + (size_t)x * 8); vx = p[0]; vy = p[1]; }
+                ++r.n;
+                const double ax = (vx < 0) ? -(double)vx : (double)vx, ay = (vy < 0) ? -(double)vy : (double)vy;
+                if (ax < 1e-6 && ay < 1e-6) { ++r.zeros; continue; }
+                sax += ax; say += ay;
+                if (ax > r.max_ax) r.max_ax = ax;
+                if (ay > r.max_ay) r.max_ay = ay;
+                if (vx > 0) ++px; if (vy > 0) ++py;
+            }
+        }
+        const unsigned long long nz = r.n - r.zeros;
+        if (nz != 0) { r.mean_ax = sax / (double)nz; r.mean_ay = say / (double)nz; r.pos_x = (double)px / (double)nz; r.pos_y = (double)py / (double)nz; }
+        if (r.n == 0) return r;
+        if (r.zeros * 100ull >= r.n * 95ull) r.verdict = "STILL (>=95% zero): no motion in this frame, or not the per-frame velocity target";
+        else if (r.max_ax <= 4.0 && r.max_ay <= 4.0) r.verdict = "SCREEN-FRACTION units (UV/NDC): MVecScaleX/Y should be the frame size in pixels (sign to settle)";
+        else r.verdict = "PIXEL units: scale 1, only the sign to settle";
+        return r;
+    }
+
+    // R258. SIGN AND SCALE FROM THE PICTURE. Two consecutive transported colour
+    // frames are collapsed (central half of the frame) to a column profile
+    // and a row profile of luminance; cross-correlating frame 1 against frame
+    // 2 gives the image shift in pixels on each axis (a pan is a near-uniform
+    // shift). The mean vector of frame 2 over the same region says what the
+    // velocity buffer thinks that shift was, in its own units. NGX wants
+    // previous-minus-current in pixels, so the factor K that maps the mean
+    // vector to -shift IS the MVecScale key, sign included. K is snapped to
+    // +-frame size (UV units) or +-half of it (NDC) when it lands within 25%
+    // of one and the shift is at least 6 px; anything else is "no usable
+    // motion" for that probe.
+    struct cal_axis { double shift; double mean_v; double k; int cand; int sign; const char *note; };
+    // cand: 0 none, 1 full (frame size), 2 half. sign: +1/-1.
+    double lum_at(const unsigned char *px, unsigned fmt)
+    {
+        switch (fmt)
+        {
+        case 28: case 29: case 87: case 88: case 91:          // RGBA8 / BGRA8 families
+            return (double)px[0] + (double)px[1] + (double)px[2];
+        case 24: { unsigned v; memcpy(&v, px, 4); return (double)(v & 1023u) + (double)((v >> 10) & 1023u) + (double)((v >> 20) & 1023u); }   // R10G10B10A2
+        case 10: { const unsigned short *h = (const unsigned short *)px; return (double)half_to_float(h[0]) + half_to_float(h[1]) + half_to_float(h[2]); }   // RGBA16F
+        default: return 0.0;
+        }
+    }
+    unsigned bpp_of(unsigned fmt) { return (fmt == 10) ? 8u : 4u; }
+
+    cal_axis cal_axis_eval(const double *a, const double *b, unsigned n, double mean_v, double full)
+    {
+        cal_axis r{}; r.note = "no usable motion";
+        r.mean_v = mean_v;
+        if (n < 400) return r;
+        // R258c: HIGH-PASS the profiles first. A static overlay (compass,
+        // crosshair), the vignette and the sky/ground gradient are large,
+        // slow components that do not move with the camera and pin the
+        // correlation peak at zero shift (SK-27: probes 4/5 read shift 0 while
+        // the buffer carried 40-70 px of motion). Subtracting a 64-bin running
+        // mean leaves edges, which are what a pan moves.
+        std::vector<double> ha(n, 0.0), hb(n, 0.0);
+        {
+            const int R = 32; double sa = 0, sb = 0; int cnt = 0;
+            for (int i = 0; i < (int)n; ++i)
+            {
+                sa += a[i]; sb += b[i]; ++cnt;
+                if (i - 2 * R >= 0) { sa -= a[i - 2 * R]; sb -= b[i - 2 * R]; --cnt; }
+                const int c = i - R; if (c >= 0) { ha[c] = a[c] - sa / cnt; hb[c] = b[c] - sb / cnt; }
+            }
+        }
+        const int MAXD = 96;
+        double best = -1e300, at0 = 0; int bestd = 0;
+        for (int dd = -MAXD; dd <= MAXD; ++dd)
+        {
+            double sc = 0; unsigned cnt = 0;
+            for (int i = MAXD + 32; i + MAXD + 32 < (int)n; ++i) { sc += ha[i] * hb[i + dd]; ++cnt; }
+            if (cnt) sc /= cnt;
+            if (dd == 0) at0 = sc;
+            if (sc > best) { best = sc; bestd = dd; }
+        }
+        r.shift = (double)bestd;   // content at i in frame 1 is at i+shift in frame 2
+        // the peak must clearly beat "no shift", or the frame pair is not a usable pan
+        if (bestd == 0 || (bestd < 0 ? -bestd : bestd) < 6 || best <= at0 * 1.10 || (mean_v < 0 ? -mean_v : mean_v) < 1e-5) return r;
+        r.k = (-r.shift) / mean_v;
+        const double ak = (r.k < 0) ? -r.k : r.k;
+        auto within = [](double v, double c) { return v > c * 0.75 && v < c * 1.25; };
+        if (within(ak, full))            { r.cand = 1; r.sign = (r.k < 0) ? -1 : 1; r.note = "UV units (frame size)"; }
+        else if (within(ak, full * 0.5)) { r.cand = 2; r.sign = (r.k < 0) ? -1 : 1; r.note = "NDC units (half frame size)"; }
+        else r.note = "K off every candidate";
+        return r;
+    }
+
+    struct depth_probe_result { int reversed; double top, bottom, p0, p1; const char *verdict; };
+    depth_probe_result depth_probe_eval(const unsigned char *base, unsigned w, unsigned h, unsigned pitch)
+    {
+        depth_probe_result r{ -1, 0.0, 0.0, 0.0, 0.0, "UNDECIDED (flat or featureless frame: menu or loading?)" };
+        const unsigned band = (h / 10u) > 0u ? (h / 10u) : 1u;
+        double top = 0, bot = 0; unsigned long long n0 = 0, n1 = 0, nt = 0, nb = 0, nall = 0;
+        for (unsigned y = 0; y < h; y += 2u)
+        {
+            const float *row = reinterpret_cast<const float *>(base + (size_t)y * pitch);
+            for (unsigned x = 0; x < w; x += 4u)
+            {
+                const float d = row[x]; ++nall;
+                if (d <= 0.0f) ++n0; else if (d >= 1.0f) ++n1;
+                if (y < band) { top += d; ++nt; } else if (y >= h - band) { bot += d; ++nb; }
+            }
+        }
+        r.top = nt ? top / (double)nt : 0.0; r.bottom = nb ? bot / (double)nb : 0.0;
+        r.p0 = nall ? 100.0 * (double)n0 / (double)nall : 0.0; r.p1 = nall ? 100.0 * (double)n1 / (double)nall : 0.0;
+        if (r.p1 >= 95.0)      { r.reversed = 0; r.verdict = "STANDARD (frame cleared to far=1.0)"; }
+        else if (r.p0 >= 95.0) { r.reversed = 1; r.verdict = "REVERSED-Z (frame cleared to far=0.0)"; }
+        else if (r.top > r.bottom + 0.02 || (r.p1 > 2.0 && r.top > r.bottom)) { r.reversed = 0; r.verdict = "STANDARD (far=1.0, near=0.0)"; }
+        else if (r.bottom > r.top + 0.02 || (r.p0 > 2.0 && r.top < r.bottom)) { r.reversed = 1; r.verdict = "REVERSED-Z (far=0.0, near=1.0)"; }
+        return r;
+    }
+
     DXGI_FORMAT nr_linear_format(DXGI_FORMAT f)
     {
         switch (f)
@@ -2488,6 +2991,39 @@ namespace
         mgpu::diag::info(line);
     }
 
+    // ---- D2.0-9: NGX's own logging for OUR session - off unless NGXLog=1 ----
+    //
+    // Requiem C6 (2026-10-05): with MinimumLoggingLevel=VERBOSE the DLSS-NR
+    // snippet wrote 80-190 lines/s into nvngx_dlssnr_*.log in the game folder
+    // (3.8 MB in 4 min, 4x our ReShade.log). Those writes happen INSIDE
+    // EvaluateFeature, on the bridge thread, under s.cs - the mutex the game's
+    // render thread takes every frame. The header: MinimumLoggingLevel
+    // overrides the configured level for every sink when it is higher. At the
+    // loading screen that file slowed to 4-14 lines/s with the disk; in D2.0-7
+    // run 4 the bridge stopped between two of its lines for 49 s. Our callback
+    // received no line at all in those runs (0 [P1.0c][NGX] lines), so the
+    // request bought nothing in the log we read.
+    //
+    // Default: level OFF, and every sink but the callback disabled for this
+    // session (the header requires a valid callback for that; it stays).
+    // NGXLog=1 restores exactly the shipped request: VERBOSE, all sinks kept.
+    // Read once per init, like ProcessCensus at the arm.
+    bool ini_read_flag(const char *key);   // defined with the ini readers below
+    void ngx_logging_info(NVSDK_NGX_LoggingInfo &li, const char *site)
+    {
+        const bool on = ini_read_flag("NGXLog");
+        li.LoggingCallback = ngx_log_callback;
+        li.MinimumLoggingLevel = on ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE
+                                    : NVSDK_NGX_LOGGING_LEVEL_OFF;
+        li.DisableOtherLoggingSinks = !on;
+        char l[200];
+        snprintf(l, sizeof l,
+                 "[MGPU][D20-9] %s: NGX logging for this session %s (NGXLog=%d)",
+                 site, on ? "VERBOSE, every sink kept" : "OFF, other sinks disabled",
+                 on ? 1 : 0);
+        mgpu::diag::info(l);
+    }
+
     // Symbolic names for the result codes so a log line carries both the
     // raw value and what the header calls it. Anything unmapped logs as a
     // bare number rather than as a guess.
@@ -2558,8 +3094,83 @@ namespace
     bool stream_nr_live();
 }
 
+// R247. What the last P1.0c core Init answered, and the handles it used, for
+// the reload-and-retry in worker.cpp. See gpu1_context.hpp.
+std::atomic<bool> g_p1_init_outofdate{false};
+HMODULE           g_p1_snippet_h = nullptr;
+bool              g_p1_snippet_private = false;
+unsigned          g_p1_snippet_loads = 0;   // LoadLibrary calls this file made on the private snippet
+
+// R248. Other live instances of this executable (a previous session still
+// exiting). Toolhelp process snapshot, name compare, own pid excluded.
+unsigned other_instances_of_this_exe(unsigned long *first_pid)
+{
+    if (first_pid) *first_pid = 0;
+    wchar_t self[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0) return 0;
+    const wchar_t *base = wcsrchr(self, L'\\');
+    base = base ? base + 1 : self;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof pe;
+    unsigned n = 0;
+    const DWORD me = GetCurrentProcessId();
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID != me && _wcsicmp(pe.szExeFile, base) == 0)
+            {
+                if (first_pid && *first_pid == 0) *first_pid = (unsigned long)pe.th32ProcessID;
+                ++n;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+bool ngx_probe_init_was_outofdate()
+{
+    return g_p1_init_outofdate.load(std::memory_order_acquire);
+}
+
+bool ngx_reload_for_retry(char *why, size_t why_n)
+{
+    // Only when the refused session is wholly ours: a core this add-on
+    // loaded (a no-contract title) and the private snippet instance. A core
+    // the game owns is never freed here.
+    if (!ngx_probe_init_was_outofdate()) { snprintf(why, why_n, "last Init was not OutOfDate - nothing to retry"); return false; }
+    if (s_core == nullptr || strncmp(s_how, "loaded", 6) != 0)
+    {
+        snprintf(why, why_n, "the NGX core is not ours to reload (%s) - retrying the Init on the same core", s_how);
+        g_p1_init_outofdate.store(false, std::memory_order_release);
+        return true;
+    }
+    const HMODULE core = s_core;
+    s_core = nullptr; s_tried = false; s_how = "not found";
+    const BOOL fc = FreeLibrary(core);
+    const bool core_gone = (GetModuleHandleW(L"_nvngx.dll") == nullptr);
+    unsigned snip_freed = 0; bool snip_gone = false;
+    if (g_p1_snippet_private && g_p1_snippet_h != nullptr)
+    {
+        // One FreeLibrary per LoadLibrary this file made; a reference the
+        // core took stays the core's and goes with it.
+        for (; g_p1_snippet_loads > 0; --g_p1_snippet_loads) { if (FreeLibrary(g_p1_snippet_h)) ++snip_freed; }
+        snip_gone = (GetModuleHandleW(L"nvngx_dlssnr.dll") == nullptr);
+        g_p1_snippet_h = nullptr;
+    }
+    snprintf(why, why_n,
+             "core FreeLibrary=%d -> %s; private snippet FreeLibrary x%u -> %s. The locator loads both again on the retry.",
+             (int)fc, core_gone ? "UNLOADED" : "STILL RESIDENT (another reference holds it)",
+             snip_freed, snip_gone ? "UNLOADED" : (snip_freed ? "STILL RESIDENT" : "not ours / not freed"));
+    g_p1_init_outofdate.store(false, std::memory_order_release);
+    return true;
+}
+
 bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 {
+    g_p1_init_outofdate.store(false, std::memory_order_release);   // R247
     // ---- V43: THE RECOVERY GATE, AND IT IS FIRST ON PURPOSE ----
     //
     // The whole value of a recovery launch is that this module opens NO NGX
@@ -2683,16 +3294,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     const char *core_how = "not found";
     const char *snip_how = "not found";
 
-    mods.core = GetModuleHandleW(L"_nvngx.dll");
-    if (mods.core != nullptr)
-    {
-        core_how = "already resident";
-    }
-    else
-    {
-        mods.core = LoadLibraryW(L"_nvngx.dll");
-        core_how = (mods.core != nullptr) ? "loaded" : "not found";
-    }
+    mods.core = ngx_find_core(&core_how);   // R240: resident / name / registry / System32
 
     // ---- V45: THE PRIVATE COPY FIRST. SEE nr_load_private_snippet. ----
     char snip_where[MAX_PATH * 2] = {};
@@ -2700,6 +3302,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     mods.snippet = nr_load_private_snippet(snip_where, sizeof snip_where);
     if (mods.snippet != nullptr)
     {
+        ++g_p1_snippet_loads;   // R247
         snip_how = "PRIVATE INSTANCE from mgpu\\ - nothing else in this process has it";
     }
     else
@@ -2770,7 +3373,7 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     char w_init[48]{}, w_init_ext[48]{}, w_caps[48]{}, w_create[48]{};
     char w_release[48]{}, w_destroy[48]{}, w_shutdown[48]{}, w_evaluate[48]{};
 
-    ngx_pf_init_core       p_init     = (ngx_pf_init_core)      ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
+    ngx_pf_init            p_init     = (ngx_pf_init)           ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w_init,     sizeof w_init);
     ngx_pf_init_ext        p_init_ext = (ngx_pf_init_ext)       ngx_resolve(mods, "NVSDK_NGX_D3D12_Init_Ext",                ngx_prefer::core,    w_init_ext, sizeof w_init_ext);
     ngx_pf_get_cap_params  p_caps     = (ngx_pf_get_cap_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w_caps,     sizeof w_caps);
     ngx_pf_destroy_params  p_destroy  = (ngx_pf_destroy_params) ngx_resolve(mods, "NVSDK_NGX_D3D12_DestroyParameters",       ngx_prefer::core,    w_destroy,  sizeof w_destroy);
@@ -3148,43 +3751,188 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     // never confused.
     {
         NVSDK_NGX_FeatureCommonInfo common{};
-        common.LoggingInfo.LoggingCallback = ngx_log_callback;
-        common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
-        // false, not true: the driver's own sinks stay enabled. The registry
-        // LogLevel under HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore is
-        // what opens them, and suppressing them would throw away the second
-        // copy for no gain.
-        common.LoggingInfo.DisableOtherLoggingSinks = false;
+        // D2.0-9: was VERBOSE with every sink kept ("the registry LogLevel
+        // under HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore is what
+        // opens them"). The header says our minimum overrides that level
+        // when higher, and the snippet's file became a disk writer inside
+        // Evaluate under s.cs. See ngx_logging_info.
+        ngx_logging_info(common.LoggingInfo, "P1.0c");
 
         NVSDK_NGX_Result r;
-        const char *which;
+        char which[300];
         bool callback_installed;
-        if (p_init != nullptr)
-        {
-            which = "Init";
-            // The core's Init has no FeatureCommonInfo parameter, so the log
-            // callback in `common` cannot be handed over here.
-            callback_installed = false;
-            r = p_init(0ULL, data_path, dev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
-        }
-        else
-        {
-            which = "Init_Ext (FALLBACK - no log callback installed)";
-            callback_installed = false;
-            r = p_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, nullptr);
-        }
+        ngx_trace_before_init("P1.0c");   // R245
+        ngx_wait_for_game_init("P1.0c core Init");   // R239
+        // R256 Init_Ext first; R255 Init as the fallback; R274 the 4-arg Init
+        // only after a FAIL_OutOfDate - see ngx_core_init_ladder.
+        r = ngx_core_init_ladder(p_init_ext, p_init, ngx_app_id(), data_path, dev, &common, which, sizeof which, &callback_installed);
         // The inputs, not just the verdict: app id and data path are the
         // two values most likely to be what the driver objects to, and they
         // were chosen rather than derived.
         snprintf(line, sizeof line,
                  "[MGPU][P1.0c] %s: result=0x%08X (%s) device=0x%p luid=%08lX-%08lX "
-                 "app_id=0 sdk_version=0x%08X log_callback=%s data_path=\"%s\"",
+                 "app_id=0x%llX sdk_version=0x%08X log_callback=%s data_path=\"%s\"",
                  which, (unsigned)r, ngx_result_name(r), (void *)dev,
                  (unsigned long)luid.HighPart, (unsigned long)luid.LowPart,
-                 (unsigned)NVSDK_NGX_Version_API,
+                 ngx_app_id(), (unsigned)NVSDK_NGX_Version_API,
                  callback_installed ? "installed(VERBOSE)" : "NOT INSTALLED",
                  data_path_n);
         mgpu::diag::info(line);
+        // R247: remembered for the reload-and-retry (worker.cpp).
+        if (!P3 && r == NVSDK_NGX_Result_FAIL_OutOfDate)
+        {
+            g_p1_snippet_h = mods.snippet;
+            g_p1_snippet_private = (snip_where[0] != '\0');
+            g_p1_init_outofdate.store(true, std::memory_order_release);
+        }
+        // R249 (DEBUG INSTRUMENT, NgxInitProbeGpu0=1, default off). TR-16: in one
+        // process, 13 ms apart, the same core accepted the game's D3D11 Init on
+        // the game's adapter and refused ours on GPU 1. The one difference is
+        // the device. This makes the same D3D12 Init on a device on the GAME's
+        // adapter, logs the answer, and keeps nothing: the device is released,
+        // the session (if any) is left to process exit. Per-adapter state and
+        // per-process state answer differently here.
+        if (!P3 && p_init != nullptr && ini_read_flag("NgxInitProbeGpu0"))
+        {
+            mgpu::adapter::selection_result sel{};
+            mgpu::adapter::get_selection(sel);
+            char g[400];
+            if (!sel.game_luid_known)
+                mgpu::diag::info("[MGPU][R249] GPU 0 Init probe: the game's adapter LUID is not known yet - not made.");
+            else
+            {
+                IDXGIFactory4 *f4 = nullptr;
+                IDXGIAdapter1 *ad0 = nullptr;
+                ID3D12Device *dev0 = nullptr;
+                HRESULT h = CreateDXGIFactory2(0, IID_PPV_ARGS(&f4));
+                if (SUCCEEDED(h)) h = f4->EnumAdapterByLuid(sel.game_luid, IID_PPV_ARGS(&ad0));
+                if (SUCCEEDED(h)) h = D3D12CreateDevice(ad0, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev0));
+                if (FAILED(h) || dev0 == nullptr)
+                {
+                    snprintf(g, sizeof g, "[MGPU][R249] GPU 0 Init probe: no D3D12 device on the game's adapter "
+                                          "(luid %08lX-%08lX) hr=0x%08X - not made.",
+                             (unsigned long)sel.game_luid.HighPart, (unsigned long)sel.game_luid.LowPart, (unsigned)h);
+                    mgpu::diag::warn(g);
+                }
+                else
+                {
+                    NVSDK_NGX_FeatureCommonInfo common0{};
+                    ngx_logging_info(common0.LoggingInfo, "R249");
+                    const NVSDK_NGX_Result r0 = p_init(0ULL, data_path, dev0, &common0, NVSDK_NGX_Version_API);
+                    snprintf(g, sizeof g,
+                             "[MGPU][R249] GPU 0 Init probe: the SAME Init (core, same data_path, same sdk version) on a "
+                             "D3D12 device on the GAME's adapter (luid %08lX-%08lX): result=0x%08X (%s). Ours on GPU 1 "
+                             "(luid %08lX-%08lX) was 0x%08X (%s). %s",
+                             (unsigned long)sel.game_luid.HighPart, (unsigned long)sel.game_luid.LowPart,
+                             (unsigned)r0, ngx_result_name(r0),
+                             (unsigned long)luid.HighPart, (unsigned long)luid.LowPart,
+                             (unsigned)r, ngx_result_name(r),
+                             (r0 == r) ? "SAME ANSWER on both adapters: not per-adapter."
+                                       : "DIFFERENT ANSWERS: the refusal is PER-ADAPTER.");
+                    if (r0 == r) mgpu::diag::info(g); else mgpu::diag::warn(g);
+                }
+                if (dev0) dev0->Release();
+                if (ad0) ad0->Release();
+                if (f4) f4->Release();
+            }
+        }
+        // R250 (DEBUG, same key NgxInitProbeGpu0=1). TR-17: not per-adapter.
+        // The accepted call (the game's) and the refused one (ours) differ in
+        // the API entry point and in the identity. Two more Inits, both on
+        // GPU 1, each isolating one of those: our identity on the game's API
+        // (NVSDK_NGX_D3D11_Init, app id 0, D3D11 device on GPU 1), and our API
+        // with a project identity (NVSDK_NGX_D3D12_Init_with_ProjectID on our
+        // device). Nothing is kept from either.
+        if (!P3 && ini_read_flag("NgxInitProbeGpu0") && mods.core != nullptr)
+        {
+            char g[520];
+            typedef NVSDK_NGX_Result (NVSDK_CONV *pf_init11)(unsigned long long, const wchar_t *, ID3D11Device *,
+                                                            const NVSDK_NGX_FeatureCommonInfo *, NVSDK_NGX_Version);
+            typedef NVSDK_NGX_Result (NVSDK_CONV *pf_init12_pid)(const char *, NVSDK_NGX_EngineType, const char *,
+                                                                const wchar_t *, ID3D12Device *,
+                                                                const NVSDK_NGX_FeatureCommonInfo *, NVSDK_NGX_Version);
+            // (a) D3D11 Init, app id 0, on GPU 1.
+            {
+                pf_init11 pi11 = (pf_init11)GetProcAddress(mods.core, "NVSDK_NGX_D3D11_Init");
+                IDXGIFactory4 *f4 = nullptr; IDXGIAdapter1 *ad1 = nullptr; ID3D11Device *d11 = nullptr;
+                HRESULT h = CreateDXGIFactory2(0, IID_PPV_ARGS(&f4));
+                if (SUCCEEDED(h)) h = f4->EnumAdapterByLuid(luid, IID_PPV_ARGS(&ad1));
+                if (SUCCEEDED(h)) h = D3D11CreateDevice(ad1, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                                                        D3D11_SDK_VERSION, &d11, nullptr, nullptr);
+                if (pi11 == nullptr || FAILED(h) || d11 == nullptr)
+                {
+                    snprintf(g, sizeof g, "[MGPU][R250] (a) D3D11 Init on GPU 1 not made: export %s, device hr=0x%08X",
+                             pi11 ? "found" : "MISSING", (unsigned)h);
+                    mgpu::diag::warn(g);
+                }
+                else
+                {
+                    NVSDK_NGX_FeatureCommonInfo c11{};
+                    ngx_logging_info(c11.LoggingInfo, "R250a");
+                    const NVSDK_NGX_Result ra = pi11(0ULL, data_path, d11, &c11, NVSDK_NGX_Version_API);
+                    snprintf(g, sizeof g,
+                             "[MGPU][R250] (a) OUR identity (app id 0, same data_path) on the GAME's API: "
+                             "NVSDK_NGX_D3D11_Init on a D3D11 device on GPU 1 -> 0x%08X (%s). Our D3D12 Init was 0x%08X (%s). %s",
+                             (unsigned)ra, ngx_result_name(ra), (unsigned)r, ngx_result_name(r),
+                             (ra == r) ? "same answer: the API is not the knob." : "DIFFERENT: the API is the knob.");
+                    if (ra == r) mgpu::diag::info(g); else mgpu::diag::warn(g);
+                }
+                if (d11) d11->Release();
+                if (ad1) ad1->Release();
+                if (f4) f4->Release();
+            }
+            // (b1) R251: our API, a NON-ZERO app id, same data_path. Init_Ext is
+            // a core export (the probe's own fallback pointer); the game's
+            // accepted call on Rise is this entry point with its id.
+            if (p_init_ext != nullptr)
+            {
+                const NVSDK_NGX_Result rb1 = p_init_ext(0x4D475055ULL /* 'MGPU' */, data_path, dev,
+                                                        NVSDK_NGX_Version_API, nullptr);
+                snprintf(g, sizeof g,
+                         "[MGPU][R251] (b1) OUR API, NON-ZERO app id (0x4D475055), same data_path: "
+                         "NVSDK_NGX_D3D12_Init_Ext on our GPU 1 device -> 0x%08X (%s). Our app-id-0 Init was 0x%08X (%s). %s",
+                         (unsigned)rb1, ngx_result_name(rb1), (unsigned)r, ngx_result_name(r),
+                         (rb1 == r) ? "same answer: the app id is not the knob." : "DIFFERENT: the app id is the knob.");
+                if (rb1 == r) mgpu::diag::info(g); else mgpu::diag::warn(g);
+            }
+            else
+                mgpu::diag::warn("[MGPU][R251] (b1) Init_Ext pointer not resolved - not made.");
+            // (b3) R256 control: Init_Ext with app id 0. Decides whether the id
+            // matters at all once the entry point is Init_Ext.
+            if (p_init_ext != nullptr)
+            {
+                const NVSDK_NGX_Result rb3 = p_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, nullptr);
+                snprintf(g, sizeof g,
+                         "[MGPU][R256] (b3) Init_Ext with APP ID 0, same data_path, our GPU 1 device -> 0x%08X (%s). "
+                         "Init_Ext with the id (b1) is above; the real Init was 0x%08X (%s). %s",
+                         (unsigned)rb3, ngx_result_name(rb3), (unsigned)r, ngx_result_name(r),
+                         (rb3 == NVSDK_NGX_Result_Success) ? "Init_Ext passes WITHOUT an id: the entry point is the knob, the id is not."
+                                                           : "Init_Ext is refused without the id: BOTH the entry point and the id matter.");
+                mgpu::diag::info(g);
+            }
+            // (b2) R251: our API, app id 0, data_path = the add-on's own mgpu\
+            // folder instead of the game's.
+            {
+                wchar_t dp2[MAX_PATH * 2] = {};
+                if (addon_dir_w(dp2, MAX_PATH * 2))
+                {
+                    wcscat_s(dp2, L"mgpu\\");
+                    NVSDK_NGX_FeatureCommonInfo c2{};
+                    ngx_logging_info(c2.LoggingInfo, "R251b2");
+                    const NVSDK_NGX_Result rb2 = p_init(0ULL, dp2, dev, &c2, NVSDK_NGX_Version_API);
+                    char dp2n[MAX_PATH * 2];
+                    WideCharToMultiByte(CP_UTF8, 0, dp2, -1, dp2n, sizeof dp2n, nullptr, nullptr);
+                    snprintf(g, sizeof g,
+                             "[MGPU][R251] (b2) OUR API, app id 0, data_path=\"%s\" (the add-on's folder, not the game's): "
+                             "Init on our GPU 1 device -> 0x%08X (%s). With the game's data_path it was 0x%08X (%s). %s",
+                             dp2n, (unsigned)rb2, ngx_result_name(rb2), (unsigned)r, ngx_result_name(r),
+                             (rb2 == r) ? "same answer: the data path is not the knob." : "DIFFERENT: the data path is the knob.");
+                    if (rb2 == r) mgpu::diag::info(g); else mgpu::diag::warn(g);
+                }
+                else
+                    mgpu::diag::warn("[MGPU][R251] (b2) add-on folder not resolved - not made.");
+            }
+        }
 
         // P3.0. THE SECOND INIT IS EXPECTED NOT TO BE A FIRST INIT. The
         // session opened by the startup call is deliberately never shut down
@@ -3283,15 +4031,16 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
     {
         NVSDK_NGX_Result r;
         const char *which;
+        ngx_wait_for_game_init("P1.0c snippet Init");   // R239
         if (ps_init_ext != nullptr)
         {
             which = "snippet Init_Ext";
-            r = ps_init_ext(0ULL, data_path, dev, NVSDK_NGX_Version_API, params);
+            r = ps_init_ext(ngx_app_id(), data_path, dev, NVSDK_NGX_Version_API, params);   // R255
         }
         else
         {
             which = "snippet Init";
-            r = ps_init(0ULL, data_path, dev, nullptr, NVSDK_NGX_Version_API);
+            r = ps_init(ngx_app_id(), data_path, dev, nullptr, NVSDK_NGX_Version_API);   // R255
         }
         snprintf(line, sizeof line,
                  "[MGPU][P1.0c] %s: result=0x%08X (%s) device=0x%p params=0x%p",
@@ -8195,6 +8944,36 @@ namespace
         LARGE_INTEGER      ui_tlast{};
         unsigned long long ui_plast = 0, ui_clast = 0;
         double             ui_fps_prod = 0.0, ui_fps_cons = 0.0;
+        // ---- R270b: the launch record (LaunchRecord=1, OFF by default) ----
+        //
+        // The record the launcher reads (mgpu\last_launch.ini) is written at
+        // arm and at the summary (R267) - under s.cs, once each, agreed. A
+        // first attempt (R270, reverted) refreshed it every 300 frames from
+        // seal_consume, which runs INSIDE stream_poll's lock: a file write on
+        // the lock the game's finish_effects gate contends on. That was wrong
+        // and was done without asking. This path writes OFF the lock, only
+        // when the key is on, and turns itself off (LaunchRecord=0 written to
+        // mgpu.ini, log line) the first time one write exceeds REC_LIMIT_MS -
+        // the record's own cost is the one thing about it this side can see.
+        bool               rec_on = false;          // read at arm
+        unsigned long long rec_next = 0;            // next consumed count to write at
+        // R275 (MoHasan9505, PR against 0.2.6): the last value actually
+        // SIGNALLED on gfence, recorded at both Signal sites only when the
+        // Signal succeeded. The teardown drain waits for this, not for
+        // `produced`: the newest frame is signalled at the next event, so at
+        // teardown it usually never is, and waiting for it would sit out the
+        // full bound on a normal exit. drain_on: DrainGpu0 in mgpu.ini, absent
+        // = 1; the add-on writes it to 0 itself if the drain ever hits its bound.
+        unsigned long long gsignaled = 0;
+        bool drain_on = true;
+        // R267b: the two agreed record writes (arm, summary) no longer happen
+        // where they were decided - the arm is the GAME thread under s.cs
+        // (G3) and the summary is the bridge thread holding s.cs (G2). The
+        // arm site sets ll_due_arm; the summary sets ll_due_summary; both are
+        // written at the off-lock tail of stream_poll on the bridge thread.
+        bool ll_due_arm = false, ll_due_summary = false;
+        LARGE_INTEGER      ll_t0{};                 // arm time, for the averages
+        unsigned long long ll_p0 = 0, ll_c0 = 0;    // produced/consumed at arm
 
         // ---- RING WINDOW: allocate 6, use as few as the run needs ----
         //
@@ -8228,7 +9007,6 @@ namespace
         unsigned long long rw_skipped = 0;  // frames skipped BY the window
         unsigned rw_hist[7] = {};           // how long each depth was held
         unsigned long long produced = 0;   // frames recorded into the game's list
-        unsigned long long gsignaled = 0;  // last value actually signalled on gfence
 
         // ---- L1: WHERE THE 62 ms ACTUALLY IS ----
         //
@@ -8723,6 +9501,7 @@ namespace
         std::atomic<unsigned char> mvec_slot_valid[RING] = {};
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
+        std::atomic<unsigned long long> mvec_copies_tap{0};   // R280o: the subset of mvec_copies made by the R277 tap
         // R118. One-shot: the fallback arms once per armed stream and never
         // disarms itself. A route that was dead for 300 frames and then
         // flickers is not a reason to start toggling the copy trigger
@@ -8784,6 +9563,8 @@ namespace
         bool swapguard_in_episode = false;
         bool swapguard_said = false;
         unsigned long long mvec_arm_waits = 0;
+        unsigned long long mvec_hold = 1800ull;   // R234: MVecHold - frames the arm holds for vectors on a path that has none yet
+        unsigned long long mvec_hold_said = 0;    // R236: the hold reports every 600 held frames
         bool   mvec_arm_logged = false;
         // ---- R99: the arm waits for the probe to STOP CHANGING ITS MIND ----
         //
@@ -8854,6 +9635,15 @@ namespace
         // f+1's vectors would otherwise land in the texture frame f is being
         // evaluated from.
         ID3D12Resource *tex_mvec_r[2] = {};
+        // D2.0 NR2: the last rendered frame's vectors, kept for a generated
+        // frame. tex_mvec_r cannot serve: its other half is being written for
+        // frame f+1 by the copy queue while frame f evaluates. Copied on the
+        // 3D queue after a fresh-vector evaluate, bound by a seal that had no
+        // fresh vector while frame generation is active. Created with the
+        // pair (mode 3 only), lives in NON_PIXEL_SHADER_RESOURCE between
+        // copies. mvec_keep_f: the frame it was copied on, 0 = never.
+        ID3D12Resource *tex_mvec_keep = nullptr;
+        unsigned long long mvec_keep_f = 0;
 
         // ---- R30/R63: depth transport ----
         //
@@ -8910,6 +9700,39 @@ namespace
         unsigned long long depth_unpacks = 0;
         unsigned long long depth_bound = 0, depth_skipped = 0;
         unsigned long long depth_flag_disagree = 0;
+        // R244: the depth-convention probe (see depth_probe_eval).
+        // R258: the sign/scale calibration: two consecutive colour frames + the
+        // second frame's vectors, read back and compared.
+        ID3D12Resource *cp_rb[2] = { nullptr, nullptr };   // READBACK, payload_bytes each
+        unsigned cp_stage = 0;                  // 0 idle, 1 first colour recorded, 2 second colour + vectors recorded
+        unsigned cp_n = 0;                      // probes evaluated
+        unsigned cp_worse = 0;                  // R278: probes where the warp was WORSE than no warp
+        unsigned cp_win_n = 0;                  // R278f: probes on the current candidate
+        bool     learn_write = false;           // R278f-r: verdicts may write (learning, or MVecTap key) - decided at arm, no file read under the lock
+        // R280e: the open judge on the virtual-target path. Edge scores: mean of
+        // best/none over windows with motion, per edge (0 last, 1 first).
+        unsigned x_edge_used = 0;               // the edge in force when this window's frames were recorded
+        unsigned x_edges_rec = 0;               // R280g: the source's write edges when the window was recorded (0 = no write: not scored)
+        double   x_edge_sum[2] = { 0.0, 0.0 };
+        unsigned x_edge_n[2] = { 0u, 0u };
+        bool     x_edge_fixed = false;          // chosen; alternation stopped
+        unsigned x_edge_bad = 0;                // chosen edge's consecutive worse windows (3 reopens)
+        unsigned x_verdicts = 0;                // scale applications so far (0 = still at + / +)
+        int      x_kx = 0, x_ky = 0;            // the applied candidates, in W/H units
+        bool     learn_on = false;              // R278: MVecTap on and MVecLearned absent
+        bool     learn_decided = false;         // R278d: the first-launch decision, made once at the hold
+        int      learn_cand = 0;                // R278: MVecCandidate this launch tests
+        int      cp_kx_votes[4] = {0,0,0,0}, cp_ky_votes[4] = {0,0,0,0};   // candidates: [0]=+full, [1]=-full, [2]=half (sign in cp_half_sign), [3]=PIXEL (R278b, sign in cp_px_sign)
+        int      cp_kx_px_sign = 0, cp_ky_px_sign = 0;   // R278b
+        int      cp_kx_half_sign = 0, cp_ky_half_sign = 0;
+        bool     cp_written = false;
+        ID3D12Resource *vp_rb = nullptr;        // R257: READBACK, mvec_bytes2
+        bool vp_pending = false; unsigned vp_n = 0;   // R257
+        ID3D12Resource *dp_rb = nullptr;        // READBACK, depth_bytes
+        bool dp_pending = false;                // a copy recorded last frame
+        unsigned dp_n = 0;                      // probes completed (3 max)
+        unsigned dp_agree = 0, dp_disagree = 0;
+        bool dp_written = false;                // the ini was corrected this session
 
         // R58 risk B. The shipped code sets DLSSNR.DepthInverted to 0 and this
         // title is UE5, which renders reversed-Z: R56 measured depth clustered
@@ -9049,7 +9872,10 @@ namespace
         stream_state &s = str();
         std::lock_guard<std::mutex> lk(s.cs);
         if (!s.nr_ok || s.profile) return nullptr;
-        w = s.width; h = s.height; fmt = s.format;
+        // R229: the format of the TEXTURE returned, which stream_nr_create made as
+        // the linear twin of s.format (P7.8). The P7.3 copy guard compares this
+        // against the chain, and the chain is now resized to the same twin.
+        w = s.width; h = s.height; fmt = nr_linear_format(s.format);
 
         // P5.3, the discriminator. Present=in shows the frame we HANDED to
         // DLSS-NR instead of the frame it produced - same adapter, same
@@ -9599,6 +10425,18 @@ namespace
         return (float)atof(k);
     }
 
+    // R271c. DcompFit: absent or "auto" or 2 -> 2 (auto); 1 -> 1; anything else -> 0.
+    int ini_read_dcomp_fit()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 2;
+        const char *k = ini_find(buf, "DcompFit");
+        if (k == nullptr || k[0] == '\0') return 2;
+        if (_strnicmp(k, "auto", 4) == 0 || k[0] == '2') return 2;
+        if (k[0] == '1') return 1;
+        return 0;
+    }
+
     bool ini_read_flag(const char *key)
     {
         char buf[INI_BYTES];
@@ -9764,6 +10602,18 @@ namespace
         return (v == 0) ? 0 : 1;
     }
 
+    // R234. MVecHold = frames the arm holds for the game's vectors on a path
+    // that has reported none yet (the DX11 producer, R227). Absent = 1800.
+    unsigned long long ini_read_mvec_hold()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 1800ull;
+        const char *k = ini_find(buf, "MVecHold");
+        if (k == nullptr) return 1800ull;
+        const long v = atol(k);
+        return (v < 0) ? 0ull : (unsigned long long)v;
+    }
+
     int ini_read_mvec_mode()
     {
         char buf[INI_BYTES];
@@ -9885,6 +10735,15 @@ namespace
         return (v < lo || v > hi) ? dflt : v;
     }
 
+    // R278b: is the key present at all (any value)? The mirror cannot say:
+    // it caches the default it returned when the key was absent.
+    bool ini_has_key(const char *key)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return false;
+        return ini_find(buf, key) != nullptr;
+    }
+
     int ini_read_sr()
     {
         char buf[INI_BYTES];
@@ -9902,6 +10761,19 @@ namespace
         if (!ini_slurp(buf, sizeof buf)) return dflt;
         const char *k = ini_find(buf, key);
         return (k != nullptr) ? (float)atof(k) : dflt;
+    }
+
+    // R278c: a short word value (MVecUnits=uv|uvhalf|px). Empty when absent.
+    void ini_read_word(const char *key, char *out, size_t n)
+    {
+        out[0] = 0;
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return;
+        const char *k = ini_find(buf, key);
+        if (k == nullptr) return;
+        size_t i = 0;
+        while (i + 1 < n && k[i] != 0 && k[i] != '\r' && k[i] != '\n' && k[i] != ' ' && k[i] != ';') { out[i] = k[i]; ++i; }
+        out[i] = 0;
     }
 
     // P6.2. Set.<key>=<value>, up to MAX_SETS of them. Scans line by line
@@ -10189,6 +11061,8 @@ namespace
         for (unsigned mi = 0; mi < 2; ++mi)
             if (s.tex_mvec_r[mi] != nullptr)
             { s.tex_mvec_r[mi]->Release(); s.tex_mvec_r[mi] = nullptr; }
+        if (s.tex_mvec_keep != nullptr) { s.tex_mvec_keep->Release(); s.tex_mvec_keep = nullptr; }   // D2.0 NR2
+        s.mvec_keep_f = 0;
         for (unsigned di = 0; di < 2; ++di)
             if (s.tex_depth[di] != nullptr)
             { s.tex_depth[di]->Release(); s.tex_depth[di] = nullptr; }
@@ -10231,6 +11105,16 @@ namespace
         if (s.evheap != nullptr) { s.evheap->Release(); s.evheap = nullptr; }
         s.ev_ok = false;
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
+        for (int i = 0; i < 2; ++i) if (s.cp_rb[i] != nullptr) { s.cp_rb[i]->Release(); s.cp_rb[i] = nullptr; }   // R258
+        s.cp_stage = 0; s.cp_n = 0; s.cp_written = false; s.cp_worse = 0; s.learn_on = false; s.learn_decided = false; s.cp_win_n = 0;   // R278
+        s.x_edge_used = 0; s.x_edges_rec = 0; s.x_edge_sum[0] = s.x_edge_sum[1] = 0.0; s.x_edge_n[0] = s.x_edge_n[1] = 0; s.x_edge_fixed = false; s.x_edge_bad = 0; s.x_verdicts = 0; s.x_kx = s.x_ky = 0;   // R280e
+        g_mvec_x_edge_req.store(0, std::memory_order_relaxed);
+        g_mv_cand_req.store(-1, std::memory_order_relaxed);   // R278f
+        for (int i = 0; i < 4; ++i) { s.cp_kx_votes[i] = 0; s.cp_ky_votes[i] = 0; }   // R278b: 4 buckets
+        if (s.vp_rb != nullptr) { s.vp_rb->Release(); s.vp_rb = nullptr; }   // R257
+        s.vp_pending = false; s.vp_n = 0;
+        if (s.dp_rb != nullptr) { s.dp_rb->Release(); s.dp_rb = nullptr; }   // R244
+        s.dp_pending = false; s.dp_n = 0; s.dp_agree = s.dp_disagree = 0; s.dp_written = false;
         if (s.nfence != nullptr) { s.nfence->Release(); s.nfence = nullptr; }
         // ---- HANGFIX 2026-09-12: DRAIN *GPU 0* BEFORE FREEING WHAT IT READS ----
         //
@@ -10250,33 +11134,67 @@ namespace
         // a leak, which is the same reasoning R26 states a few lines up. Two
         // seconds is longer than any frame this project has measured and
         // shorter than the TDR it is trying to avoid.
-        //
-        // gfence, not nfence: nfence is released a few lines above, so testing
-        // it here meant this drain never ran. gfence is the same fence on the
-        // game's side and is still alive.
-        //
-        // The target is the last value actually SIGNALLED, not `produced`: the
-        // newest frame is only signalled at the next event, so at teardown it
-        // usually never is, and waiting for `produced` would sit out the full
-        // two seconds on a normal exit.
-        const unsigned long long drain_to = s.gsignaled;
-        if (s.gfence != nullptr && drain_to != 0
-            && s.gfence->GetCompletedValue() < (UINT64)drain_to)
+        // R275 (MoHasan9505). THIS DRAIN NEVER RAN. It tested s.nfence one
+        // line after s.nfence was released and nulled above, so from
+        // 2026-09-12 to R275 the GPU 0 drain was dead code and every shipped
+        // build freed gxfer with no wait. gfence is the same fence on the
+        // game's side and is still alive here; the target is gsignaled, the
+        // last value actually signalled, so a normal exit waits ~0 ms. Because
+        // this turns on a wait no shipped build has executed, it carries its
+        // own fault switch: the wait is timed and logged on every teardown,
+        // and if it ever hits the bound the add-on writes DrainGpu0=0 and
+        // DrainGpu0Off=<reason> to mgpu.ini and skips the drain on later
+        // launches - one slow exit, then never again, with the reason on file.
         {
-            HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (dev0 != nullptr)
+            const unsigned long long drain_to = s.gsignaled;
+            if (!s.drain_on)
+                mgpu::diag::info("[MGPU][R275] teardown: the GPU 0 drain is OFF (DrainGpu0=0 in mgpu.ini - the add-on "
+                                 "wrote it after a stalled drain, or it was set by hand). gxfer is released without a wait, "
+                                 "as every build before R275 did.");
+            else if (s.gfence != nullptr && drain_to != 0
+                     && s.gfence->GetCompletedValue() < (UINT64)drain_to)
             {
-                if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)drain_to, dev0)))
+                HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (dev0 != nullptr)
                 {
-                    if (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0)
-                        mgpu::diag::warn(
-                            "[MGPU][P4.0] teardown: the GAME's queue did not reach the produced "
-                            "count within 2 s. Releasing anyway - a leak is recoverable and a "
-                            "hang here is not - but if this line appears, something on GPU 0 is "
-                            "stuck and the device removal that may follow is NOT this add-on "
-                            "freeing under it.");
+                    LARGE_INTEGER t0{}, t1{}, fq{};
+                    QueryPerformanceCounter(&t0);
+                    bool timed_out = false;
+                    if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)drain_to, dev0)))
+                        timed_out = (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0);
+                    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+                    const double ms = (fq.QuadPart != 0) ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
+                    char dl[560];
+                    if (!timed_out)
+                    {
+                        snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain waited %.2f ms for gfence to reach %llu "
+                                                "(now completed %llu). gxfer is released after the game's queue passed it.",
+                                 ms, drain_to, (unsigned long long)s.gfence->GetCompletedValue());
+                        mgpu::diag::info(dl);
+                    }
+                    else
+                    {
+                        char why[160];
+                        snprintf(why, sizeof why, "drain waited %.0f ms for gfence %llu and timed out", ms, drain_to);
+                        (void)ini_write_int("DrainGpu0", 0);
+                        (void)ini_write_text("DrainGpu0Off", why);
+                        snprintf(dl, sizeof dl,
+                                 "[MGPU][P4.0] teardown: the GAME's queue did not reach the signalled count within 2 s "
+                                 "(%s). Releasing anyway - a leak is recoverable and a hang here is not. If this line "
+                                 "appears, something on GPU 0 is stuck and the device removal that may follow is NOT this "
+                                 "add-on freeing under it. [R275] mgpu.ini now has DrainGpu0=0 and DrainGpu0Off=<reason>: "
+                                 "the next launch skips this drain.", why);
+                        mgpu::diag::warn(dl);
+                    }
+                    CloseHandle(dev0);
                 }
-                CloseHandle(dev0);
+            }
+            else
+            {
+                char dl[300];
+                snprintf(dl, sizeof dl, "[MGPU][R275] teardown: GPU 0 drain needed no wait (gfence completed %llu, last signalled %llu).",
+                         (s.gfence != nullptr) ? (unsigned long long)s.gfence->GetCompletedValue() : 0ull, drain_to);
+                mgpu::diag::info(dl);
             }
         }
 
@@ -10955,8 +11873,7 @@ namespace
         // worked and the caller check failed, which is a different problem with
         // a different fix. The two codes are worth telling apart.
         ngx_modules mods;
-        mods.core = GetModuleHandleW(L"_nvngx.dll");
-        if (mods.core == nullptr) mods.core = LoadLibraryW(L"_nvngx.dll");
+        mods.core = ngx_find_core(nullptr);   // R240
         // C2-SR-c. SRSnippet=1 (default) prefers the driver's copy; 0 keeps the
         // game's, which is what every run before 2026-09-12 used.
         char snip_path[MAX_PATH * 2] = {};
@@ -11087,7 +12004,7 @@ namespace
             wchar_t data_path[MAX_PATH] = L".";
             (void)GetCurrentDirectoryW(MAX_PATH, data_path);
             if (p_iext != nullptr)
-                (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.sr_params);
+                (void)p_iext(ngx_app_id(), data_path, ndev, NVSDK_NGX_Version_API, s.sr_params);   // R255
             if (p_pop != nullptr)
                 (void)p_pop(s.sr_params);
         }
@@ -11794,8 +12711,7 @@ namespace
         if (ini_read_flag("ProcessCensus")) report_process_census_at_arm();
 
         ngx_modules mods;
-        mods.core = GetModuleHandleW(L"_nvngx.dll");
-        if (mods.core == nullptr) mods.core = LoadLibraryW(L"_nvngx.dll");
+        mods.core = ngx_find_core(nullptr);   // R240
         // ---- V45: SAME RULE AS THE PROBE. THE PRIVATE COPY WINS. ----
         //
         // This is the site that actually crashes, so it matters more than the
@@ -11835,7 +12751,9 @@ namespace
         }
 
         char w[9][160] = {};
-        ngx_pf_init_core      p_init  = (ngx_pf_init_core)     ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
+        char w_iext41[160];
+        ngx_pf_init_ext       p_init_ext41 = (ngx_pf_init_ext)   ngx_resolve(mods, "NVSDK_NGX_D3D12_Init_Ext",                ngx_prefer::core,    w_iext41, sizeof w_iext41);   // R256
         ngx_pf_get_cap_params p_caps  = (ngx_pf_get_cap_params)ngx_resolve(mods, "NVSDK_NGX_D3D12_GetCapabilityParameters", ngx_prefer::core,    w[1], sizeof w[1]);
         ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
         ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
@@ -11884,14 +12802,22 @@ namespace
         //   DLSSNR:   color (0,0 WxH) mvec (0,0 WxH) scale (x,y)
         //
         // That is the vendor reporting, not us inferring. DisableOtherLoggingSinks
-        // stays false so the driver's own sinks keep their copy.
+        // stayed false so the driver's own sinks kept their copy.
+        //
+        // D2.0-9: that request is now behind NGXLog=1; the default is OFF with
+        // the other sinks disabled. See ngx_logging_info for the run that
+        // showed the snippet's file writing inside Evaluate under s.cs.
         NVSDK_NGX_FeatureCommonInfo common{};
-        common.LoggingInfo.LoggingCallback = ngx_log_callback;
-        common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
-        common.LoggingInfo.DisableOtherLoggingSinks = false;
-        NVSDK_NGX_Result r = p_init(0ULL, data_path, ndev, NVSDK_NGX_Version_API);   // four arguments - see ngx_pf_init_core
-        snprintf(line, sizeof line, "[MGPU][P4.1] Init: result=0x%08X (%s)",
-                 (unsigned)r, ngx_result_name(r));
+        ngx_logging_info(common.LoggingInfo, "P4.1");
+        ngx_trace_before_init("P4.1");   // R245
+        ngx_wait_for_game_init("P4.1 Init");   // R239
+        // R256: Init_Ext first (see P1.0c); Init only if the core lacks it.
+        NVSDK_NGX_Result r;
+        char p41_which[300];
+        bool p41_cb = false;
+        r = ngx_core_init_ladder(p_init_ext41, p_init, ngx_app_id(), data_path, ndev, &common, p41_which, sizeof p41_which, &p41_cb);   // R256 / R255 / R274
+        snprintf(line, sizeof line, "[MGPU][P4.1] %s: result=0x%08X (%s) app_id=0x%llX",
+                 p41_which, (unsigned)r, ngx_result_name(r), ngx_app_id());
         mgpu::diag::info(line);
 
         // ---- V31: THE Init RESULT IS NOT THE ERROR. GUARD REMOVED. ----
@@ -11920,7 +12846,7 @@ namespace
             mgpu::diag::error(line);
             return false;
         }
-        (void)p_iext(0ULL, data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);
+        (void)p_iext(ngx_app_id(), data_path, ndev, NVSDK_NGX_Version_API, s.nr_params);   // R255
         (void)p_pop(s.nr_params);
         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
@@ -12353,6 +13279,14 @@ namespace
                 h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
                              D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_mvec_r[1]);
+            // D2.0 NR2: the kept copy, same description as the pair. Always in
+            // mode 3 so the panel can switch the fix on live; one more texture
+            // of the pair's size. Rests in NON_PIXEL_SHADER_RESOURCE.
+            if (SUCCEEDED(h))
+                h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
+                             D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.tex_mvec_keep);
+            s.mvec_keep_f = 0;
         }
 
         // R216: built last, once every texture it reads exists.
@@ -12903,6 +13837,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     // Null in mode 0, where there is no tree, so this is a no-op there.
     if (SUCCEEDED(rb) && g_dcomp_device != nullptr)
     {
+        dcomp_fit_apply(buf_w, buf_h, "present_resize");   // R271: no-op unless DcompFit=1
         IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
         const HRESULT ch = dc->Commit();
         if (FAILED(ch))
@@ -13389,6 +14324,37 @@ namespace dispcfg
     // one number the ghost mode's safety guard needs. Returns 0 when the API
     // is unavailable, and 0 is treated as UNKNOWN by every caller, never as
     // "none".
+    // R273. The card behind the display the GAME WINDOW sits on, by the
+    // kernel's own mapping (the R265 source, which SK-44 proved follows the
+    // cable). 0 = resolved into out_luid, with the GDI name in gdi; 1 = no
+    // game window yet; 2 = the window is on no monitor; 3 = the kernel call
+    // is missing or failed. Every non-zero answer is "unknown" to the gate.
+    int game_window_card(LUID &out_luid, char *gdi, size_t gdi_n)
+    {
+        if (gdi != nullptr && gdi_n > 0) gdi[0] = '\0';
+        if (g_game_hwnd == nullptr) return 1;
+        HMONITOR mh = MonitorFromWindow(g_game_hwnd, MONITOR_DEFAULTTONULL);
+        if (mh == nullptr) return 2;
+        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(mh, &mi) == FALSE) return 2;
+        if (gdi != nullptr && gdi_n > 0) WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, gdi, (int)gdi_n, nullptr, nullptr);
+        struct kmt_open { WCHAR DeviceName[32]; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
+        struct kmt_close { UINT hAdapter; };
+        typedef LONG (WINAPI *pfn_kmt_open)(kmt_open *);
+        typedef LONG (WINAPI *pfn_kmt_close)(const kmt_close *);
+        HMODULE g32 = GetModuleHandleW(L"gdi32.dll");
+        if (g32 == nullptr) g32 = LoadLibraryW(L"gdi32.dll");
+        pfn_kmt_open  p_open  = (g32 != nullptr) ? (pfn_kmt_open)(void *)GetProcAddress(g32, "D3DKMTOpenAdapterFromGdiDisplayName") : nullptr;
+        pfn_kmt_close p_close = (g32 != nullptr) ? (pfn_kmt_close)(void *)GetProcAddress(g32, "D3DKMTCloseAdapter") : nullptr;
+        if (p_open == nullptr) return 3;
+        kmt_open ko{};
+        wcsncpy_s(ko.DeviceName, 32, mi.szDevice, _TRUNCATE);
+        if (p_open(&ko) != 0) return 3;
+        out_luid = ko.AdapterLuid;
+        if (p_close != nullptr) { kmt_close kc{ ko.hAdapter }; p_close(&kc); }
+        return 0;
+    }
+
     unsigned active_paths()
     {
         HMODULE u = GetModuleHandleW(L"user32.dll");
@@ -13427,6 +14393,14 @@ namespace dispcfg
     //
     // ONE SHOT, at the same site as R158. No hot path, no new API, no new
     // dependency: user32 by GetProcAddress exactly as the two functions below.
+    // R267: what the R265 lines saw, kept for mgpu\last_launch.ini.
+    char g_ll_display_name[128] = {};
+    char g_ll_display_gdi[48] = {};
+    LUID g_ll_display_luid{};
+    bool g_ll_display_luid_ok = false;
+    int  g_ll_display_on_bridge = 0;
+    bool g_ll_display_set = false;
+
     void report_topology(unsigned long long game_luid_low, unsigned long long bridge_luid_low,
                          unsigned dxgi_game_outputs, unsigned dxgi_bridge_outputs)
     {
@@ -13517,6 +14491,121 @@ namespace dispcfg
             "displays - if this count disagrees with what the user says they have, that is the "
             "first thing to ask about.");
         mgpu::diag::info(line);
+
+        // ---- R265: EACH DISPLAY BY NAME, AND THE KERNEL'S OWN ADAPTER FOR IT ----
+        //
+        // Read-only, decides nothing (Marcelo, 2026-10-07 00:23). The question
+        // behind it: can a user pick a DISPLAY (by its name) and can the add-on
+        // find the adapter driving it in a namespace that joins to the
+        // selection table? DXGI's EnumOutputs attributes outputs to the owner
+        // of desktop composition (DEBUG-GUIDE 3.9) and CCD's adapterId is its
+        // own namespace (R185 above). D3DKMTOpenAdapterFromGdiDisplayName is
+        // the kernel's mapping from a GDI display name to the adapter LUID -
+        // the namespace DXGI's LUIDs come from. Whether it also follows the
+        // composition owner on a twin-card rig is what this line answers,
+        // compared against the cables. Per path: monitor friendly name, GDI
+        // name, primary or not, the kernel LUID and whether it is the GAME's,
+        // the BRIDGE's or neither. gdi32 and user32 by GetProcAddress; a
+        // failure prints as such and nothing else happens.
+        {
+            typedef LONG (WINAPI *pfn_devinfo)(DISPLAYCONFIG_DEVICE_INFO_HEADER *);
+            struct kmt_open { WCHAR DeviceName[32]; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; };
+            struct kmt_close { UINT hAdapter; };
+            typedef LONG (WINAPI *pfn_kmt_open)(kmt_open *);
+            typedef LONG (WINAPI *pfn_kmt_close)(const kmt_close *);
+            pfn_devinfo p_info = (u != nullptr) ? (pfn_devinfo)(void *)GetProcAddress(u, "DisplayConfigGetDeviceInfo") : nullptr;
+            HMODULE g32 = GetModuleHandleW(L"gdi32.dll");
+            pfn_kmt_open  p_open  = (g32 != nullptr) ? (pfn_kmt_open)(void *)GetProcAddress(g32, "D3DKMTOpenAdapterFromGdiDisplayName") : nullptr;
+            pfn_kmt_close p_close = (g32 != nullptr) ? (pfn_kmt_close)(void *)GetProcAddress(g32, "D3DKMTCloseAdapter") : nullptr;
+            if (p_info == nullptr || p_open == nullptr)
+                mgpu::diag::warn("[MGPU][R265] display names unavailable: DisplayConfigGetDeviceInfo or "
+                                 "D3DKMTOpenAdapterFromGdiDisplayName did not resolve.");
+            else
+            {
+                // the primary display's GDI name, from the monitor table
+                wchar_t primary[32] = {};
+                {
+                    struct cb_bag { wchar_t *out; };
+                    cb_bag bag{ primary };
+                    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR h, HDC, LPRECT, LPARAM lp) -> BOOL {
+                        MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+                        if (GetMonitorInfoW(h, &mi) && (mi.dwFlags & MONITORINFOF_PRIMARY))
+                            wcsncpy_s(((cb_bag *)lp)->out, 32, mi.szDevice, _TRUNCATE);
+                        return TRUE;
+                    }, (LPARAM)&bag);
+                }
+                for (UINT32 i = 0; i < np; ++i)
+                {
+                    DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+                    sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    sn.header.size = sizeof sn;
+                    sn.header.adapterId = paths[i].sourceInfo.adapterId;
+                    sn.header.id = paths[i].sourceInfo.id;
+                    const bool sn_ok = (p_info(&sn.header) == ERROR_SUCCESS);
+                    DISPLAYCONFIG_TARGET_DEVICE_NAME tn{};
+                    tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                    tn.header.size = sizeof tn;
+                    tn.header.adapterId = paths[i].targetInfo.adapterId;
+                    tn.header.id = paths[i].targetInfo.id;
+                    const bool tn_ok = (p_info(&tn.header) == ERROR_SUCCESS);
+                    DISPLAYCONFIG_ADAPTER_NAME an{};
+                    an.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
+                    an.header.size = sizeof an;
+                    an.header.adapterId = paths[i].sourceInfo.adapterId;
+                    const bool an_ok = (p_info(&an.header) == ERROR_SUCCESS);
+
+                    LUID kl{}; bool k_ok = false; LONG ks = -1;
+                    if (sn_ok)
+                    {
+                        kmt_open ko{};
+                        wcsncpy_s(ko.DeviceName, 32, sn.viewGdiDeviceName, _TRUNCATE);
+                        ks = p_open(&ko);
+                        if (ks == 0)
+                        {
+                            kl = ko.AdapterLuid; k_ok = true;
+                            if (p_close != nullptr) { kmt_close kc{ ko.hAdapter }; p_close(&kc); }
+                        }
+                    }
+                    const char *who = !k_ok ? "unresolved"
+                        : ((unsigned long long)kl.LowPart == game_luid_low && kl.HighPart == 0) ? "the GAME's card"
+                        : ((unsigned long long)kl.LowPart == bridge_luid_low && kl.HighPart == 0) ? "the BRIDGE's card"
+                        : "neither (another adapter, or a LUID this table does not hold)";
+                    char fname[128] = {}, gname[48] = {}, apath[200] = {};
+                    if (tn_ok) WideCharToMultiByte(CP_UTF8, 0, tn.monitorFriendlyDeviceName, -1, fname, sizeof fname, nullptr, nullptr);
+                    if (sn_ok) WideCharToMultiByte(CP_UTF8, 0, sn.viewGdiDeviceName, -1, gname, sizeof gname, nullptr, nullptr);
+                    if (an_ok) WideCharToMultiByte(CP_UTF8, 0, an.adapterDevicePath, -1, apath, sizeof apath, nullptr, nullptr);
+                    {   // R267: keep the primary display (or the first, if no primary matched) for last_launch.ini
+                        const bool is_primary = (sn_ok && primary[0] != 0 && wcscmp(primary, sn.viewGdiDeviceName) == 0);
+                        if (is_primary || i == 0)
+                        {
+                            strncpy_s(g_ll_display_name, fname, _TRUNCATE);
+                            strncpy_s(g_ll_display_gdi,  gname, _TRUNCATE);
+                            g_ll_display_luid_ok = k_ok;
+                            g_ll_display_luid = kl;
+                            g_ll_display_on_bridge = (k_ok && (unsigned long long)kl.LowPart == bridge_luid_low && kl.HighPart == 0) ? 1 : 0;
+                            g_ll_display_set = true;
+                        }
+                    }
+                    const char *ven = strstr(apath, "VEN_10DE") ? "NVIDIA" : strstr(apath, "VEN_8086") ? "Intel"
+                                    : strstr(apath, "VEN_1002") ? "AMD" : (an_ok ? "other" : "?");
+                    char l2[700];
+                    snprintf(l2, sizeof l2,
+                             "[MGPU][R265] display %u/%u: \"%s\" on %s%s | CCD adapter: %s (%s) | kernel adapter for %s: "
+                             "%s0x%08X-0x%08X -> %s. COMPARE WITH THE CABLE: if the display cabled to the neural card reads "
+                             "as the BRIDGE's card here, the kernel mapping follows the cable and a display-picker can be "
+                             "built on it; if it reads as the GAME's card, it follows the composition owner like DXGI does.",
+                             (unsigned)i + 1u, (unsigned)np,
+                             tn_ok ? fname : "(name unavailable)",
+                             sn_ok ? gname : "(gdi name unavailable)",
+                             (sn_ok && primary[0] != 0 && wcscmp(primary, sn.viewGdiDeviceName) == 0) ? " [PRIMARY]" : "",
+                             ven, an_ok ? apath : "(adapter path unavailable)",
+                             sn_ok ? gname : "?",
+                             k_ok ? "" : "(open failed, status ", k_ok ? (unsigned)kl.HighPart : (unsigned)ks,
+                             k_ok ? (unsigned)kl.LowPart : 0u, who);
+                    mgpu::diag::info(l2);
+                }
+            }
+        }
         free(paths); free(modes);
     }
 
@@ -13678,6 +14767,13 @@ static int ini_read_dcomp_setting()
     const int v = atoi(k);
     return (v == 1) ? 1 : 0;
 }
+// R266 (2026-10-07). THE DEFAULT IS 1. A missing key resolves exactly as a
+// written "1": the V55 path (its count gate included) runs unchanged, and
+// the V72 hint keeps its meaning through g_dcomp_setting, which still holds
+// the raw -2 so "absent" and "written 1" stay distinguishable there. 0 and
+// auto are untouched. Nothing else in the mode moves (Marcelo: "the path
+// as it is right now remains, with 1 the default rather than 0").
+static int dcomp_setting_effective(int raw) { return (raw == -2) ? 1 : raw; }
 
 // V72. The raw setting, latched alongside the resolved one, so the hint can
 // ask what the user SAID rather than what the mode resolved to.
@@ -13690,14 +14786,136 @@ static std::atomic<int> g_dcomp_setting{-3};   // -3 = not read yet
 // That is LNK2019, and the linker's own hint named both symbols side by side.
 void report_resident_addons();
 
+// R242. DcompForceWindowed: absent or 1 = with DcompOverlay on, a D3D11 game
+// chain is created windowed and refused fullscreen (the composed output is
+// not shown while the game holds the direct flip - Skyrim SK-3); 0 = never
+// touch the game's mode. Latched on the first read.
+bool dcomp_force_windowed()
+{
+    static std::atomic<int> latched{-1};
+    const int seen = latched.load(std::memory_order_relaxed);
+    if (seen >= 0) return seen != 0;
+    int out = 1;
+    char buf[INI_BYTES];
+    if (ini_slurp(buf, sizeof buf))
+    {
+        const char *k = ini_find(buf, "DcompForceWindowed");
+        if (k != nullptr && *k == '0') out = 0;
+    }
+    latched.store(out, std::memory_order_relaxed);
+    return out != 0;
+}
+
+// ---- R267: mgpu\last_launch.ini - THE RECORD THE LAUNCHER READS ----
+//
+// Written at arm and again at the stream summary; overwritten each launch;
+// never read by the add-on. It answers, after the fact, the one thing no
+// launcher can know before a launch: which card the game ran on, which the
+// bridge took, and whether the display was on the neural card (LAUNCHER_LEDGER).
+// Plain key=value, one per line, so the launcher and a person can both read it.
+static char g_ll_build[96] = {};
+void set_build_string(const char *s) { if (s) strncpy_s(g_ll_build, s, _TRUNCATE); }   // R267, from dllmain
+// R270b. The fields the record needs, copied under the lock so the write can
+// happen outside it. Arm and summary take the snapshot where they already
+// hold s.cs; the periodic refresh takes it, releases the lock, then writes.
+struct ll_snapshot
+{
+    unsigned width = 0, height = 0, passes = 0;
+    unsigned long long produced = 0, consumed = 0;
+    double lat_sum = 0.0, first_lat = 0.0; unsigned long long lat_n = 0;
+    double ready_sum = 0.0; unsigned long long ready_n = 0;
+    unsigned long long q_sum = 0, q_n = 0, q_max = 0;
+    bool ts_ok = false; unsigned long long ts_n = 0; double ts_eval = 0.0;
+    LARGE_INTEGER t0{}; unsigned long long p0 = 0, c0 = 0;
+};
+static ll_snapshot ll_take(const stream_state &s)
+{
+    ll_snapshot o;
+    o.width = s.width; o.height = s.height; o.passes = s.passes;
+    o.produced = s.produced; o.consumed = s.consumed;
+    o.lat_sum = s.lat_sum; o.first_lat = s.first_lat; o.lat_n = s.lat_n;
+    o.ready_sum = s.ready_sum; o.ready_n = s.ready_n;
+    o.q_sum = s.q_sum; o.q_n = s.q_n; o.q_max = s.q_max;
+    o.ts_ok = s.ts_ok; o.ts_n = s.ts_n; o.ts_eval = s.ts_sum[2];
+    o.t0 = s.ll_t0; o.p0 = s.ll_p0; o.c0 = s.ll_c0;
+    return o;
+}
+static void write_last_launch(const char *stage, const ll_snapshot *s)
+{
+    const wchar_t *ip = ini_path();
+    if (ip == nullptr || ip[0] == L'\0') return;
+    wchar_t path[1024];
+    wcsncpy_s(path, ip, _TRUNCATE);
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) return;
+    slash[1] = L'\0';
+    wcscat_s(path, L"mgpu\\last_launch.ini");
+    FILE *f = _wfopen(path, L"wb");
+    if (f == nullptr) return;
+
+    mgpu::adapter::selection_result sel;
+    mgpu::adapter::get_selection(sel);
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    fprintf(f, "; MGPU Bridge last launch - written by the add-on, read by the launcher. Overwritten every launch.\r\n");
+    fprintf(f, "Stage=%s\r\n", stage);
+    fprintf(f, "Build=%s\r\n", g_ll_build[0] ? g_ll_build : "unknown");
+    fprintf(f, "When=%04u-%02u-%02u %02u:%02u:%02u\r\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    fprintf(f, "SelectionValid=%d\r\n", sel.valid ? 1 : 0);
+    fprintf(f, "GameAdapterLuid=0x%08X-0x%08X\r\n", (unsigned)sel.game_luid.HighPart, (unsigned)sel.game_luid.LowPart);
+    fprintf(f, "GameLuidFromSwapchain=%d\r\n", sel.game_luid_from_swapchain ? 1 : 0);
+    fprintf(f, "BridgeAdapterLuid=0x%08X-0x%08X\r\n", (unsigned)sel.selected_luid.HighPart, (unsigned)sel.selected_luid.LowPart);
+    fprintf(f, "BridgeAdapterName=%s\r\n", sel.selected_desc);
+    fprintf(f, "SelectionRule=%s\r\n", sel.rule ? sel.rule : "");
+    if (dispcfg::g_ll_display_set)
+    {
+        fprintf(f, "Display=%s\r\n", dispcfg::g_ll_display_name);
+        fprintf(f, "DisplayGdi=%s\r\n", dispcfg::g_ll_display_gdi);
+        if (dispcfg::g_ll_display_luid_ok)
+            fprintf(f, "DisplayAdapterLuid=0x%08X-0x%08X\r\n", (unsigned)dispcfg::g_ll_display_luid.HighPart, (unsigned)dispcfg::g_ll_display_luid.LowPart);
+        else
+            fprintf(f, "DisplayAdapterLuid=unresolved\r\n");
+        fprintf(f, "DisplayOnBridge=%d\r\n", dispcfg::g_ll_display_on_bridge);
+    }
+    else
+        fprintf(f, "Display=unknown\r\n");
+    fprintf(f, "Dcomp=%s\r\n", dcomp_overlay_mode() ? "on" : "off");
+    if (s != nullptr)
+    {
+        fprintf(f, "SourceWidth=%u\r\nSourceHeight=%u\r\n", (unsigned)s->width, (unsigned)s->height);
+        fprintf(f, "Passes=%u\r\n", s->passes);
+        fprintf(f, "FramesProduced=%llu\r\nFramesConsumed=%llu\r\n", s->produced, s->consumed);
+        if (s->lat_n > 1)
+            fprintf(f, "SealLatencyMs=%.2f\r\n", (s->lat_sum - s->first_lat) / (double)(s->lat_n - 1));
+        if (s->ready_n > 0)
+            fprintf(f, "L2Ms=%.2f\r\n", s->ready_sum / (double)s->ready_n);
+        if (s->q_n > 0)
+            fprintf(f, "GpuBacklogMean=%.2f\r\nGpuBacklogMax=%llu\r\n", (double)s->q_sum / (double)s->q_n, s->q_max);
+        if (s->ts_ok && s->ts_n > 0)
+            fprintf(f, "EvaluateMsPerFrame=%.3f\r\n", s->ts_eval / (double)s->ts_n);
+        // R270b: average frame rate per card since arm. Produced = the game's
+        // frames, consumed = the bridge's. Written once a second has passed.
+        if (s->t0.QuadPart != 0)
+        {
+            LARGE_INTEGER now{}, fq{};
+            QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
+            const double el = (fq.QuadPart != 0) ? (double)(now.QuadPart - s->t0.QuadPart) / (double)fq.QuadPart : 0.0;
+            if (el >= 1.0)
+                fprintf(f, "ElapsedS=%.0f\r\nGameFps=%.1f\r\nNeuralFps=%.1f\r\n", el,
+                        (double)(s->produced - s->p0) / el, (double)(s->consumed - s->c0) / el);
+        }
+    }
+    fclose(f);
+}
+
 bool dcomp_overlay_mode()
 {
     static std::atomic<int> latched{-1};
     const int seen = latched.load(std::memory_order_relaxed);
     if (seen >= 0) return seen != 0;
 
-    const int want = ini_read_dcomp_setting();
-    g_dcomp_setting.store(want, std::memory_order_relaxed);
+    const int raw = ini_read_dcomp_setting();
+    g_dcomp_setting.store(raw, std::memory_order_relaxed);
+    const int want = dcomp_setting_effective(raw);   // R266: absent = 1
     int out = 0;
     if (want == -1)
     {
@@ -13726,19 +14944,165 @@ bool dcomp_overlay_mode()
     {
         const unsigned paths = dispcfg::active_paths();
         out = (paths == 1u) ? 1 : 0;
+        // R273 (was R267): more than one display path is decided BY DETECTION,
+        // not by the count. Marcelo, 2026-10-07 13:23: the default has to be
+        // decided by construction, because nothing learned after 0.3.0 lands
+        // reaches anyone's mgpu.ini. The one guard that matters - the game and
+        // the neural load never on the same card - lives in adapter selection
+        // and is not touched here. The count was a proxy for what could not be
+        // observed then and can be now: WHICH CARD the display under the game's
+        // window hangs on (the kernel mapping, R265's source). On the neural
+        // card -> compose (Dave; the dummy-plug reporter). On the game's card ->
+        // refused, the own window, as before (the frame would travel back).
+        // Unknown, duplicate, a third card -> refused, the shipped direction.
+        // One path never enters this block, so every single-display rig is
+        // byte-identical. DcompMultiDisplay: absent = by detection; 1 = accept
+        // always (Dave's fork behaviour, kept); 0 = the old gate, refuse always.
+        int multi = -1;   // -1 absent, 0, 1
+        {
+            char buf[INI_BYTES];
+            if (ini_slurp(buf, sizeof buf))
+            {
+                const char *k = ini_find(buf, "DcompMultiDisplay");
+                if (k != nullptr && *k == '1') multi = 1;
+                else if (k != nullptr && *k == '0') multi = 0;
+            }
+        }
+        const char *why = "";
+        bool multi_accept = false;
+        bool pending = false;   // R273b: inputs not there yet - no latch, the safe answer for now
+        if (paths > 1u)
+        {
+            if (multi == 1)
+            {
+                out = 1; multi_accept = true;
+                char r267[420];
+                snprintf(r267, sizeof r267,
+                         "[MGPU][R267] DcompMultiDisplay=1: %u active display path(s) and the composition mode is "
+                         "ACCEPTED anyway, no detection. This value is the fork behaviour kept for whoever has it; "
+                         "absent (the default) decides by detection - see [R273].", paths);
+                mgpu::diag::warn(r267);
+            }
+            else if (multi == 0)
+            {
+                out = 0;
+                mgpu::diag::info("[MGPU][R273] DcompMultiDisplay=0: more than one display path and the composition "
+                                 "mode is REFUSED by the key - the old gate, by choice. The bridge opens its own window.");
+            }
+            else
+            {
+                LUID dl{}; char gdi[40] = {};
+                const int rc = dispcfg::game_window_card(dl, gdi, sizeof gdi);
+                mgpu::adapter::selection_result sel;
+                mgpu::adapter::get_selection(sel);
+                const bool dup = dispcfg::duplicated_by_rect();
+                const bool same_game = sel.game_luid_from_swapchain && dl.LowPart == sel.game_luid.LowPart && dl.HighPart == sel.game_luid.HighPart;
+                const bool same_sel  = sel.valid && dl.LowPart == sel.selected_luid.LowPart && dl.HighPart == sel.selected_luid.HighPart;
+                const bool forced = (g_dcomp_force_decide.load(std::memory_order_relaxed) != 0);
+                if (dup)                              why = "REFUSED: the displays are DUPLICATED (one source, more than one target) - the clone always travels across";
+                else if (rc == 1 && !forced)        { pending = true; why = "PENDING: the game's window is not known yet - no decision, asked again on the next call"; }
+                else if (rc == 1)                     why = "REFUSED: the game's window never arrived within the wait";
+                else if (rc == 2)                     why = "REFUSED: the game's window is on no monitor";
+                else if (rc == 3)                     why = "REFUSED: the kernel display->adapter mapping could not be read";
+                else if (!sel.game_luid_from_swapchain && !forced) { pending = true; why = "PENDING: the game's card is not known from its swapchain yet - no decision, asked again on the next call"; }
+                else if (!sel.game_luid_from_swapchain) why = "REFUSED: the game's card was never established from its swapchain within the wait";
+                else if (same_game)                   why = "REFUSED: the display under the game's window is on the card the GAME renders on - composing there would send the frame back across the bus";
+                else if (sel.valid && !same_sel)      why = "REFUSED: the display under the game's window is on neither the game's card nor the selected card";
+                else { out = 1; multi_accept = true;  why = "ACCEPTED: the display under the game's window is on the NEURAL card, not the game's"; }
+                if (!pending) g_dcomp_decided_hwnd = g_game_hwnd;
+                // pending: one line per distinct reason, not one per call
+                static int said_pending = -1;
+                const int pend_code = !pending ? -1 : (rc == 1 ? 1 : 2);
+                if (pending && said_pending == pend_code) { g_dcomp_undecided.store(1, std::memory_order_relaxed); return false; }
+                if (pending) said_pending = pend_code;
+                char r273[700];
+                snprintf(r273, sizeof r273,
+                         "[MGPU][R273] DcompMultiDisplay absent -> by detection: %u active display path(s); the game's "
+                         "window is on %s (kernel adapter luid=0x%08X-0x%08X, lookup rc=%d) | game luid=0x%08X-0x%08X "
+                         "(%s) | selected luid=0x%08X-0x%08X (%s) | duplicate=%d -> %s. Write DcompMultiDisplay=1 to "
+                         "accept always, 0 for the old gate.",
+                         paths, gdi[0] ? gdi : "(no GDI name)", (unsigned)dl.HighPart, (unsigned)dl.LowPart, rc,
+                         (unsigned)sel.game_luid.HighPart, (unsigned)sel.game_luid.LowPart, sel.game_luid_from_swapchain ? "from swapchain" : "not from swapchain",
+                         (unsigned)sel.selected_luid.HighPart, (unsigned)sel.selected_luid.LowPart, sel.valid ? "valid" : "not selected yet",
+                         dup ? 1 : 0, why);
+                if (out) mgpu::diag::info(r273); else mgpu::diag::warn(r273);
+            }
+        }
+        if (pending)
+        {
+            // R273b: nothing is latched. Callers get the safe answer (own
+            // window) until the inputs exist; the bridge thread settles it
+            // before it shows anything (dcomp_overlay_mode_settled).
+            g_dcomp_undecided.store(1, std::memory_order_relaxed);
+            return false;
+        }
+        g_dcomp_undecided.store(0, std::memory_order_relaxed);
         char v55[640];
         snprintf(v55, sizeof v55,
-                 "[MGPU][V55] DcompOverlay 1 requested, %u active display path(s) -> %s. The "
+                 "[MGPU][V55] DcompOverlay 1 %s, %u active display path(s) -> %s. The "
                  "composition mode is for ONE monitor with the render card headless and is "
                  "refused anywhere else, tested or not. A count of 0 means the display "
                  "configuration API could not be read, and unknown refuses exactly like "
                  "multi-display does - the fall-back direction is always the shipped behaviour.",
-                 paths, out ? "ACCEPTED" : "REFUSED, the bridge opens its own window");
+                 (raw == -2) ? "(the default since 0.3.0, key absent)" : "requested",
+                 paths, out ? (multi_accept ? ((multi == 1) ? "ACCEPTED by DcompMultiDisplay=1 (R267)" : "ACCEPTED by detection (R273)") : "ACCEPTED")
+                            : "REFUSED, the bridge opens its own window");
         if (out) mgpu::diag::info(v55);
         else     mgpu::diag::warn(v55);
     }
     latched.store(out, std::memory_order_relaxed);
     return out != 0;
+}
+
+// GHOST_MODE.md section 6, the invariant this must keep: the mode is resolved
+// once and latched because its readers sit on two threads and "must not
+// disagree or the mode comes up half armed". The PENDING state bends that for
+// the few calls before the game thread has stored the window and the card.
+// Every reader that can run that early is accounted for: force_windowed_active
+// treats pending as on (R273c), the worker settles here before it shows its
+// window, hotkeys and the present chain come after the settle, and
+// note_game_fullscreen / write_last_launch run after the hwnd and selection
+// exist. Anything added later that reads the mode before the game chain's init
+// must do the same, or it is the half-armed case the doc warns about.
+//
+// R273b. The bridge thread's view of the decision. settled(): wait, bounded,
+// while the detection is still pending (the game thread has not stored the
+// window or established the game's card yet), then decide - after the wait,
+// a still-missing input REFUSES with a line that names it, never silently.
+// Every later caller reads the latched answer, so the window, the hotkeys and
+// the present chain all see one mode. Only the bridge thread calls this.
+bool dcomp_overlay_undecided() { return g_dcomp_undecided.load(std::memory_order_relaxed) != 0; }
+bool dcomp_overlay_mode_settled(unsigned timeout_ms)
+{
+    bool m = dcomp_overlay_mode();
+    if (!dcomp_overlay_undecided()) return m;
+    const ULONGLONG t0 = GetTickCount64();
+    while (dcomp_overlay_undecided() && GetTickCount64() - t0 < (ULONGLONG)timeout_ms)
+    {
+        Sleep(10);
+        m = dcomp_overlay_mode();
+    }
+    if (!dcomp_overlay_undecided())
+    {
+        // decided while we waited: say how long, so a wait in a log is never a mystery
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][R273] the composition decision settled after %llu ms on the bridge thread (waited for the "
+                              "game's window and card); the window below follows it.", (unsigned long long)(GetTickCount64() - t0));
+        mgpu::diag::info(l);
+        return m;
+    }
+    if (dcomp_overlay_undecided())
+    {
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][R273] the composition decision was still PENDING after %u ms on the bridge thread - "
+                 "deciding now with what is known (a missing input refuses). The line that follows says which.",
+                 timeout_ms);
+        mgpu::diag::warn(l);
+        g_dcomp_force_decide.store(1, std::memory_order_relaxed);
+        m = dcomp_overlay_mode();
+    }
+    return m;
 }
 
 // R158. See the header. dcomp_overlay_mode() is called first and its result
@@ -14148,6 +15512,61 @@ bool window_no_activate()
         return true;
     }
     return dispcfg::duplicated();
+}
+
+bool ngx_probe_at_start()   // R246
+{
+    return ini_read_flag("NgxProbeAtStart");
+}
+
+// R282 - THE SCENE HOLD (test key mv62, automatic since mv63, Marcelo 14:24:
+// "automatic, with no time limit"). Tomb Raider DX12 TR-R3/R4/R6: our deferred
+// probe made the first NGX Init in the process and the game's own
+// CreateFeature failed ~5 s later ("specified Device not found"), then a crash
+// at its first evaluate. R239 orders the two Inits on D3D11 only (the game's
+// D3D12 Init is not observed). Our arm Init (P4.1) came after the game's
+// feature in every run and never failed; with the probe held until the
+// game's first DLSS evaluate, TR-R7/R8 were clean. The probe's own result is
+// ignored (R246), so it can wait as long as it takes - a fixed bound would
+// race again on a slower machine, and a title that never evaluates DLSS
+// simply never runs it.
+// AUTO (key absent) applies only where that failure is possible and nowhere
+// it has been tested to work as before: the game's chain is D3D12 (LUID-proved,
+// noted by dllmain), the NGX core is already resident when the probe would
+// run (the game brought NGX - on a title without NGX this add-on loads the
+// core itself, later, in the probe), and Streamline is not loaded.
+// From the kept logs: RE4 (core ours), Skyrim and Tomb Raider DX11 (D3D11),
+// Dawnwalker / Cyberpunk / Starfield (Streamline) -> not applied; Tomb Raider
+// DX12 -> applied. NgxProbeAfterScene=1 forces it, =0 turns it off.
+std::atomic<bool> g_game_d3d12{false};
+void note_game_d3d12()   // R282: dllmain, on the LUID-proved D3D12 game chain
+{
+    g_game_d3d12.store(true, std::memory_order_release);
+}
+bool ngx_probe_scene_hold_decide(char *why, size_t n)   // R282: once, bridge thread
+{
+    if (ini_has_key("NgxProbeAfterScene"))
+    {
+        const bool on = ini_read_flag("NgxProbeAfterScene");
+        snprintf(why, n, on ? "[MGPU][R282] scene hold APPLIED (NgxProbeAfterScene=1): our first NGX Init waits for "
+                              "the game's first DLSS evaluate, no time limit."
+                            : "[MGPU][R282] scene hold OFF (NgxProbeAfterScene is not 1): the probe runs as before.");
+        return on;
+    }
+    const bool d3d12 = g_game_d3d12.load(std::memory_order_acquire);
+    const bool core  = GetModuleHandleW(L"_nvngx.dll") != nullptr;
+    const bool sl    = mgpu::slprobe::interposer_resident();
+    const bool hold  = d3d12 && core && !sl;
+    snprintf(why, n, "[MGPU][R282] scene hold %s (auto): game chain D3D12=%s, NGX core already resident (the "
+                     "game's)=%s, Streamline=%s%s",
+             hold ? "APPLIED" : "not applied", d3d12 ? "yes" : "no", core ? "yes" : "no", sl ? "yes" : "no",
+             hold ? " - our first NGX Init waits for the game's first DLSS evaluate, no time limit."
+                  : " - the probe runs as before.");
+    return hold;
+}
+bool ngx_probe_scene_seen()   // R282
+{
+    return mgpu::calibrator::scene_captures() != 0ull;
 }
 
 unsigned autoarm_frames()
@@ -15386,6 +16805,26 @@ void intensity_step(int dir)
     mgpu::diag::info(l);
 }
 
+// R227. See the header. One flag, one reason, read at stream_request.
+static std::atomic<bool> g_no_real_vectors{false};
+static char g_no_real_vectors_why[160] = "";
+void stream_note_no_real_vectors(const char *why)
+{
+    if (why != nullptr) { strncpy(g_no_real_vectors_why, why, sizeof g_no_real_vectors_why - 1); g_no_real_vectors_why[sizeof g_no_real_vectors_why - 1] = '\0'; }
+    g_no_real_vectors.store(true, std::memory_order_release);
+}
+// R232. The DX11 producer saw the game's first vector surface (the
+// calibrator's D3D11 evaluate tap): the lane can deliver after all. Said
+// once. If the stream already armed as synthetic, this run stays synthetic
+// - the arm sized no MVec region - and the line says so.
+void stream_note_real_vectors()
+{
+    if (!g_no_real_vectors.exchange(false, std::memory_order_acq_rel)) return;
+    mgpu::diag::info("[MGPU][R232] real vectors are available on this path after all (the game's D3D11 "
+                     "DLSS evaluate was tapped): MVec=3 stays as requested at the arm. If the arm "
+                     "already happened as synthetic (an R227 line above), this run keeps it.");
+}
+
 void stream_request()
 {
     // V43. Refuse every arm during a recovery launch - AutoArm, the hotkey,
@@ -15425,6 +16864,11 @@ void stream_request()
     s.depth_mode = ini_read_depth_mode();
     s.depth_inverted = ini_read_depth_inverted();
     s.mvec_mode = ini_read_mvec_mode();
+    // R234. R227's degrade no longer happens here: a title can create its DLSS
+    // feature after the arm request (Rise: AutoArm at 36.8 s, CreateFeature at
+    // 38.6 s, TR-11). The arm HOLDS for vectors as on D3D12, bounded by MVecHold
+    // frames; the degrade, with the R227 line, happens in the hold itself.
+    s.mvec_hold = ini_read_mvec_hold();
     if (s.mvec_mode == 2)
     {
         mgpu::diag::warn("[MGPU][P8.0] MVec=estimated requested, but this build has no flow "
@@ -15619,6 +17063,7 @@ void stream_request()
     }
     s.preset = ini_read_preset();
     s.window_mode = ini_read_window_mode();
+    s.drain_on = ini_read_sr_int("DrainGpu0", 1, 0, 1) != 0;   // R275: absent = on; 0 is written by the add-on itself after a stalled drain
     {
         char buf[INI_BYTES];
         const bool have = ini_slurp(buf, sizeof buf);
@@ -15848,8 +17293,7 @@ void stream_on_present(void *cmd_queue_v)
     ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
     if (gq == nullptr) return;
 
-    if (SUCCEEDED(gq->Signal(s.gfence, s.produced)))
-        s.gsignaled = s.produced;
+    if (SUCCEEDED(gq->Signal(s.gfence, s.produced))) s.gsignaled = s.produced;   // R275
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -16435,11 +17879,25 @@ namespace reflex
     }
 }
 
+std::atomic<unsigned long long> g_game_effects_frames{0};   // R246
+
+unsigned long long game_effects_frames()
+{
+    return g_game_effects_frames.load(std::memory_order_relaxed);
+}
+
+// R278f-r: has the stream sealed a frame (lock-free mirror: armed and producing). The probe
+// must not re-pick a different buffer on its own after this - the ring is laid out.
+bool stream_producing() { return str().produced_a.load(std::memory_order_acquire) != 0ull; }
+
 void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                               unsigned long long rtv_handle,
                               unsigned long long depth_handle,
                               unsigned long long mvec_handle)
 {
+    // R246: counted before anything else, armed or not - the deferred startup
+    // probe waits on this.
+    g_game_effects_frames.fetch_add(1, std::memory_order_relaxed);
     // ---- REFLEX, BEFORE ANY LOCK, ON THE GAME'S OWN RENDER THREAD ----
     //
     // The first attempt put this in stream_on_present and it crashed on arm.
@@ -16633,13 +18091,70 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             else { s.mvec_seen_handle = mvec_handle; s.mvec_stable = 1; }
         }
         const unsigned long long STABLE_NEED = 240ull;   // ~4 s at 60 fps
+        // R256: with the tap on (MVecTap=1, R254) a no-contract title CAN deliver
+        // real vectors, so the arm holds for them exactly as it does on a
+        // contract title, bounded by MVecHold. "Synthetic at once" is only for
+        // a title that has neither a contract nor the tap.
+        const int tap_k = ui_ini_read("MVecTap", 0);
+        // R278d: a first launch that CAN learn (no MVecTap key, no MVecLearned, MVec=3)
+        // holds for vectors like a tap, so the no-contract degrade to synthetic does
+        // not fire before the learning has had its chance. MVecLearned=99 (depth
+        // only) is not learnable and degrades as before.
+        // Decided ONCE, at the first pass through here: on D3D11 the tap must be
+        // live BEFORE the hold can clear (the census hands out a candidate only
+        // with the tap on), so the switch is thrown here, not at the arm.
+        if (!s.learn_decided)
+        {
+            s.learn_decided = true;
+            const bool no_contract = !game_contract_seen();   // R280k: Init seen OR the game's NGX table (DW-R1)
+            const bool auto_learn = !ini_has_key("MVecTap") && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3 && no_contract;
+            g_mvec_tap_live.store(auto_learn ? 1 : 0, std::memory_order_relaxed);
+            static bool s_first_said = false;   // R278e: once per process, not per arm
+            if (auto_learn && !s_first_said && (s_first_said = true))
+                mgpu::diag::warn("[MGPU][R278] FIRST LAUNCH on a title without an NGX contract: the velocity tap is ON for this "
+                                 "session only, to test the game's vectors against the picture (R258 warp test). The result is "
+                                 "written to mgpu.ini: a buffer that lines up keeps the tap (MVecTap=1, MVecLearned=<candidate>); "
+                                 "none that does turns it off (depth only). Nothing of this runs on the next launch.");
+        }
+        const bool learnable = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
+        const bool can_tap = (tap_k == 1 || tap_k == 2) || learnable;   // R277: 2 is the D3D12 tap with the common assumption
+        if (s.mvec_mode == 3 && mvec_handle == 0 && g_no_real_vectors.load(std::memory_order_acquire) &&
+            (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap)))
+        {
+            // R234 (was R227 at the request): a path that said it has no real
+            // vectors, and none arrived within the hold. Synthetic from here.
+            // R241b: a title whose NGX Init was never seen (R236) has no DLSS
+            // and can never deliver vectors to this hold - no hold at all, so a
+            // no-contract title (Skyrim) never reads as 'the add-on is not
+            // working'. The hold stays for a contract seen but not created yet.
+            const bool no_contract = !mgpu::calibrator::game_ngx_init_seen() && !can_tap;   // R256
+            char nv[520];
+            if (no_contract)
+                snprintf(nv, sizeof nv,
+                         "[MGPU][R227] MVec=3 requested but this title never initialised NGX (no DLSS contract, R236): "
+                         "nothing on this path can deliver real vectors, so there is no hold. Using the synthetic field "
+                         "(MVec=1) now. The picture is NR without the game's motion; that is the state, not a fault.");
+            else
+                snprintf(nv, sizeof nv,
+                         "[MGPU][R227] MVec=3 requested, the arm held %llu frame(s) for the game's vectors and none "
+                         "arrived (%s). Using the synthetic field (MVec=1) for this run. The picture is NR without the "
+                         "game's motion; that is the state, not a fault. MVecHold= in mgpu.ini sets the hold.",
+                         s.mvec_arm_waits, g_no_real_vectors_why);
+            mgpu::diag::warn(nv);
+            s.mvec_mode = 1;
+        }
         if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED))
         {
-            ++s.mvec_arm_waits;
+            // R280j: while the virtual-target module is deciding WITH EVIDENCE (a four-channel
+            // candidate is being written, no source yet), the hold does not count: the decision
+            // is coming and is bounded by the module's own give-up. A title with no such
+            // candidate, a contract title and D3D11 never set this - their hold is as before.
+            if (!g_mvec_x_deciding.load(std::memory_order_relaxed)) ++s.mvec_arm_waits;
             s.hold_lane = 2;                      // R146: live, this frame
             if (!s.mvec_arm_logged)
             {
                 s.mvec_arm_logged = true;
+                s.mvec_hold_said = 0;
                 mgpu::diag::info(
                     "[MGPU][R78] stream arm HELD: MVec=3 (REAL) and the probe has not published "
                     "a velocity buffer yet, so the slot cannot be sized. This clears on the "
@@ -16647,6 +18162,19 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                     "check the [R71] line for a MVEC SOURCE with a non-zero handle, and check "
                     "that its width and height match the scene extents - the probe refuses to "
                     "publish a candidate that does not.");
+            }
+            // R236: a held arm is never silent - the game plays underneath it.
+            if (s.mvec_arm_waits >= s.mvec_hold_said + 600ull)
+            {
+                s.mvec_hold_said = s.mvec_arm_waits;
+                char hl[300];
+                snprintf(hl, sizeof hl,
+                         "[MGPU][R236] arm still HELD for the game's vectors: %llu frame(s), handle=%s, stable=%llu/%llu. "
+                         "The game is unaffected; %s",
+                         s.mvec_arm_waits, mvec_handle != 0 ? "seen" : "none yet", s.mvec_stable, STABLE_NEED,
+                         g_no_real_vectors.load(std::memory_order_acquire)
+                             ? "synthetic at MVecHold frames if none arrive." : "no bound on this path (as shipped).");
+                mgpu::diag::info(hl);
             }
             return;
         }
@@ -17051,6 +18579,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         }
         else if (ndev == nullptr) h = E_FAIL;
 
+        s.ll_due_arm = true;   // R267b: written off the lock on the bridge thread, next stream_poll
         snprintf(line, sizeof line,
                  "[MGPU][P4.0] stream arm hr=0x%08X source=%ux%u fmt=%d rowPitch=%u "
                  "payload=%llu slot=%llu ring=%u heap=%llu bytes. The heap is created on the "
@@ -17110,7 +18639,67 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             return;
         }
         s.armed = true;
+        // R270b. Off unless mgpu.ini says LaunchRecord=1 (the launcher writes it).
+        QueryPerformanceCounter(&s.ll_t0); s.ll_p0 = s.produced; s.ll_c0 = s.consumed;
+        s.rec_on = ini_read_flag("LaunchRecord");
+        s.rec_next = s.consumed + 300ull;
+        if (s.rec_on)
+            mgpu::diag::info("[MGPU][R270b] LaunchRecord=1: mgpu\\last_launch.ini is refreshed every 300 "
+                             "bridge frames with GameFps/NeuralFps, written on the bridge thread with "
+                             "s.cs released. It turns itself off (LaunchRecord=0 written to mgpu.ini) the "
+                             "first time one write takes more than 2 ms; the next launch then runs "
+                             "without it. Default is off.");
         s.vr_ini_ok = false;   // R219: read again when the neural stage is created
+        // R278: the vector learning runs once per title. Only with the tap on
+        // (MVecTap, off by default) and no MVecLearned yet; learned titles skip
+        // R258 altogether (no probes, no readbacks).
+        {
+            const int tk = ui_ini_read("MVecTap", 0);
+            const int lr = ui_ini_read("MVecLearned", -1);
+            s.learn_cand = ui_ini_read("MVecCandidate", 0);
+            // R278b/R278d: FIRST LAUNCH of a no-contract title - the tap came on by
+            // itself at the hold (above, decided once); here it only sets learn_on.
+            // The warp test then keeps it (writes MVecTap=1 + MVecLearned) or turns
+            // it off (depth only). A contract title never enters; a set key is honoured.
+            const bool auto_learn = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
+            s.learn_on = ((tk == 1 || tk == 2) && lr < 0) || auto_learn;
+            s.learn_write = s.learn_on || tk != 0;   // R278f-r: the key read above already answers presence-with-value
+            if ((tk == 1 || tk == 2) && lr >= 0) s.cp_written = true;   // learned: R258 stays closed
+            // R278c: THE LEARNED UNIT, NOT THE LEARNED NUMBER. The warp test
+            // writes MVecUnits (uv / uvhalf / px) and MVecSignX/Y; the scale is
+            // derived here from THIS launch's source and vector sizes, so the
+            // same ini is right on a 1080p display or at another render scale.
+            // An explicit MVecScaleX/Y other than 1.0 still wins (the user's
+            // override, and the ini R258 wrote before this change).
+            // R278e: only on the tap path (MVecTap present - a learned title has it written).
+            // R280c: on the virtual-target path the units are uv BY CONSTRUCTION (the target
+            // is x,y as the engine wrote them, RE4-TP3), so the scale is derived with no key;
+            // MVecSignX/Y in the ini still count as the user's override. X1 armed at 1.0 here.
+            const bool x_on = g_mvec_x_active.load(std::memory_order_relaxed);
+            if (s.mvec_scale_x == 1.0f && s.mvec_scale_y == 1.0f && s.mvec_w != 0u && s.mvec_h != 0u && (tk != 0 || x_on))   // R278f-r: tk read above
+            {
+                char un[16]; ini_read_word("MVecUnits", un, sizeof un);
+                if (un[0] == 0 && x_on) { un[0] = 'u'; un[1] = 'v'; un[2] = 0; }
+                const int gx = ui_ini_read("MVecSignX", 1) < 0 ? -1 : 1, gy = ui_ini_read("MVecSignY", 1) < 0 ? -1 : 1;
+                float sx = 0.0f, sy = 0.0f;
+                if (_stricmp(un, "uv") == 0)          { sx = (float)s.width;        sy = (float)s.height; }
+                else if (_stricmp(un, "uvhalf") == 0) { sx = (float)s.width * 0.5f; sy = (float)s.height * 0.5f; }
+                else if (_stricmp(un, "px") == 0)     { sx = (float)s.width / (float)s.mvec_w; sy = (float)s.height / (float)s.mvec_h; }
+                if (sx != 0.0f)
+                {
+                    s.mvec_scale_x = (float)gx * sx; s.mvec_scale_y = (float)gy * sy; s.mvec_dirty = true;
+                    char ul[260];
+                    if (x_on && tk == 0)
+                        snprintf(ul, sizeof ul, "[MGPU][R280] vectors from the virtual target: units uv by construction, MVecScaleX=%.2f MVecScaleY=%.2f "
+                                                "derived from source %ux%u and vectors %ux%u. The warp test settles the signs live; nothing is written to mgpu.ini on this path.",
+                                 s.mvec_scale_x, s.mvec_scale_y, s.width, s.height, s.mvec_w, s.mvec_h);
+                    else
+                        snprintf(ul, sizeof ul, "[MGPU][R278c] vector units %s (learned): MVecScaleX=%.2f MVecScaleY=%.2f derived from source %ux%u and vectors %ux%u.",
+                                 un, s.mvec_scale_x, s.mvec_scale_y, s.width, s.height, s.mvec_w, s.mvec_h);
+                    mgpu::diag::info(ul);
+                }
+            }
+        }
         s.n16_ini_ok = false;  // R219-2: same
         // R88: gxfer exists and the mvec geometry is final from here.
         // The flags are zeroed explicitly: std::atomic's default constructor
@@ -17268,7 +18857,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // instead, one event earlier, which is a whole frame earlier. See
         // stream_on_present.
         if (s.signal_at == 0u && SUCCEEDED(gq->Signal(s.gfence, s.produced)))
-            s.gsignaled = s.produced;
+            s.gsignaled = s.produced;   // R275
     }
 
     if (s.produced >= s.max_frames)
@@ -17449,6 +19038,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u) seal.mvec_valid = 1u;
         else ++s.mvec_missing;
     }
+    // D2.0 NR step one: record what this seal says about vectors. Read only. Off: one load.
+    if (mgpu::fgmap::on()) mgpu::fgmap::on_seal(fi, slot, seal.mvec_valid, rtv_handle);
 
     // ---- THE DEPTH DECISION IS MADE HERE, BEFORE THE SEAL IS STAGED ----
     //
@@ -17689,8 +19280,14 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     // Counted ONCE per frame even if the engine binds the target twice, so
     // that copies + missing equals the number of frames sealed and a
     // disagreement between those two numbers is a real finding.
-    if (s.mvec_slot_valid[slot].load(std::memory_order_relaxed) == 0u) ++s.mvec_copies;
+    if (s.mvec_slot_valid[slot].load(std::memory_order_relaxed) == 0u)
+    {
+        ++s.mvec_copies;
+        if (t_tap_copy_scope) ++s.mvec_copies_tap;   // R280o: same point, same condition, so tap <= copies
+    }
     s.mvec_slot_valid[slot].store(1u, std::memory_order_release);
+    // D2.0 NR step one: record that this slot got its copy. Off: one load.
+    if (mgpu::fgmap::on()) mgpu::fgmap::on_mvec_copy(slot);
 }
 
 // ---- R26: the cross-adapter unpack, on GPU 1's dedicated COPY queue ----
@@ -18473,9 +20070,17 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     // It cannot fire where the barrier route works, because
                     // copies would not be zero. That is the whole safety
                     // argument and it is structural, not a guard we maintain.
+                    // R280o (SF-R1): the R277 tap's copies are not the barrier route.
+                    // The first-launch learning turned the tap on before Starfield's
+                    // table existed; its end-of-frame copies made "copies == 0" false
+                    // and the evaluate route never armed. Counted apart, the question
+                    // is again the one R118 asks. tap is loaded FIRST: it can only lag
+                    // copies, so the difference never underflows - a copy landing
+                    // between the two loads delays the arm by one report, never fakes it.
+                    const unsigned long long r118_tap = s.mvec_copies_tap.load(std::memory_order_relaxed);
                     if (mgpu::calibrator::eval_copy_mode() == 2 &&
                         !s.mvec_auto_armed &&
-                        s.mvec_copies.load(std::memory_order_relaxed) == 0ull)
+                        s.mvec_copies.load(std::memory_order_relaxed) - r118_tap == 0ull)
                     {
                         mgpu::calibrator::table at{};
                         if (mgpu::calibrator::read(at) &&
@@ -18495,8 +20100,10 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                                 "cannot appear on a title where the barrier route works, "
                                 "because copies would not be zero. If it appears and copies "
                                 "STAY at zero, the evaluate is not carrying either and the "
-                                "finding is that neither route reaches this title.",
-                                f, f, at.mvec);
+                                "finding is that neither route reaches this title. [R280o] "
+                                "%llu copy(ies) by the R277 tap so far - not the barrier route, "
+                                "not counted.",
+                                f, f, at.mvec, r118_tap);
                             mgpu::diag::warn(al);
                         }
                     }
@@ -19274,8 +20881,13 @@ void stream_poll()
         // corrected in crop too, where the window does not change at all - and
         // present_resize itself decides there is nothing to do when the mode is
         // crop AND the format already matches.
+        // R229: the LINEAR twin of the game's format, not the game's format. A
+        // flip-model swap chain refuses an _SRGB back-buffer format (ResizeBuffers
+        // E_INVALIDARG - Rise of the Tomb Raider renders DXGI 29, TR-6b), and the
+        // neural textures the present copies from are already the linear twin
+        // (P7.8, nr_linear_format). 28 and 24 titles pass through unchanged.
         if (!s.profile)
-            (void)present_resize(s.width, s.height, s.window_mode, s.format);
+            (void)present_resize(s.width, s.height, s.window_mode, nr_linear_format(s.format));
     }
 
     // ---- RING WINDOW: hold no more depth than this run has earned ----
@@ -19498,7 +21110,29 @@ void stream_poll()
         // block below: the timestamp read and the liveness sample both test it
         // and both live after that block closes.
         const bool newest = (f >= completed);
-        const bool run_nr = s.nr_ok && newest && s.neural;
+        // ---- D2.0 NR2 / NR3: is this seal a generated frame? ----
+        //
+        // The N1 map (2026-10-05): frame generation reads the same vector
+        // resource as the scene feature, a generated frame cannot be told by
+        // resource identity, and the one per-seal fact that tells it apart is
+        // that no fresh vector copy arrived for it. So: frame generation
+        // active (fg_map: an fg evaluate within the last two rendered frames
+        // of presents) and no fresh vector in this slot = a generated frame.
+        // Off fg, or with the mode off, every line below is the old path.
+        const bool mvec_fresh =
+            (s.mvec_mode == 3 && s.mvec_bytes2 != 0 &&
+             s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
+        const bool fg_act  = mgpu::fgmap::act() && mgpu::fgmap::fg_active();
+        // NR3b: the generated frame is the FIRST seal after an fg evaluate
+        // (fg_map records it per slot at seal time), not the seal without a
+        // fresh vector - that one was title-dependent. mvec_fresh still
+        // decides fresh-vs-kept below; the data is the same either way.
+        const bool fg_gen  = fg_act && mgpu::fgmap::seal_generated(slot, f);
+        const float fg_frac = fg_act ? mgpu::fgmap::step_fraction() : 1.0f;
+        // NR3: evaluate only 1 generated frame in N; the rest keep the last
+        // output on screen (the same path as a superseded frame below).
+        const bool fg_thin = fg_gen && mgpu::fgmap::thin_this();
+        const bool run_nr = s.nr_ok && newest && s.neural && !fg_thin;
         if (!newest) ++s.nr_skipped;
 
         // ---- R26: the unpack goes to the COPY queue, one frame ahead when
@@ -19625,6 +21259,439 @@ void stream_poll()
                 const bool depth_here =
                     (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
                      s.depth_bytes != 0 && s.depth_slot_valid[slot] != 0u);
+                // R244. Read last frame's probe (its fence wait has passed), then
+                // record this frame's if it is one of the three.
+                if (s.dp_pending && s.dp_rb != nullptr)
+                {
+                    s.dp_pending = false; ++s.dp_n;
+                    unsigned char *pm = nullptr;
+                    D3D12_RANGE rr{ 0, (SIZE_T)s.depth_bytes };
+                    if (SUCCEEDED(s.dp_rb->Map(0, &rr, (void **)&pm)) && pm != nullptr)
+                    {
+                        const depth_probe_result pr = depth_probe_eval(pm, s.depth_w, s.depth_h, (unsigned)s.depth_fp.Footprint.RowPitch);
+                        D3D12_RANGE none{0, 0}; s.dp_rb->Unmap(0, &none);
+                        const char *cmp = "(no verdict to compare)";
+                        bool wrote = false;
+                        if (pr.reversed >= 0)
+                        {
+                            if (pr.reversed == s.depth_inverted) { ++s.dp_agree; cmp = "AGREES"; }
+                            else
+                            {
+                                ++s.dp_disagree; cmp = "DISAGREES";
+                                if (!s.dp_written) { wrote = ui_ini_write("DepthInverted", pr.reversed); s.dp_written = wrote; }
+                            }
+                        }
+                        char dl[640];
+                        snprintf(dl, sizeof dl,
+                                 "[MGPU][R244] depth probe %u/3 at f=%llu (%ux%u fmt=%u, every 2nd row/4th col): top 10%% rows "
+                                 "mean=%.4f, bottom 10%% mean=%.4f, at 0.0=%.1f%%, at 1.0=%.1f%% -> reads as %s. DepthInverted=%d in "
+                                 "effect %s%s",
+                                 s.dp_n, f, s.depth_w, s.depth_h, s.depth_format, pr.top, pr.bottom, pr.p0, pr.p1, pr.verdict,
+                                 s.depth_inverted, cmp,
+                                 wrote ? " - mgpu.ini DepthInverted REWRITTEN to match (self-heal); this session's NR keeps the "
+                                         "flag it was created with, the next launch uses the corrected key."
+                                       : (s.dp_written && pr.reversed >= 0 && pr.reversed != s.depth_inverted ? " (already rewritten this session)" : ""));
+                        if (cmp[0] == 'D') mgpu::diag::warn(dl); else mgpu::diag::info(dl);
+                    }
+                }
+                // R258: the calibration. Stage machine over three consecutive
+                // frames: record colour (f), record colour + vectors (f+1),
+                // read all three (f+2). Up to 12 probes, every 150 frames.
+                if (s.cp_stage == 2u && s.cp_rb[0] && s.cp_rb[1] && s.vp_rb && !s.vp_pending)
+                {
+                    s.cp_stage = 0; ++s.cp_n; ++s.cp_win_n;   // R278f: per-candidate window
+                    // R280o (Fable's ladder; SF-R1 vs SF-R2): the first-launch learning is the
+                    // LAST rung. Once the evaluate route has delivered - the calibrator copying the
+                    // vectors the game hands DLSS, at the DLSS pass (R118) - a lower rung carries
+                    // this title's own vectors at the right moment, and the learning stops: no
+                    // worse-count, no live switch, no verdict, nothing written. R258's probe lines
+                    // continue as information. Evidence, not a flag: a title whose evaluate route
+                    // never delivers (no NGX table: RE4, Skyrim) learns exactly as before.
+                    if (s.learn_on && mgpu::calibrator::eval_copies() != 0ull)
+                    {
+                        s.learn_on = false; s.learn_write = false;
+                        g_mv_cand_req.store(-1, std::memory_order_relaxed);
+                        mgpu::diag::warn("[MGPU][R280o] the evaluate route is delivering this title's own vectors (R118): "
+                                         "the first-launch learning stops here - nothing switched, nothing written. "
+                                         "R258 lines continue as information.");
+                    }
+                    unsigned char *c0 = nullptr, *c1 = nullptr, *mv = nullptr;
+                    D3D12_RANGE rc{ 0, (SIZE_T)s.payload_bytes }, rm{ 0, (SIZE_T)s.mvec_bytes2 }, none{ 0, 0 };
+                    const bool ok0 = SUCCEEDED(s.cp_rb[0]->Map(0, &rc, (void **)&c0)) && c0;
+                    const bool ok1 = SUCCEEDED(s.cp_rb[1]->Map(0, &rc, (void **)&c1)) && c1;
+                    const bool okm = SUCCEEDED(s.vp_rb->Map(0, &rm, (void **)&mv)) && mv;
+                    if (ok0 && ok1 && okm)
+                    {
+                        const unsigned W = s.fp.Footprint.Width, H = s.fp.Footprint.Height, P = s.fp.Footprint.RowPitch;
+                        const unsigned fmt = (unsigned)s.fp.Footprint.Format, bpp = bpp_of(fmt);
+                        const unsigned x0 = W / 4, x1 = 3 * W / 4, y0 = H / 4, y1 = 3 * H / 4;
+                        std::vector<double> ca(W, 0.0), cb(W, 0.0), ra(H, 0.0), rb(H, 0.0);
+                        for (unsigned y = y0; y < y1; y += 2)
+                        {
+                            const unsigned char *r0 = c0 + (size_t)y * P, *r1 = c1 + (size_t)y * P;
+                            for (unsigned x = x0; x < x1; x += 2)
+                            {
+                                const double l0 = lum_at(r0 + (size_t)x * bpp, fmt), l1 = lum_at(r1 + (size_t)x * bpp, fmt);
+                                ca[x] += l0; cb[x] += l1; ra[y] += l0; rb[y] += l1;
+                            }
+                        }
+                        // mean vector over the same region, in buffer units
+                        double svx = 0, svy = 0; unsigned long long nv = 0;
+                        const unsigned MP = s.mvec_fp2.Footprint.RowPitch;
+                        // R280o: the vector pair is read in the slot's own format, the way DLSS reads
+                        // it. SF-R1/SF-R2: R16G16_TYPELESS (4 bytes) was read as two 32-bit floats at
+                        // an 8-byte stride, and every warp candidate then scored the same error. The
+                        // decision rules below are unchanged - this is the reading, not the judgement.
+                        // 4-byte: FLOAT and TYPELESS as halves (what DLSS reads), UNORM / SNORM
+                        // normalised, SINT as integers. 8-byte: R32G32 FLOAT / TYPELESS as floats.
+                        const unsigned mfmt = s.mvec_format;
+                        const bool mv4 = (mfmt == (unsigned)DXGI_FORMAT_R16G16_FLOAT || mfmt == (unsigned)DXGI_FORMAT_R16G16_TYPELESS ||
+                                          mfmt == (unsigned)DXGI_FORMAT_R16G16_UNORM || mfmt == (unsigned)DXGI_FORMAT_R16G16_SNORM ||
+                                          mfmt == (unsigned)DXGI_FORMAT_R16G16_SINT);
+                        const size_t mv_bpp = mv4 ? 4u : 8u;
+                        auto read_mv = [mfmt, mv4](const unsigned char *px, float &vx, float &vy)
+                        {
+                            if (!mv4) { const float *q = (const float *)px; vx = q[0]; vy = q[1]; return; }
+                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_UNORM)
+                            { const unsigned short *q = (const unsigned short *)px; vx = (float)q[0] / 65535.0f; vy = (float)q[1] / 65535.0f; return; }
+                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_SNORM)
+                            {
+                                const short *q = (const short *)px;
+                                vx = (q[0] <= -32767) ? -1.0f : (float)q[0] / 32767.0f;
+                                vy = (q[1] <= -32767) ? -1.0f : (float)q[1] / 32767.0f;
+                                return;
+                            }
+                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_SINT)
+                            { const short *q = (const short *)px; vx = (float)q[0]; vy = (float)q[1]; return; }
+                            const unsigned short *q = (const unsigned short *)px; vx = half_to_float(q[0]); vy = half_to_float(q[1]);
+                        };
+                        const unsigned mx0 = s.mvec_w / 4, mx1 = 3 * s.mvec_w / 4, my0 = s.mvec_h / 4, my1 = 3 * s.mvec_h / 4;
+                        for (unsigned y = my0; y < my1; y += 2)
+                        {
+                            const unsigned char *row = mv + (size_t)y * MP;
+                            for (unsigned x = mx0; x < mx1; x += 4)
+                            {
+                                float vx, vy;
+                                read_mv(row + (size_t)x * mv_bpp, vx, vy);   // R280o
+                                svx += vx; svy += vy; ++nv;
+                            }
+                        }
+                        const double mvx = nv ? svx / (double)nv : 0.0, mvy = nv ? svy / (double)nv : 0.0;
+                        const cal_axis ax = cal_axis_eval(ca.data(), cb.data(), W, mvx, (double)W);
+                        const cal_axis ay = cal_axis_eval(ra.data(), rb.data(), H, mvy, (double)H);
+                        // R258d: THE WARP TEST - the vote that needs no eyes. For each
+                        // candidate scale (sign x unit, both axes) every sampled pixel of
+                        // frame 2 follows its vector back by that scale and reads frame 1
+                        // there (NGX: the vector points to the previous frame). The right
+                        // candidate makes frame 1 line up and the error falls well under
+                        // the no-motion baseline; a wrong sign makes it worse than baseline.
+                        // Winner must beat the baseline by 10% and the runner-up by 5%.
+                        double err[13] = {0}; unsigned long long cnt[13] = {0};
+                        const double KX[4] = { (double)W, -(double)W, (double)W * 0.5, -(double)W * 0.5 };
+                        const double KY[4] = { (double)H, -(double)H, (double)H * 0.5, -(double)H * 0.5 };
+                        // candidates: index = 1 + ux*4 + ... keep it explicit: [0]=baseline,
+                        // [1..4] = (sx,sy) in {++,+-,-+,--} at full units, [5..8] the same at half.
+                        const double sxm = (double)W / (double)s.mvec_w, sym = (double)H / (double)s.mvec_h;   // vector grid -> colour grid
+                        // R278b: [9..12] PIXEL units on the vector grid (RE4-4: |x| mean 0.37 max 3.1 on
+                        // 1280x720 reads as pixels, which the eight UV candidates can only reject).
+                        const double sxv[12] = { KX[0], KX[0], KX[1], KX[1], KX[2], KX[2], KX[3], KX[3],  sxm,  sxm, -sxm, -sxm };
+                        const double syv[12] = { KY[0], KY[1], KY[0], KY[1], KY[2], KY[3], KY[2], KY[3],  sym, -sym,  sym, -sym };
+                        for (unsigned y = y0; y < y1; y += 4)
+                        {
+                            const unsigned char *r1 = c1 + (size_t)y * P;
+                            const unsigned my = (unsigned)((double)y / sym); if (my >= s.mvec_h) continue;
+                            const unsigned char *mrow = mv + (size_t)my * MP;
+                            for (unsigned x = x0; x < x1; x += 4)
+                            {
+                                const unsigned mxx = (unsigned)((double)x / sxm); if (mxx >= s.mvec_w) continue;
+                                float vx, vy;
+                                read_mv(mrow + (size_t)mxx * mv_bpp, vx, vy);   // R280o
+                                const double l2 = lum_at(r1 + (size_t)x * bpp, fmt);
+                                // baseline
+                                { const double l1 = lum_at(c0 + (size_t)y * P + (size_t)x * bpp, fmt); err[0] += (l1 > l2 ? l1 - l2 : l2 - l1); ++cnt[0]; }
+                                for (int c = 0; c < 12; ++c)
+                                {
+                                    const double px = (double)x + sxv[c] * (double)vx, py = (double)y + syv[c] * (double)vy;
+                                    if (px < 0 || py < 0 || px >= (double)W - 1 || py >= (double)H - 1) continue;
+                                    const double l1 = lum_at(c0 + (size_t)(unsigned)py * P + (size_t)(unsigned)px * bpp, fmt);
+                                    err[1 + c] += (l1 > l2 ? l1 - l2 : l2 - l1); ++cnt[1 + c];
+                                }
+                            }
+                        }
+                        double e[13]; for (int c = 0; c < 13; ++c) e[c] = cnt[c] ? err[c] / (double)cnt[c] : 1e300;
+                        int bestc = 1; for (int c = 2; c <= 12; ++c) if (e[c] < e[bestc]) bestc = c;
+                        double second = 1e300; for (int c = 1; c <= 12; ++c) if (c != bestc && e[c] < second) second = e[c];
+                        const bool decisive = (e[bestc] < e[0] * 0.90) && (e[bestc] < second * 0.95) && cnt[bestc] > 1000ull;
+                        // R278: the other half of the judge. Every vector reading
+                        // making the picture line up WORSE than no motion at all
+                        // (RE4-4: 8 of 8) is a buffer that is not this frame's motion.
+                        if (s.learn_on && e[bestc] > e[0] * 1.10 && cnt[0] > 1000ull) ++s.cp_worse;
+                        const char *cname[13] = { "none", "+W,+H", "+W,-H", "-W,+H", "-W,-H", "+W/2,+H/2", "+W/2,-H/2", "-W/2,+H/2", "-W/2,-H/2",
+                                                  "+px,+px", "+px,-px", "-px,+px", "-px,-px" };
+                        if (decisive)
+                        {
+                            const int c = bestc - 1;
+                            const bool half = (c >= 4 && c < 8), pix = (c >= 8);
+                            const int sx = (sxv[c] > 0) ? 1 : -1, sy = (syv[c] > 0) ? 1 : -1;
+                            if (pix) { ++s.cp_kx_votes[3]; s.cp_kx_px_sign = sx; ++s.cp_ky_votes[3]; s.cp_ky_px_sign = sy; }   // R278b
+                            else if (!half) { ++s.cp_kx_votes[sx > 0 ? 0 : 1]; ++s.cp_ky_votes[sy > 0 ? 0 : 1]; }
+                            else { ++s.cp_kx_votes[2]; s.cp_kx_half_sign = sx; ++s.cp_ky_votes[2]; s.cp_ky_half_sign = sy; }
+                        }
+                        char cl[760];
+                        snprintf(cl, sizeof cl,
+                                 "[MGPU][R258] calibration %u/24 at f=%llu: WARP TEST error none=%.3g best=%.3g (%s) second=%.3g -> %s | "
+                                 "profile cross-check: shift x=%+.0f y=%+.0f, mean vector x=%+.5f y=%+.5f, K_x=%+.1f K_y=%+.1f | "
+                                 "votes x: +W %d, -W %d, half %d, px %d | y: +H %d, -H %d, half %d, px %d",
+                                 s.cp_n, f, e[0], e[bestc], cname[bestc], second,
+                                 decisive ? "DECISIVE" : "not decisive (too little motion or no clear winner)",
+                                 ax.shift, ay.shift, mvx, mvy, ax.k, ay.k,
+                                 s.cp_kx_votes[0], s.cp_kx_votes[1], s.cp_kx_votes[2], s.cp_kx_votes[3],
+                                 s.cp_ky_votes[0], s.cp_ky_votes[1], s.cp_ky_votes[2], s.cp_ky_votes[3]);
+                        mgpu::diag::info(cl);
+                        // Three agreeing votes on an axis -> the key. Written once per axis pair,
+                        // next launch is the heal (the R244 shape). Y falls back to X's unit and
+                        // sign when it never saw enough vertical motion.
+                        auto decide = [](const int *v, int half_sign, double full, int &out) -> bool {
+                            if (v[0] >= 3 && v[0] > v[1] && v[0] > v[2] && v[0] > v[3]) { out = (int)full; return true; }
+                            if (v[1] >= 3 && v[1] > v[0] && v[1] > v[2] && v[1] > v[3]) { out = -(int)full; return true; }
+                            if (v[2] >= 3 && v[2] > v[0] && v[2] > v[1] && v[2] > v[3]) { out = half_sign * (int)(full * 0.5); return true; }
+                            return false;
+                        };
+                        // R278b: the pixel verdict. Three agreeing pixel votes on X -> the scale is
+                        // colour pixels per vector pixel (W / vector width), signed; Y the same or X's sign.
+                        const bool px_x = (s.cp_kx_votes[3] >= 3 && s.cp_kx_votes[3] > s.cp_kx_votes[0] && s.cp_kx_votes[3] > s.cp_kx_votes[1] && s.cp_kx_votes[3] > s.cp_kx_votes[2]);
+                        int kx = 0, ky = 0;
+                        // R278e: verdicts are written only on the tap path (learning, or MVecTap set).
+                        // A contract title keeps its probe lines as information and its ini untouched.
+                        // R280c/R280e: on the virtual-target path nothing is written. The judge stays
+                        // OPEN for the session: each window re-reads the cumulative votes per axis and
+                        // applies the scale live when it changes (Y from its own votes, never X's);
+                        // and it scores the write edge in force for the window (best/none, motion
+                        // windows only), alternating edges while the source is written more than
+                        // once per frame, until one edge wins; a chosen edge that goes worse three
+                        // windows running reopens the choice. No key, no eye: the picture decides.
+                        const bool x_live = g_mvec_x_active.load(std::memory_order_relaxed);
+                        const bool may_write = s.learn_write && !x_live;   // R278f-r: decided at arm (R258 runs under s.cs on the bridge thread: no file read here)
+                        if (x_live)
+                        {
+                            const bool motion = s.x_edges_rec != 0u && cnt[0] > 1000ull && e[0] > 0.0 && (decisive || e[bestc] > e[0] * 1.10);   // R280g: a window with no source write is not scored
+                            const unsigned eu = s.x_edge_used & 1u;
+                            if (motion) { s.x_edge_sum[eu] += e[bestc] / e[0]; ++s.x_edge_n[eu]; }
+                            const unsigned edges = g_mvec_x_edges.load(std::memory_order_relaxed);
+                            char el[200]; el[0] = 0;
+                            if (!s.x_edge_fixed)
+                            {
+                                if (s.x_edge_n[0] >= 3u && s.x_edge_n[1] >= 3u)
+                                {
+                                    const double m0 = s.x_edge_sum[0] / s.x_edge_n[0], m1 = s.x_edge_sum[1] / s.x_edge_n[1];
+                                    const int pick = (m1 < m0 * 0.95) ? 1 : 0;
+                                    s.x_edge_fixed = true; s.x_edge_bad = 0;
+                                    g_mvec_x_edge_req.store(pick, std::memory_order_relaxed);
+                                    snprintf(el, sizeof el, " | EDGE CHOSEN: %s write of the frame (last %.2f over %u, first %.2f over %u; best/none, lower is better)",
+                                             pick ? "FIRST" : "LAST", m0, s.x_edge_n[0], m1, s.x_edge_n[1]);
+                                }
+                                else if (edges >= 2u)
+                                    g_mvec_x_edge_req.store(eu ? 0 : 1, std::memory_order_relaxed);   // alternate for the next window
+                            }
+                            else if (motion)
+                            {
+                                if (e[bestc] > e[0] * 1.10) ++s.x_edge_bad; else s.x_edge_bad = 0;
+                                if (s.x_edge_bad >= 3u)
+                                {
+                                    s.x_edge_fixed = false; s.x_edge_bad = 0;
+                                    s.x_edge_sum[0] = s.x_edge_sum[1] = 0.0; s.x_edge_n[0] = s.x_edge_n[1] = 0;
+                                    snprintf(el, sizeof el, " | EDGE REOPENED: the chosen edge was worse than no motion three windows running");
+                                }
+                            }
+                            int nkx = s.x_kx, nky = s.x_ky;
+                            if (!px_x) (void)decide(s.cp_kx_votes, s.cp_kx_half_sign, (double)W, nkx);
+                            (void)decide(s.cp_ky_votes, s.cp_ky_half_sign, (double)H, nky);
+                            if (nkx != s.x_kx || nky != s.x_ky)
+                            {
+                                s.x_kx = nkx; s.x_ky = nky; ++s.x_verdicts;
+                                s.mvec_scale_x = (nkx != 0) ? (float)nkx * ((float)s.width / (float)W) : (float)s.width;
+                                s.mvec_scale_y = (nky != 0) ? (float)nky * ((float)s.height / (float)H) : (float)s.height;
+                                s.mvec_dirty = true;
+                                snprintf(cl, sizeof cl, "[MGPU][R280] VERDICT applied live (#%u): MVecScaleX=%.2f MVecScaleY=%.2f (uv; X from %d votes, Y from %d - Y not yet measured keeps +). Nothing written to mgpu.ini.%s",
+                                         s.x_verdicts, s.mvec_scale_x, s.mvec_scale_y,
+                                         s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2], s.cp_ky_votes[0] + s.cp_ky_votes[1] + s.cp_ky_votes[2], el);
+                                mgpu::diag::warn(cl);
+                            }
+                            else if (el[0] != 0 || (s.cp_n % 8u) == 0u)
+                            {
+                                snprintf(cl, sizeof cl, "[MGPU][R280] judge window %u: source edges/frame=%u, edge in force=%s, none=%.3g best=%.3g (%s)%s | edge means last=%.2f/%u first=%.2f/%u | scale X=%.0f Y=%.0f%s",
+                                         s.cp_n, edges, eu ? "first" : "last", e[0], e[bestc], decisive ? "decisive" : (motion ? "worse" : "no motion"),
+                                         s.x_edge_fixed ? " [edge fixed]" : "",
+                                         s.x_edge_n[0] ? s.x_edge_sum[0] / s.x_edge_n[0] : 0.0, s.x_edge_n[0], s.x_edge_n[1] ? s.x_edge_sum[1] / s.x_edge_n[1] : 0.0, s.x_edge_n[1],
+                                         s.mvec_scale_x, s.mvec_scale_y, el);
+                                mgpu::diag::info(cl);
+                            }
+                        }
+                        if (!s.cp_written && may_write && px_x)
+                        {
+                            const float fx = (float)(s.cp_kx_px_sign * sxm);
+                            const float fy = (float)((s.cp_ky_votes[3] >= 3 ? s.cp_ky_px_sign : s.cp_kx_px_sign) * sym);
+                            // R278c: the unit and the signs are written, never the number.
+                            const bool w1 = ini_write_text("MVecUnits", "px"),
+                                       w2 = ui_ini_write("MVecSignX", fx < 0 ? -1 : 1) && ui_ini_write("MVecSignY", fy < 0 ? -1 : 1);
+                            s.cp_written = w1 && w2;
+                            if (s.learn_on && s.cp_written) { (void)ui_ini_write("MVecLearned", s.learn_cand); (void)ui_ini_write("MVecTap", 1); (void)ui_ini_write("MVecCandidate", s.learn_cand); }   /* R278f: the pick the next launch must take */   // R278b: kept
+                            snprintf(cl, sizeof cl,
+                                     "[MGPU][R258] VERDICT: PIXEL units (this launch: MVecScaleX=%.2f MVecScaleY=%.2f, colour pixels per vector pixel) - "
+                                     "mgpu.ini %s with MVecUnits=px and the signs; every launch derives the scale from its own sizes.",
+                                     fx, fy, s.cp_written ? "REWRITTEN" : "NOT written (writer failed)");
+                            mgpu::diag::warn(cl);
+                        }
+                        else if (!s.cp_written && may_write && decide(s.cp_kx_votes, s.cp_kx_half_sign, (double)W, kx))
+                        {
+                            if (!decide(s.cp_ky_votes, s.cp_ky_half_sign, (double)H, ky)) ky = (kx < 0 ? -1 : 1) * (int)((double)H * ((kx < 0 ? -kx : kx) == (int)W ? 1.0 : 0.5));
+                            // R278c: the unit and the signs are written, never the number.
+                            const bool is_half = ((kx < 0 ? -kx : kx) != (int)W);
+                            const bool w1 = ini_write_text("MVecUnits", is_half ? "uvhalf" : "uv"),
+                                       w2 = ui_ini_write("MVecSignX", kx < 0 ? -1 : 1) && ui_ini_write("MVecSignY", ky < 0 ? -1 : 1);
+                            s.cp_written = w1 && w2;
+                            if (s.learn_on && s.cp_written) { (void)ui_ini_write("MVecLearned", s.learn_cand); (void)ui_ini_write("MVecTap", 1); (void)ui_ini_write("MVecCandidate", s.learn_cand); }   /* R278f: the pick the next launch must take */   // R278: closed for this title, tap kept
+                            snprintf(cl, sizeof cl,
+                                     "[MGPU][R258] VERDICT: %s units (this launch: MVecScaleX=%d MVecScaleY=%d) %s - mgpu.ini %s with MVecUnits and the signs; "
+                                     "every launch derives the scale from its own sizes.", is_half ? "UV/2" : "UV", kx, ky,
+                                     (s.cp_ky_votes[0] + s.cp_ky_votes[1] + s.cp_ky_votes[2] >= 3) ? "(both axes measured)" : "(Y taken from X: not enough vertical motion seen)",
+                                     s.cp_written ? "REWRITTEN" : "NOT written (writer failed)");
+                            mgpu::diag::warn(cl);
+                        }
+                    }
+                    // R278: rejected. Six probes worse than no motion and not one
+                    // decisive vote: the next eligible candidate is tried on the next
+                    // launch; with none left, the tap is turned off (depth only) and
+                    // the title is closed. One line either way, then silence.
+                    // R278e: or on balance at the end of the 24 probes - one lucky
+                    // decisive vote no longer vetoes (RE4-L1: 1 vote, ~17 worse).
+                    const unsigned votes_x = (unsigned)(s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2] + s.cp_kx_votes[3]);
+                    // R278f: per candidate - a window of 8 probes. Rejected early (6 worse,
+                    // no vote) or on balance at the window's end (worse >= 4 and >= 3 x votes).
+                    const bool win_end = (s.cp_win_n >= 8u);
+                    // R280e: on the virtual-target path there is no reject - the judge stays open (above).
+                    if (g_mvec_x_active.load(std::memory_order_relaxed)) { }
+                    else if (s.learn_on && !s.cp_written &&
+                        ((s.cp_worse >= 6u && votes_x == 0u) || (win_end && s.cp_worse >= 4u && s.cp_worse >= 3u * votes_x)))
+                    {
+                        const unsigned en = g_mvec_elig_n.load(std::memory_order_relaxed);
+                        const int ns = g_mv_next_same.load(std::memory_order_relaxed);
+                        const int nc = g_mv_next_class.load(std::memory_order_relaxed);
+                        char rl[400];
+                        if (ns > s.learn_cand)
+                        {
+                            // Same size: switch live, start a fresh window. Not closed.
+                            snprintf(rl, sizeof rl, "[MGPU][R278f] vector candidate %d rejected (%u of %u probes worse than none, %u decisive). "
+                                                    "Candidate %d has the same size: switching live, this launch.", s.learn_cand, s.cp_worse, s.cp_win_n, votes_x, ns);
+                            mgpu::diag::warn(rl);
+                            g_mv_cand_req.store(ns, std::memory_order_relaxed);
+                            s.learn_cand = ns; s.cp_worse = 0; s.cp_win_n = 0;
+                            for (int i = 0; i < 4; ++i) { s.cp_kx_votes[i] = 0; s.cp_ky_votes[i] = 0; }
+                            goto r278f_next;
+                        }
+                        if (nc > s.learn_cand && (unsigned)nc < en)
+                        {
+                            (void)ui_ini_write("MVecCandidate", nc);
+                            snprintf(rl, sizeof rl, "[MGPU][R278] vector candidate %d rejected (%u of %u probes worse than none). No other candidate of this size; "
+                                                    "the next launch tries candidate %d (a smaller size) of %u.", s.learn_cand, s.cp_worse, s.cp_win_n, nc, en);
+                        }
+                        else
+                        {
+                            (void)ui_ini_write("MVecTap", 0);
+                            (void)ui_ini_write("MVecLearned", 99);
+                            snprintf(rl, sizeof rl, "[MGPU][R278] no vector candidate passed on this title (%u eligible). The tap is off from the next launch: "
+                                                    "depth only. MVecLearned=99 keeps it closed.", en);
+                        }
+                        mgpu::diag::warn(rl);
+                        s.cp_written = true;   // closes R258 for this session
+                    }
+                    r278f_next:;
+                    if (ok0) s.cp_rb[0]->Unmap(0, &none);
+                    if (ok1) s.cp_rb[1]->Unmap(0, &none);
+                    if (okm) s.vp_rb->Unmap(0, &none);
+                }
+                // R280e: on the virtual-target path the judge never closes (no probe budget);
+                // after the first verdict it runs every 1000 frames instead of every 100.
+                const bool x_judge = g_mvec_x_active.load(std::memory_order_relaxed);
+                if (((x_judge && (s.x_verdicts == 0u || (f % 1000ull) < 100ull)) || (s.cp_n < (s.learn_on ? 40u : 24u) && !s.cp_written)) && s.mvec_bytes2 != 0)   // R278f: room for 3 same-size windows while learning
+                {
+                    // Staged recording. Stage 1 at the odd 150s (150, 450, 750, ...) so it
+                    // never shares a frame with R257's readback at 300/900/1800; stage 2
+                    // the frame after. R258b: no longer waits for the R257 probes (SK-26
+                    // ended at f=1586, before the old gate at 1801).
+                    // R258c: every 100 frames at the 50s (150, 250, 350, ...): never a
+                    // multiple of 300, so never R257's frame.
+                    if (s.cp_stage == 0u && (f % 100ull) == 50ull && f >= 150ull)
+                    {
+                        if (s.cp_rb[0] == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.payload_bytes, D3D12_HEAP_TYPE_READBACK, &s.cp_rb[0]);
+                        if (s.cp_rb[1] == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.payload_bytes, D3D12_HEAP_TYPE_READBACK, &s.cp_rb[1]);
+                        if (s.vp_rb == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.mvec_bytes2, D3D12_HEAP_TYPE_READBACK, &s.vp_rb);
+                        if (s.cp_rb[0] && s.cp_rb[1] && s.vp_rb)
+                        {
+                            s.nl->CopyBufferRegion(s.cp_rb[0], 0, s.nxfer, slot_off + SEAL_STRIDE, s.payload_bytes);
+                            s.cp_stage = 1u;
+                            s.x_edge_used = (unsigned)g_mvec_x_edge_req.load(std::memory_order_relaxed);   // R280e
+                            s.x_edges_rec = g_mvec_x_edges.load(std::memory_order_relaxed);                  // R280g
+                        }
+                    }
+                    else if (s.cp_stage == 1u)
+                    {
+                        if (mvec_fresh)
+                        {
+                            s.nl->CopyBufferRegion(s.cp_rb[1], 0, s.nxfer, slot_off + SEAL_STRIDE, s.payload_bytes);
+                            s.nl->CopyBufferRegion(s.vp_rb, 0, s.nxfer, slot_off + s.mvec_off, s.mvec_bytes2);
+                            s.cp_stage = 2u;
+                        }
+                        else s.cp_stage = 0u;   // no vectors on the second frame: try at the next 150
+                    }
+                }
+
+                // R257: read last frame's vector probe, then record this frame's.
+                if (s.vp_pending && s.vp_rb != nullptr)
+                {
+                    s.vp_pending = false; ++s.vp_n;
+                    unsigned char *pm = nullptr;
+                    D3D12_RANGE rr{ 0, (SIZE_T)s.mvec_bytes2 };
+                    if (SUCCEEDED(s.vp_rb->Map(0, &rr, (void **)&pm)) && pm != nullptr)
+                    {
+                        const vec_probe_result vr = vec_probe_eval(pm, s.mvec_w, s.mvec_h, (unsigned)s.mvec_fp2.Footprint.RowPitch, s.mvec_format);
+                        D3D12_RANGE none{0, 0}; s.vp_rb->Unmap(0, &none);
+                        char vl[560];
+                        snprintf(vl, sizeof vl,
+                                 "[MGPU][R257] vector probe %u/3 at f=%llu (%ux%u fmt=%u, every 2nd row/4th col): samples=%llu zero=%.1f%% | "
+                                 "|x| mean=%.4g max=%.4g | |y| mean=%.4g max=%.4g | x>0 %.0f%% y>0 %.0f%% -> %s",
+                                 s.vp_n, f, s.mvec_w, s.mvec_h, s.mvec_format, vr.n,
+                                 vr.n ? 100.0 * (double)vr.zeros / (double)vr.n : 0.0,
+                                 vr.mean_ax, vr.max_ax, vr.mean_ay, vr.max_ay, 100.0 * vr.pos_x, 100.0 * vr.pos_y, vr.verdict);
+                        mgpu::diag::info(vl);
+                    }
+                }
+                if (mvec_fresh && s.vp_n < 3u && !s.vp_pending && s.mvec_bytes2 != 0 && (f == 300ull || f == 900ull || f == 1800ull))
+                {
+                    if (s.vp_rb == nullptr && s.ndev_b != nullptr) (void)make_buf(s.ndev_b, s.mvec_bytes2, D3D12_HEAP_TYPE_READBACK, &s.vp_rb);
+                    if (s.vp_rb != nullptr)
+                    {
+                        s.nl->CopyBufferRegion(s.vp_rb, 0, s.nxfer, slot_off + s.mvec_off, s.mvec_bytes2);
+                        s.vp_pending = true;
+                    }
+                }
+                if (depth_here && s.dp_n < 3u && !s.dp_pending && (f == 300ull || f == 900ull || f == 1800ull))
+                {
+                    if (s.depth_format != (unsigned)DXGI_FORMAT_R32_FLOAT)
+                    {
+                        char nf[160]; snprintf(nf, sizeof nf, "[MGPU][R244] depth probe: depth format %u is not R32_FLOAT - not sampled.", s.depth_format);
+                        mgpu::diag::info(nf); s.dp_n = 3u;
+                    }
+                    else
+                    {
+                        if (s.dp_rb == nullptr && s.ndev_b != nullptr) (void)make_buf(s.ndev_b, s.depth_bytes, D3D12_HEAP_TYPE_READBACK, &s.dp_rb);
+                        if (s.dp_rb != nullptr)
+                        {
+                            s.nl->CopyBufferRegion(s.dp_rb, 0, s.nxfer, slot_off + s.depth_off, s.depth_bytes);
+                            s.dp_pending = true;
+                        }
+                    }
+                }
                 if (depth_here)
                 {
                     if (!use_cq)
@@ -20184,7 +22251,11 @@ void stream_poll()
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
-                        const float mv_k = cv_here ? 1.0f : mv_el;   // R217
+                        // D2.0 NR2: one presented step of a rendered frame's
+                        // motion while frame generation is active (fg_frac is
+                        // 1.0 otherwise). With a thinned frame before this one
+                        // mv_el is 2 and the product is one rendered step.
+                        const float mv_k = cv_here ? 1.0f : mv_el * fg_frac;   // R217
                         s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
                         s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
                         mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
@@ -20200,6 +22271,38 @@ void stream_poll()
                             ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
                             : (unsigned int)s.mvec_h);
                         if (pi == 0 && sk == 0) ++s.mvec_bound;
+                    }
+                    else if (s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
+                             s.mvec_keep_f != 0ull &&
+                             f - s.mvec_keep_f <= (unsigned long long)mgpu::fgmap::reuse_window())
+                    {
+                        // D2.0 NR2: frame generation is active and this seal
+                        // brought no fresh vector. Generated or real (NR3b:
+                        // which one is title-dependent, see fg_map), the
+                        // motion it needs is the last rendered frame's at one
+                        // presented step - the same vector and fraction fg
+                        // itself used - so binding the kept copy adds no new
+                        // guess. Written out like the branch above so the two
+                        // cannot drift apart. Bounded to the reuse window: a
+                        // kept copy older than two rendered frames falls
+                        // through to R61's unset below.
+                        s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_keep);
+                        mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        const float mv_k = mv_el * fg_frac;
+                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
+                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
+                            ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
+                            : (unsigned int)s.mvec_w);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
+                            ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
+                            : (unsigned int)s.mvec_h);
+                        if (pi == 0 && sk == 0) { ++s.mvec_bound; mgpu::fgmap::on_reuse(); }
                     }
                     else if (s.mvec_mode == 3)
                     {
@@ -20726,8 +22829,34 @@ void stream_poll()
                 // depth's so the two cannot drift apart.
                 if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                     s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
-                    barrier(s.nl, s.tex_mvec_r[ii],
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.tex_in_rest);
+                {
+                    if (fg_act && s.tex_mvec_keep != nullptr)
+                    {
+                        // D2.0 NR2: keep this rendered frame's vectors for the
+                        // generated frame(s) that follow. Same queue as the
+                        // evaluate that just read them, so ordered behind it;
+                        // the kept texture returns to its resting state and
+                        // the pair's half to its own. Recorded only while
+                        // frame generation is active: otherwise this list is
+                        // byte-identical to the shipped one.
+                        barrier(s.nl, s.tex_mvec_r[ii],
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        barrier(s.nl, s.tex_mvec_keep,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                        s.nl->CopyResource(s.tex_mvec_keep, s.tex_mvec_r[ii]);
+                        barrier(s.nl, s.tex_mvec_keep,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        barrier(s.nl, s.tex_mvec_r[ii],
+                                D3D12_RESOURCE_STATE_COPY_SOURCE, s.tex_in_rest);
+                        s.mvec_keep_f = f;
+                    }
+                    else
+                        barrier(s.nl, s.tex_mvec_r[ii],
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.tex_in_rest);
+                }
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
             }
@@ -20787,6 +22916,7 @@ void stream_poll()
     if (s.finished && s.consumed >= s.produced && !s.summarised)
     {
         s.summarised = true;
+        s.ll_due_summary = true;   // R267b: written off the lock at the tail of this stream_poll
 
         // ---- R89: THE COUNTERS THAT ONLY EVER LIVED IN A PERIODIC LINE ----
         //
@@ -21383,6 +23513,53 @@ void stream_poll()
                               "causes. Do not average them into a verdict.");
         }
         stream_release();
+    }
+
+    // ---- R270b: the launch record, off the lock ----
+    //
+    // Last thing in stream_poll, so nothing below needs s.cs: the snapshot is
+    // taken under the lock, the lock is released, and the file is written on
+    // this (bridge) thread only. The game's gate cannot be held by it. The
+    // write is timed; one slow write turns the record off for good.
+    // R267b first: the agreed arm and summary records, deferred here from the
+    // sites that decided them so neither the game thread nor the lock pays
+    // for a file write. Same writer, same content, a poll later.
+    if (s.ll_due_arm || s.ll_due_summary)
+    {
+        const bool arm = s.ll_due_arm, sum = s.ll_due_summary;
+        s.ll_due_arm = false; s.ll_due_summary = false;
+        const ll_snapshot snap = ll_take(s);
+        lk.unlock();
+        if (arm && !sum) write_last_launch("arm", &snap);
+        if (sum)         write_last_launch("summary", &snap);
+        return;
+    }
+    if (s.rec_on && s.armed && !s.summarised && s.consumed >= s.rec_next)
+    {
+        s.rec_next = s.consumed + 300ull;
+        const ll_snapshot snap = ll_take(s);
+        lk.unlock();
+        LARGE_INTEGER t0{}, t1{}, fq{};
+        QueryPerformanceCounter(&t0);
+        write_last_launch("running", &snap);
+        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+        const double ms = (fq.QuadPart != 0) ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
+        const double REC_LIMIT_MS = 2.0;
+        if (ms > REC_LIMIT_MS)
+        {
+            s.rec_on = false;   // this thread is the only writer of rec_on after arm
+            char why[160];
+            snprintf(why, sizeof why, "write took %.2f ms at consumed=%llu (limit %.0f ms)", ms, snap.consumed, REC_LIMIT_MS);
+            (void)ui_ini_write("LaunchRecord", 0);
+            (void)ini_write_text("LaunchRecordOff", why);
+            char line[400];
+            snprintf(line, sizeof line,
+                     "[MGPU][R270b] LaunchRecord turned itself off: %s. mgpu.ini now has "
+                     "LaunchRecord=0 and LaunchRecordOff=<reason>; the next launch runs without "
+                     "the record. Nothing else changes in this run.", why);
+            mgpu::diag::warn(line);
+        }
+        return;
     }
 }
 

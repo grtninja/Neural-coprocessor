@@ -26,3 +26,34 @@ requests:
 
 Thank you for both - especially for the regression coverage that makes these
 correctness properties checkable going forward rather than just asserted.
+
+## Mohammed Hasan - [MoHasan9505](https://github.com/MoHasan9505)
+
+His test system: NVIDIA 617.14 (32.0.16.1714) on the RTX 5070, AMD Adrenalin
+32.0.31041.1004 on the Radeon AI PRO R9700, and one display connected to the
+RTX 5070 over HDMI.
+
+Two findings against the add-on's NGX and teardown code, from a fork where
+an AMD card renders the game and an RTX card runs DLSS-NR
+([nr-redgreen](https://github.com/MoHasan9505/nr-redgreen)). Both merged in
+a guarded shape, under his name:
+
+- **The core `Init` takes four arguments.** The driver's `_nvngx.dll` export
+  of `NVSDK_NGX_D3D12_Init` is the four-argument form; called through the
+  SDK's five-argument typedef, the driver read a stack address as the
+  version and the check passed or failed by ASLR - the intermittent
+  `FAIL_OutOfDate` on roughly every other launch (#44). His disassembly on
+  driver 617.14 is the first explanation of that failure that holds, and it
+  also explains a chase on the primary author's side. Merged as the last
+  rung of a ladder: the four-argument call is tried only after the
+  five-argument one has returned `FAIL_OutOfDate`, so a driver whose export
+  really takes five arguments is never handed a junk parameter.
+- **The GPU 0 teardown drain never ran.** The drain checked a fence one line
+  after that fence had been released, so it was dead code and the shared
+  transfer buffer was freed with no wait. His fix waits on the game-side
+  fence, for the last value actually signalled, so a normal exit waits
+  nothing. Merged as written, plus a timing line on every teardown and a
+  switch the add-on throws itself if the wait ever stalls, because it turns
+  on a wait no shipped build had executed.
+
+Thank you for both, and for the disassembly in particular.

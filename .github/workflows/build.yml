@@ -328,3 +328,70 @@ jobs:
           name: mgpu_bridge
           path: _deploy/
           if-no-files-found: error
+
+  # 0.3.0: the launcher, shipped with everything COPY FILES copies. Its
+  # payload\ is this run's mgpu_bridge set (the seven files, the shader under
+  # reshade-shaders\Shaders\), and payload\tools\ holds nrcheck for DIAGNOSE.
+  # nvngx_dlssnr.dll is never in it: the launcher's INSTALL page says where to
+  # get it. The build job above is unchanged; this job only reads its artifact.
+  launcher:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mgpu_bridge
+          path: _bridge
+
+      - name: Configure the launcher
+        working-directory: tools/launcher
+        run: cmake -B build -A x64
+
+      - name: Build the launcher
+        working-directory: tools/launcher
+        run: cmake --build build --config Release
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA (for nrcheck)
+        working-directory: tools/nrcheck
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+
+      - name: Configure nrcheck
+        working-directory: tools/nrcheck
+        run: cmake -B build -A x64
+
+      - name: Build nrcheck
+        working-directory: tools/nrcheck
+        run: cmake --build build --config Release
+
+      - name: Stage the launcher with its payload
+        shell: bash
+        run: |
+          mkdir -p _launcher/payload/tools
+          cp "tools/launcher/build/Release/MGPU Bridge Launcher.exe" _launcher/
+          cp -R _bridge/. _launcher/payload/
+          cp tools/nrcheck/build/Release/nrcheck.exe _launcher/payload/tools/
+          cp tools/nrcheck/build/Release/nvngx.dll_nrcheck.dll _launcher/payload/tools/
+          cp tools/nrcheck/Run-NRBench.ps1 _launcher/payload/tools/
+          find _launcher -type f | sort
+          for F in nvngx.dll_mgpu_bridge.addon64 mgpu.ini gpu1.ini ReShade2.ini README.txt LICENSE \
+                   reshade-shaders/Shaders/mgpu_depth_tap.fx tools/nrcheck.exe tools/nvngx.dll_nrcheck.dll; do
+            test -f "_launcher/payload/$F" || { echo "::error::payload is missing $F"; exit 1; }
+          done
+          if find _launcher -iname 'nvngx_dlssnr*.dll' | grep -q .; then
+            echo "::error::nvngx_dlssnr.dll must never ship"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mgpu_bridge_launcher
+          path: _launcher/
+          if-no-files-found: error
