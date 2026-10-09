@@ -4,7 +4,7 @@
 
 ### [Download the latest release](https://github.com/maohgad-web/Neural-coprocessor/releases)
 
-Unpack into the folder containing the game's `.exe`. Full install steps and every known limitation are in `README.txt` inside the zip, and summarised below.
+Unpack into the folder containing the game's `.exe`. Full install steps and every known limitation are in `README.txt` inside the zip, and summarised below. The launcher is a separate download in the same release.
 
 Research code with published measurements, not a product. Run games with anti-cheat and online games at your own risk.
 
@@ -14,7 +14,7 @@ Research code with published measurements, not a product. Run games with anti-ch
 
 Not SLI: nothing is split mid-frame. Neural rendering is a *terminal* stage. It takes a finished frame and returns a finished frame, so it can be picked up and executed somewhere else entirely.
 
-**This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a D3D12 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add-on-enabled** ReShade build to load at all. There is no game modification of any kind: the add-on reads each finished frame and does its work elsewhere.
+**This is a ReShade add-on.** It is called **MGPU Bridge**, it is a `.addon64` file that ReShade loads into a DirectX 12 or DirectX 11 game, and every log line it writes is prefixed `[MGPU]` in `ReShade.log`. It is not a driver, not a patch, and not a replacement for anything, and it needs an **add-on-enabled** ReShade build to load at all. There is no game modification of any kind: the add-on reads each finished frame and does its work elsewhere.
 
 ### Which card should run DLSS 5
 
@@ -30,13 +30,19 @@ Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu
 
 * * *
 
-## New in 0.2.4: one display
+## New in 0.3.0
 
-**One monitor, one cable, no third-party tools. Mouse, keyboard and controller all work.** Until 0.2.4 a second monitor was effectively required. It is not any more.
+**DirectX 11 support.** DirectX 11 games now work, and it is on by default (`DX11=1`).
 
-Set `DcompOverlay=1` in `mgpu.ini`. The bridge stops opening a window of its own and draws the neural output onto the game's own window instead, so the game keeps the mouse and the keyboard. The display goes on the neural card, and the card that renders the game has nothing plugged into it.
+**Motion vectors for games without DLSS.** The add-on now finds the game's own motion vectors and depth when the game does not run DLSS. Tested on Resident Evil 4 (2023).
 
-Two monitors, one per card, remains the arrangement every published measurement was taken on. See Display setup for both.
+**Single display is now the default mode.** The add-on launches with `DcompOverlay=1`. One display, connected to the GPU that runs DLSS 5. No display connected to the GPU that renders the game. Use the launcher to verify that the GPU that renders the game is headless.
+
+**Multi display support.** Set `DcompMultiDisplay=1` in `mgpu.ini`.
+
+**Launcher (experimental).** A separate download. It should help you set up the add-on, check your setup, and manage your configurations. Comes in English, Português (Brasil), Español, 中文, 日本語 and 한국어.
+
+See Display setup.
 
 * * *
 
@@ -77,6 +83,8 @@ Also in 0.2.0:
 - **Starfield support behind `SFPath`**, experimental. The game recreates its DLSS feature often and the add-on stopped following it. The detector runs on every title, and where it sees the fault the add-on sets the key itself - `SFPath=0` stops that.
 - **Two log lines that read as faults no longer do.** `TAP = OFF` and the motion vector hand-off count were both stating true things that readers took as failures.
 
+**0.3.0** - DirectX 11 support, motion vectors for games without DLSS, single display as the default mode, multi display support, and the launcher. See New in 0.3.0.
+
 * * *
 
 ## Performance Results
@@ -110,6 +118,17 @@ Also in 0.2.0:
 **Key Finding:** Moving neural post-processing to a second GPU restores 86% of available performance gains from upscaling, compared to 39% when running on the render card.
 
 * * *
+
+## Titles run on 0.3.0
+
+| Title | API |
+| --- | --- |
+| Resident Evil 4 (2023) | DirectX 12 |
+| Rise of the Tomb Raider | DirectX 11 and DirectX 12 |
+| Skyrim Special Edition | DirectX 11 |
+| The Blood of Dawnwalker | DirectX 12 |
+| Cyberpunk 2077 | DirectX 12 |
+| Starfield | DirectX 12 |
 
 ## Titles run on 0.2.0
 
@@ -163,9 +182,9 @@ Behind `SFPath=1`, and tested on one machine only. The game destroys and recreat
 
 - **GeForce RTX 50-series cards** (primary requirement for DLSS Neural Rendering)
 - **GeForce RTX 40-series cards** (confirmed working with modded `nvngx_dlssnr.dll`)
-- **Two GPUs.** Two monitors, one per card, or one monitor with `DcompOverlay=1` and the display on the neural card - see Display setup
+- **Two GPUs.** One display, connected to the GPU that runs DLSS 5, and no display connected to the GPU that renders the game. More than one display: `DcompMultiDisplay=1` - see Display setup
 - **Add-on-enabled ReShade build, 6.8.0 or newer**
-- **DirectX 12 games only** (D3D11 and Vulkan unsupported). Some Unity titles ship a D3D11 default and a working D3D12 path - see Forcing D3D12 on Unity titles
+- **DirectX 12 or DirectX 11 games** (Vulkan unsupported). On some Unity titles DirectX 12 is still better - see Forcing D3D12 on Unity titles
 - **No shader packs required**
 - **No other add-ons** (to avoid multiple NGX consumers)
 
@@ -175,11 +194,11 @@ Behind `SFPath=1`, and tested on one machine only. The game destroys and recreat
 
 MGPU Bridge operates by:
 
-1. Identifying the adapter the game renders on from the swapchain
+1. Identifying the adapter the game renders on from the swapchain (DirectX 12) or the game's device (DirectX 11)
 2. Creating its own D3D12 device on a *different* adapter
 3. Copying each finished frame across a cross-adapter shared heap with a 192-byte seal per ring slot for frame identity and ordering verification
 4. Running DLSS Neural Rendering on the second adapter once or twice per frame
-5. Presenting the result in its own window on the second adapter
+5. Presenting the result on the display connected to the second adapter, drawn onto the game's own window (the default, `DcompOverlay=1`) or in its own window
 
 The game's rendering is never touched; the bridge reads the finished frame and executes work elsewhere.
 
@@ -187,7 +206,7 @@ The game's rendering is never touched; the bridge reads the finished frame and e
 
 ## Installation
 
-**[Get the zip from Releases](https://github.com/maohgad-web/Neural-coprocessor/releases)**, then follow `README.txt` inside it. Critical requirements:
+**[Get the zip from Releases](https://github.com/maohgad-web/Neural-coprocessor/releases)**, then follow `README.txt` inside it. The launcher, a separate download in the same release, has the install guide and an install check for the steps below. Critical requirements:
 
 - ReShade must support add-ons (effects-only build will not load `.addon64` files)
 - File name must contain the literal substring `nvngx.dll`
@@ -199,19 +218,15 @@ The game's rendering is never touched; the bridge reads the finished frame and e
 
 ## Display setup
 
-Both of these work. Pick the one that matches your hardware.
-
-**Two displays, extended, one per card.** The bridge presents the second card's output in its own window on the second screen. Every published figure was measured this way, and it is what I develop on - a window of its own is what lets the bridge's swapchain be isolated from the game's when I am debugging.
-
-**One display, one cable.** Set `DcompOverlay=1` in `mgpu.ini`. The bridge creates no window of its own and draws the neural output onto the game's window instead. The game keeps its input: mouse, keyboard and controller all work. No third-party tools.
-
-The display goes on the neural card, and the card that renders the game has nothing plugged into it.
+**One display, one cable. The default since 0.3.0.** `DcompOverlay=1` is set in `mgpu.ini`. The display is connected to the GPU that runs DLSS 5, and no display is connected to the GPU that renders the game. Use the launcher to verify that the GPU that renders the game is headless. The bridge creates no window of its own and draws the neural output onto the game's window instead. The game keeps its input: mouse, keyboard and controller all work. No third-party tools.
 
 In this mode the neural output is the topmost composition visual on the game's window, so it sits above the game's own ReShade overlay. You do not have to do anything about that: open the overlay with its normal key and the neural output steps aside by itself, then comes back when you close it.
 
 `CTRL+ALT+F6` does that by hand - it unroots the visual and roots it again, and never touches the stream. It is registered only in this mode, and most people will never need it.
 
-The add-on refuses this mode if it finds more than one active display, and says so in the log.
+**More than one display.** Set `DcompMultiDisplay=1` in `mgpu.ini`.
+
+**Two displays, extended, one per card, with the bridge's own window.** Set `DcompOverlay=0`. The bridge presents the second card's output in its own window on the second screen. Every published figure was measured this way, and it is what I develop on - a window of its own is what lets the bridge's swapchain be isolated from the game's when I am debugging.
 
 Two cables from two cards into one monitor was explored and did not reach anything worth shipping. A pull request is welcome if you find an arrangement that does.
 
@@ -250,7 +265,9 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `Calib=2` | How the add-on reads the game's own DLSS calls. `0` turns the whole tap off |
 | `CalibRung=0` | Which install route the calibrator may use. `0` both, `1` the import table alone, `2` the cached-pointer scan alone. Leave at `0` unless a title faults at startup. New in 0.2.2 |
 | `SRPreset=0` | 0 title default, 11 K, 12 L, 13 M |
-| `DcompOverlay=0` | `1` draws the neural output onto the game's own window instead of opening one. Single display only - see Display setup |
+| `DcompOverlay=1` | Draws the neural output onto the game's own window instead of opening one. The default since 0.3.0. `0` opens the bridge's own window - see Display setup |
+| `DcompMultiDisplay` | Absent by default. `1` for more than one display - see Display setup. New in 0.3.0 |
+| `DX11=1` | DirectX 11 support. On by default. New in 0.3.0 |
 | `SFPath` | Absent by default, and absent is not off: the detector runs, the repair does not, and the add-on sets `1` itself if it sees the fault. `0` stops that. New in 0.2.5 |
 | `Frames=0` | Stop after this many frames. `0` runs until you quit. A bounded run is what prints a summary |
 
@@ -262,7 +279,7 @@ Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after
 
 ## Forcing D3D12 on Unity titles
 
-A Unity game that launches in D3D11 does nothing here: the add-on finds no D3D12 render device, stands down, and says so in the ReShade overlay panel. Many Unity titles also ship a D3D12 renderer and simply do not pick it by default. Adding `-force-d3d12` to the launch arguments switches them over.
+Optional since 0.3.0: DirectX 11 games run. On some games DirectX 12 is still better, because the game runs the full NGX suite and the add-on gets the correct motion vectors. Many Unity titles ship a D3D12 renderer and do not pick it by default. Adding `-force-d3d12` to the launch arguments switches them over.
 
 **Steam.** Right-click the game, Properties, General, and put this in Launch Options:
 
@@ -278,20 +295,20 @@ A Unity game that launches in D3D11 does nothing here: the add-on finds no D3D12
 
 **Other launchers** take the same flag wherever they accept command-line arguments.
 
-This only works if the title actually carries a D3D12 renderer - there is nothing to force if it does not. Check `ReShade.log` after launching: if the add-on now finds a D3D12 device it proceeds normally, and if it still stands down, that title is D3D11 only.
+This only works if the title actually carries a D3D12 renderer - there is nothing to force if it does not. Without one, the game runs in DirectX 11, which is supported since 0.3.0.
 
 * * *
 
 ## Limitations
 
-- **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6: 96-98% of frames with DLSS or DLAA, none with TAA.
+- **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6 (0.2.2): 96-98% of frames with DLSS or DLAA, none with TAA. Since 0.3.0 the add-on also finds the game's own motion vectors on games without DLSS, tested on Resident Evil 4 (2023).
 - **DLAA sends more data than DLSS.** It renders at native, so depth and motion vectors cross the link at full resolution.
 - **No resolution/DLSS changes while armed** (requires swapchain rebuild)
 - **Frame generation:** Untested and not recommended
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
-- **D3D12 only:** No D3D11 or Vulkan support. Some Unity titles can be forced to D3D12 - see Forcing D3D12 on Unity titles
-- **Keyboard focus:** Interacting with the bridge window removes focus from the game, so a controller is recommended. On a single display use `DcompOverlay=1` - there is then no bridge window to take focus. See Display setup
+- **No Vulkan support.** DirectX 12 and DirectX 11 only. Some Unity titles can be forced to D3D12, optional since 0.3.0 - see Forcing D3D12 on Unity titles
+- **Keyboard focus:** With `DcompOverlay=0`, interacting with the bridge window removes focus from the game, so a controller is recommended. With the default `DcompOverlay=1` there is no bridge window to take focus. See Display setup
 
 * * *
 
