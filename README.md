@@ -85,7 +85,7 @@ Also in 0.2.0:
 
 **0.3.0** - DirectX 11 support, motion vectors for games without DLSS, single display as the default mode, multi display support, and the launcher. See New in 0.3.0.
 
-**0.3.1** - improves the input vector selector to support more setups and systems.
+**0.3.1** - improves the input vector selector to support more setups and systems. Improves image stability and reduces flicker on those setups.
 
 * * *
 
