@@ -61,6 +61,29 @@ add_library(mgpu_bridge SHARED
     # D1.5a (0.3.0 R&D): the read-only latency probe. OFF unless
     # LatencyProbe=1 in mgpu.ini. Holds no ReShade type and no gpu1_context type.
     src/latency_probe.cpp
+    # D2.0 (0.3.0 R&D): log queue, journal, stall watch, our Reflex for
+    # case-B titles. Each OFF unless its key is set (Journal, StallWatch,
+    # OwnReflex). No ReShade type and no gpu1_context type in any of them.
+    src/log_queue.cpp
+    src/journal.cpp
+    src/stall_watch.cpp
+    src/own_reflex.cpp
+    # D2.0 NR step one: read-only frame-gen vector map, OFF unless NRFrameFilter=1.
+    src/fg_map.cpp
+    # DX11 transport-hop probe (DX11_CONTRACT_LEDGER.md). OFF unless Dx11Probe=1.
+    # Holds no ReShade type and no gpu1_context type; nothing on GPU 1.
+    src/dx11_probe.cpp
+    # DX11 producer (DX11_CONTRACT_LEDGER.md section 7, R227). OFF unless DX11=1
+    # and only ever called from a D3D11 game device; owns a D3D12 device on the
+    # game adapter and feeds the existing stream producer. No ReShade type.
+    src/dx11_producer.cpp
+    # R253: motion-vector census for D3D11 titles (DX11_CONTRACT_LEDGER.md section 13).
+    # Observe-only, OFF unless MVecCensus=1; registers its own ReShade events.
+    src/mvec_census.cpp
+    # R279: TexCensus=1 instrument (remove with the file pair when done)
+    src/tex_census.cpp
+    # R280: the virtual velocity target for D3D12 titles without an NGX contract (MVEC_D3D12_LEDGER.md)
+    src/mvec_extract.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -141,6 +164,15 @@ target_compile_definitions(mgpu_bridge PRIVATE
     _CRT_SECURE_NO_WARNINGS
     UNICODE
     _UNICODE
+    # 2026-10-06, Rise of the Tomb Raider (and a reporter's Shadow of the Tomb
+    # Raider): the game folder ships msvcp140.dll 14.28.29910 and the process
+    # loads that copy, not the system's. Visual Studio 2022 17.10+ made
+    # std::mutex's constructor constexpr; a binary built that way crashes at
+    # its first mutex use (0xC0000005) against an msvcp140 older than 14.40.
+    # The add-on takes a std::mutex in its first device event. This is
+    # Microsoft's documented switch for exactly that case. The alternative, a
+    # static CRT, is the broader answer and a later milestone.
+    _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
 )
 
 # dxgi: factory + EnumAdapters1 (T2). d3d12: the private device (T3).
