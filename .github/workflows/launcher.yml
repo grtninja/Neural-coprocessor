@@ -1,0 +1,77 @@
+name: launcher (experimental)
+
+# Builds the MGPU Bridge Launcher in tools/launcher, and stages it with the
+# nrcheck tools the Test button runs. It does not build or change the add-on;
+# build.yml is untouched. The payload\ folder (the bridge release files) is
+# NOT staged here: the launcher's release zip is assembled by hand from this
+# artifact plus a release build of the add-on.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/launcher/**'
+      - 'tools/nrcheck/**'
+      - '.github/workflows/launcher.yml'
+
+permissions:
+  contents: read
+
+env:
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure the launcher
+        working-directory: tools/launcher
+        run: cmake -B build -A x64
+
+      - name: Build the launcher
+        working-directory: tools/launcher
+        run: cmake --build build --config Release
+
+      # nrcheck, so the Test button has its two files in payload\tools\.
+      - name: Fetch NVIDIA NGX headers at pinned SHA (for nrcheck)
+        working-directory: tools/nrcheck
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+
+      - name: Configure nrcheck
+        working-directory: tools/nrcheck
+        run: cmake -B build -A x64
+
+      - name: Build nrcheck
+        working-directory: tools/nrcheck
+        run: cmake --build build --config Release
+
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir -p _deploy/payload/tools
+          cp "tools/launcher/build/Release/MGPU Bridge Launcher.exe" _deploy/
+          cp tools/nrcheck/build/Release/nrcheck.exe _deploy/payload/tools/
+          cp tools/nrcheck/build/Release/nvngx.dll_nrcheck.dll _deploy/payload/tools/
+          cp tools/nrcheck/Run-NRBench.ps1 _deploy/payload/tools/
+          cat > _deploy/payload/README.txt <<'TXT'
+          Put the bridge release files in this folder (payload\):
+            nvngx.dll_mgpu_bridge.addon64, mgpu.ini, gpu1.ini, ReShade2.ini, README.txt, LICENSE
+          The launcher's COPY FILES button copies them into a game folder.
+          nvngx_dlssnr.dll is not included and is not copied: the launcher's
+          INSTALL page says where to get it (RHI or the RenoDX Discord).
+          tools\ holds the NR check and bench that DIAGNOSE runs.
+          TXT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-experimental
+          path: _deploy/
