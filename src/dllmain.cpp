@@ -64,7 +64,7 @@
 // misidentifying a build. Caught by a control run rather than by a reader,
 // which is the only reason it is not in somebody's issue thread.
 // R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
-#define MGPU_VERSION_STR "0.3.0"
+#define MGPU_VERSION_STR "0.3.1-t1"
 
 
 // ---- P6.4: the overlay panel ----
@@ -3243,13 +3243,23 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // Latched rather than per frame: the evaluate route is absent in menus, and a tap that
     // came back there would copy at the wrong moment and flip the source in and out.
     // A title whose evaluate route never delivers (RE4, no table) taps exactly as before.
-    if (rt_is_game && tap_mode != 0 && (g_r280o_eval_yield || mgpu::calibrator::eval_copies() != 0ull))
+    // R289 (0.3.1): the same ladder with the game's own route as a rung too - on a
+    // D3D12 title with an NGX contract, copies not made by the tap that landed are the
+    // title's own vectors arriving. Latched like R280o. Titles without a contract
+    // (no DLSS, non-NVIDIA game card) keep the tap exactly as in 0.3.0.
+    const int r289_route = (rt_is_game && tap_mode != 0 && !g_r280o_eval_yield) ? mgpu::gpu1::own_route_delivered() : 0;
+    if (rt_is_game && tap_mode != 0 && (g_r280o_eval_yield || r289_route != 0))
     {
         if (!g_r280o_eval_yield)
         {
             g_r280o_eval_yield = true;
-            mgpu::diag::info("[MGPU][R280o] the evaluate route has delivered this title's own vectors: the R277 tap "
-                             "yields to it for the rest of this session (one route at a time, R106b).");
+            if (r289_route == 1)
+                mgpu::diag::info("[MGPU][R280o] the evaluate route has delivered this title's own vectors: the R277 tap "
+                                 "yields to it for the rest of this session (one route at a time, R106b).");
+            else
+                mgpu::diag::info("[MGPU][R289] the game's NGX contract is seen and its own route (not the tap) has delivered "
+                                 "this title's vectors: the R277 tap yields to it for the rest of this session (one route "
+                                 "at a time, R106b).");
         }
         tap_mode = 0;
     }

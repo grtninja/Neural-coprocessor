@@ -54,6 +54,14 @@ namespace
     unsigned g_active_windows = 0;        // R280b: windows in which SOME candidate was written - the give-up clock (not wall frames)
     bool g_last_written = false;          // R280j: the last decision window saw a candidate written
     reshade::api::device *g_api_dev = nullptr;   // ReShade's device, for destroy_resource at shutdown
+    // R280p (0.3.1): a target that leaves the transport (inert, resize) is WITHDRAWN at
+    // once and DESTROYED later. Its last copy into the slot (the R277 tap, on ReShade's
+    // list) can still be on the game's queue in the frame that tears it down, and
+    // release_objects() waits only for our own list. GRAVE_FRAMES rendered frames is
+    // past any frame latency the swap chain allows. Game render thread only.
+    const unsigned long long GRAVE_FRAMES = 8ull;
+    struct grave { reshade::api::resource r; unsigned long long due; };
+    grave g_grave[4] = {};
     std::atomic<unsigned long long> g_staged_frame{~0ull};   // frame whose staging copy was recorded
     std::atomic<unsigned long long> g_copy_taken{0};        // frame of the last copy (R280d: every edge, last wins)
     std::atomic<unsigned> g_edges_frame{0};                  // R280d: copy edges seen this frame
@@ -350,6 +358,27 @@ namespace
         return true;
     }
 
+    void reap(bool all)   // R280p: destroy what is due (all = at shutdown)
+    {
+        const unsigned long long f = g_frame.load(std::memory_order_relaxed);
+        for (grave &g : g_grave)
+            if (g.r.handle != 0 && (all || f >= g.due))
+            {
+                if (g_api_dev != nullptr) g_api_dev->destroy_resource(g.r);
+                g.r = { 0 }; g.due = 0;
+            }
+    }
+    void bury(reshade::api::resource t)   // R280p: withdrawn already by the caller
+    {
+        if (t.handle == 0) return;
+        const unsigned long long due = g_frame.load(std::memory_order_relaxed) + GRAVE_FRAMES;
+        for (grave &g : g_grave) if (g.r.handle == 0) { g.r = t; g.due = due; return; }
+        grave *old = &g_grave[0];   // full: the one that has waited longest goes now
+        for (grave &g : g_grave) if (g.due < old->due) old = &g;
+        if (g_api_dev != nullptr) g_api_dev->destroy_resource(old->r);
+        old->r = t; old->due = due;
+    }
+
     void release_objects()
     {
         if (g_fence != nullptr && g_fence_ev != nullptr && g_fence_v != 0 && g_fence->GetCompletedValue() < g_fence_v)
@@ -362,7 +391,7 @@ namespace
         if (g_fence) { g_fence->Release(); g_fence = nullptr; }
         if (g_fence_ev) { CloseHandle(g_fence_ev); g_fence_ev = nullptr; }
         if (g_staging) { g_staging->Release(); g_staging = nullptr; }
-        g_target = nullptr; g_target_api = { 0 };   // destroyed through ReShade's device by shutdown
+        g_target = nullptr; g_target_api = { 0 };   // the caller destroys it: buried on inert / reset (R280p), at once at shutdown
         g_objects_ok = false;
     }
     // R280g/R280h: everything built at the old size goes; the decision runs again at the
@@ -371,7 +400,7 @@ namespace
     {
         const reshade::api::resource t = g_target_api;
         release_objects();
-        if (t.handle != 0) { mgpu::probe::mvec_withdraw((unsigned long long)t.handle); if (g_api_dev != nullptr) g_api_dev->destroy_resource(t); }
+        if (t.handle != 0) { mgpu::probe::mvec_withdraw((unsigned long long)t.handle); bury(t); }   // R280p
         // R280i: x_active stays TRUE - the title is still on the R280 path; the judge must
         // not fall back to the R278 branch (which writes MVecLearned=99) while we rebuild.
         g_src.store(0); g_src_fmt = 0; g_objects_tried = false; g_objects_ok = false; g_zeroed = false;
@@ -456,6 +485,7 @@ void on_finish_effects(void *reshade_command_list, void *reshade_command_queue)
     reshade::api::command_queue *q = static_cast<reshade::api::command_queue *>(reshade_command_queue);
     if (cl == nullptr || q == nullptr) return;
     const unsigned long long f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    reap(false);   // R280p: targets torn down GRAVE_FRAMES ago
 
     // A contract title: go inert, once, say it.
     if (g_live.load(std::memory_order_relaxed) && (f % 30ull) == 0ull && mgpu::gpu1::game_contract_seen())   // R280k: Init seen OR the game's NGX table
@@ -467,7 +497,7 @@ void on_finish_effects(void *reshade_command_list, void *reshade_command_queue)
         {
             const reshade::api::resource t = g_target_api;
             release_objects();
-            if (t.handle != 0) { mgpu::probe::mvec_withdraw((unsigned long long)t.handle); if (g_api_dev != nullptr) g_api_dev->destroy_resource(t); }
+            if (t.handle != 0) { mgpu::probe::mvec_withdraw((unsigned long long)t.handle); bury(t); }   // R280p
             g_src.store(0); g_src_fmt = 0; g_objects_tried = false;
         }
         if (g_deferring) { g_deferring = false; mgpu::probe::mvec_defer(false); }
@@ -632,6 +662,7 @@ void shutdown()
     const reshade::api::resource t = g_target_api;
     release_objects();   // waits for our last list, then drops our objects
     if (t.handle != 0 && g_api_dev != nullptr) g_api_dev->destroy_resource(t);   // the device is alive during destroy_device
+    reap(true);   // R280p: and anything still waiting in the grave
     g_api_dev = nullptr;
     g_on.store(false);
 }

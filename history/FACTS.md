@@ -1032,6 +1032,10 @@ is the first place to check for a pre-existing cause. Human-owned, like section
   described rather than guessed at, but **that line is context, not a
   correction**: nothing recovers a clean measurement from a contaminated
   sample.
+  **Since 0.3.1 the probe no longer runs at startup.** 0.3.0 (R246) deferred
+  it to the game's first frame; 0.3.1 (R287) holds it until the game's first
+  DLSS evaluate, and on a title without DLSS it does not run. The point above
+  stands for every probe timing read from earlier logs.
   **What is unaffected: every verdict this project has produced.** They are
   byte comparisons between deterministic images on a GPU the game is not
   using, and focus, occlusion and shader compilation cannot change whether

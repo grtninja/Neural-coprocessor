@@ -211,7 +211,9 @@ keys carry no separator: `DLSSNR.ColorSubrectWidth`.
 **`GetCapabilityParameters` returns the core's shared block, not a per-caller
 one.** Two consumers in one process therefore write into each other's
 parameters, and one calling `DestroyParameters` pulls the block out from under
-the other. This is why the one-shot probe chain is opt-in and off by default.
+the other. This is why the add-on keeps its own NGX work out of the game's way:
+since 0.3.1 its first NGX Init waits for the game's first DLSS evaluate, so on
+a game that loads NGX late the game's own feature is created first.
 
 ### The caller gate
 

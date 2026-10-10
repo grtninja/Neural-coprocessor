@@ -8155,6 +8155,7 @@ void capture_poll()
         ext.dxgi_format = nr_srcfmt;
         ext.native_format = true;
         native_ok = ngx_probe(nr_w, nr_h, &ext);
+        note_ngx_probe_ran();   // R290
         free(nr_raw);
     }
 
@@ -8176,6 +8177,7 @@ void capture_poll()
         ext.row_pitch = nr_pitch;
         ext.dxgi_format = nr_srcfmt;
         (void)ngx_probe(nr_w, nr_h, &ext);
+        note_ngx_probe_ran();   // R290
     }
     if (nr_in != nullptr) free(nr_in);
 }
@@ -9502,6 +9504,7 @@ namespace
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         std::atomic<unsigned long long> mvec_copies_tap{0};   // R280o: the subset of mvec_copies made by the R277 tap
+        std::atomic<unsigned long long> mvec_copies_own{0};   // R289: the subset NOT made by the tap (the game's own routes)
         // R118. One-shot: the fallback arms once per armed stream and never
         // disarms itself. A route that was dead for 300 frames and then
         // flickers is not a reason to start toggling the copy trigger
@@ -9744,6 +9747,14 @@ namespace
         float mvec_dx = 0.0f, mvec_dy = 0.0f;
         float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;
         bool  mvec_dirty = true;
+        // R290 (0.3.1): the depth hold's bound (DepthHoldMax), read at stream_request.
+        unsigned long long depth_hold_max_ms = 180000ull;   // 0 = no bound (the 0.2.4 / 0.3.0 hold)
+        unsigned long long depth_hold_first = 0;            // first held frame (the report line only)
+        unsigned long long depth_hold_t0 = 0;               // first held frame WITH the evidence (the clock)
+        unsigned long long depth_fb_t0 = 0;                 // the probe request (the 10 s grace)
+        bool  depth_hold_saw_depth = false;                 // depth arrived once: this arm never falls back
+        bool  depth_hold_wait_said = false;                 // the "stays held" line, once per arm
+        bool  depth_fell_back = false;                      // this arm runs without depth
         bool  mvec_in_read = false;
         unsigned long long mvec_fills = 0;
 
@@ -10600,6 +10611,26 @@ namespace
         if (k == nullptr) return 1;          // reversed-Z is the default here
         const int v = atoi(k);
         return (v == 0) ? 0 : 1;
+    }
+
+    // R290 (0.3.1). DepthHoldMax = seconds the arm waits for the game's depth
+    // before it may arm without depth (only on evidence - see the hold). Absent
+    // or empty = 180. 0 (or negative) = no bound, the 0.2.4 / 0.3.0 hold.
+    // Clamped to 10..3600.
+    unsigned long long ini_read_depth_hold_max_ms()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 180000ull;
+        const char *k = ini_find(buf, "DepthHoldMax");
+        if (k == nullptr) return 180000ull;
+        while (*k == ' ' || *k == '\t') ++k;   // "DepthHoldMax= 0"
+        if (*k == '-') return 0ull;
+        if (*k < '0' || *k > '9') return 180000ull;   // "DepthHoldMax=" with no value
+        long v = atol(k);
+        if (v <= 0) return 0ull;
+        if (v < 10) v = 10;
+        if (v > 3600) v = 3600;
+        return (unsigned long long)v * 1000ull;
     }
 
     // R234. MVecHold = frames the arm holds for the game's vectors on a path
@@ -15543,30 +15574,67 @@ void note_game_d3d12()   // R282: dllmain, on the LUID-proved D3D12 game chain
 {
     g_game_d3d12.store(true, std::memory_order_release);
 }
-bool ngx_probe_scene_hold_decide(char *why, size_t n)   // R282: once, bridge thread
+// R287 (0.3.1). OUR FIRST NGX INIT NEVER COMES BEFORE THE GAME'S. Jay, Lunar
+// Eclipse (0.3.0 vs 0.2.4): the core was not loaded yet when the deferred probe
+// ran (0.45 s), R240 loaded it, our Init came first, and the game's DLSS was
+// never seen (creates=0); the no-contract vector paths took the picture. Jay then
+// ran 0.3.0 with NgxProbeAfterScene=1 on every title he had reported: no flicker
+// (2026-10-09). So the scene hold is the default on every title, whatever the
+// machine's timing: the probe waits for the game's first DLSS evaluate, and on a
+// title without DLSS it never runs (its result is ignored - R246); the first NGX
+// Init is then the arm's. NgxProbeAfterScene=0 restores the 0.3.0 order (R246
+// deferral, no hold); =1 is the hold, as absent.
+bool ngx_probe_scene_hold_decide(char *why, size_t n)   // R282/R287: once, bridge thread
 {
-    if (ini_has_key("NgxProbeAfterScene"))
+    const bool keyed = ini_has_key("NgxProbeAfterScene");
+    if (keyed && !ini_read_flag("NgxProbeAfterScene"))
     {
-        const bool on = ini_read_flag("NgxProbeAfterScene");
-        snprintf(why, n, on ? "[MGPU][R282] scene hold APPLIED (NgxProbeAfterScene=1): our first NGX Init waits for "
-                              "the game's first DLSS evaluate, no time limit."
-                            : "[MGPU][R282] scene hold OFF (NgxProbeAfterScene is not 1): the probe runs as before.");
-        return on;
+        snprintf(why, n, "[MGPU][R282] scene hold OFF (NgxProbeAfterScene is not 1): the probe runs as in 0.3.0.");
+        return false;
     }
     const bool d3d12 = g_game_d3d12.load(std::memory_order_acquire);
     const bool core  = GetModuleHandleW(L"_nvngx.dll") != nullptr;
     const bool sl    = mgpu::slprobe::interposer_resident();
-    const bool hold  = d3d12 && core && !sl;
-    snprintf(why, n, "[MGPU][R282] scene hold %s (auto): game chain D3D12=%s, NGX core already resident (the "
-                     "game's)=%s, Streamline=%s%s",
-             hold ? "APPLIED" : "not applied", d3d12 ? "yes" : "no", core ? "yes" : "no", sl ? "yes" : "no",
-             hold ? " - our first NGX Init waits for the game's first DLSS evaluate, no time limit."
-                  : " - the probe runs as before.");
-    return hold;
+    snprintf(why, n, "[MGPU][R287] scene hold APPLIED (%s): our first NGX Init waits for the game's first DLSS evaluate; "
+                     "on a title without DLSS the probe never runs and the first NGX Init is the arm's. Game chain "
+                     "D3D12=%s, NGX core loaded=%s, Streamline=%s.",
+             keyed ? "NgxProbeAfterScene=1" : "default since 0.3.1",
+             d3d12 ? "yes" : "no", core ? "yes" : "no", sl ? "yes" : "no");
+    return true;
 }
 bool ngx_probe_scene_seen()   // R282
 {
     return mgpu::calibrator::scene_captures() != 0ull;
+}
+
+// R290 (0.3.1): the depth hold's fallback releases the probe; the worker reports
+// that the probe ran, so the fallback arm follows it.
+std::atomic<bool> g_depth_fallback{false};
+std::atomic<bool> g_ngx_probe_ran{false};
+void depth_fallback_request()   { g_depth_fallback.store(true, std::memory_order_release); }
+bool depth_fallback_requested() { return g_depth_fallback.load(std::memory_order_acquire); }
+void note_ngx_probe_ran()       { g_ngx_probe_ran.store(true, std::memory_order_release); }
+bool ngx_probe_ran()            { return g_ngx_probe_ran.load(std::memory_order_acquire); }
+
+// R289 (0.3.1). R280o's ladder, with the barrier route as a rung too. R280o lets
+// the first-launch tap and learning stand aside once the EVALUATE route has
+// delivered (Starfield). A title whose own vectors come by the BARRIER route
+// (Lunar Eclipse in 0.2.4: 5,077 barrier copies, no evaluate copies) never
+// reached that rung, so a learning decided before the game's DLSS showed kept
+// running there. Evidence, not a flag (R280n was withdrawn for being a flag):
+// copies of the game's own vectors that landed - counted at the copy point
+// beside R280o's tap counter, for every copy NOT made by the tap - on a D3D12
+// title with an NGX contract (R280k). Titles without one (no DLSS, the game on a
+// non-NVIDIA card) keep the 0.3.0 path exactly.
+unsigned long long own_route_copies()
+{
+    return str().mvec_copies_own.load(std::memory_order_relaxed);
+}
+int own_route_delivered()   // 0 none, 1 the evaluate route (R280o), 2 the game's own route on a contract title (R289)
+{
+    if (mgpu::calibrator::eval_copies() != 0ull) return 1;
+    if (g_game_d3d12.load(std::memory_order_acquire) && own_route_copies() != 0ull && game_contract_seen()) return 2;
+    return 0;
 }
 
 unsigned autoarm_frames()
@@ -16863,6 +16931,9 @@ void stream_request()
     // paying for.
     s.depth_mode = ini_read_depth_mode();
     s.depth_inverted = ini_read_depth_inverted();
+    s.depth_hold_max_ms = ini_read_depth_hold_max_ms();   // R290
+    s.depth_hold_first = 0; s.depth_hold_t0 = 0; s.depth_fb_t0 = 0;
+    s.depth_hold_saw_depth = false; s.depth_hold_wait_said = false; s.depth_fell_back = false;
     s.mvec_mode = ini_read_mvec_mode();
     // R234. R227's degrade no longer happens here: a title can create its DLSS
     // feature after the arm request (Rise: AutoArm at 36.8 s, CreateFeature at
@@ -18054,6 +18125,61 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // This is the only path in this function that returns without
         // consuming the attempt, and it is why the check sits here rather
         // than after it.
+        // R290 (0.3.1): THE DEPTH HOLD HAS A BOUND, AND ACTS ONLY ON EVIDENCE.
+        // The clock runs only while the game's DLSS is evaluating (the
+        // calibrator's captures, both APIs) and the depth tap is on (tap_state
+        // 1 - a broken tap keeps the E203/E204 screen, R142/R143); menu time
+        // before that does not count. An arm that has seen depth once never
+        // falls back (depth leaves in menus and scene changes - the 0.3.0
+        // hold). Past DepthHoldMax with the evidence: the startup probe is
+        // released first (R287), then this arm goes on WITHOUT depth once the
+        // probe ran, or 10 s after the request. Without the evidence nothing
+        // is started, as in 0.2.4 / 0.3.0, and one line asks for the log.
+        if (depth_handle != 0) s.depth_hold_saw_depth = true;
+        if (s.depth_mode != 0 && depth_handle == 0 && s.depth_hold_max_ms != 0ull && !s.depth_hold_saw_depth)
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (s.depth_hold_first == 0) s.depth_hold_first = now;
+            const bool dlss_eval = mgpu::calibrator::scene_captures() != 0ull;
+            const bool tap_on    = g_tap_state_game.load(std::memory_order_relaxed) == 1;
+            if (dlss_eval && tap_on)
+            {
+                if (s.depth_hold_t0 == 0) s.depth_hold_t0 = now;
+                const unsigned long long held = now - s.depth_hold_t0;
+                if (held >= s.depth_hold_max_ms)
+                {
+                    if (s.depth_fb_t0 == 0)
+                    {
+                        s.depth_fb_t0 = now;
+                        depth_fallback_request();
+                        char hl[420];
+                        snprintf(hl, sizeof hl,
+                                 "[MGPU][R290] NO DEPTH in %llu s while the game's DLSS runs and the depth tap is on "
+                                 "(DepthHoldMax=%llu): the startup probe goes first, then this session arms WITHOUT depth. "
+                                 "DepthHoldMax=0 keeps the wait without a bound.",
+                                 held / 1000ull, s.depth_hold_max_ms / 1000ull);
+                        mgpu::diag::warn(hl);
+                    }
+                    if (ngx_probe_ran() || now - s.depth_fb_t0 >= 10000ull)
+                    {
+                        s.depth_mode = 0; s.depth_fell_back = true;
+                        mgpu::diag::warn("[MGPU][R290] arming now WITHOUT depth for this session (Depth=0 for this arm only).");
+                    }
+                }
+            }
+            else if (!s.depth_hold_wait_said && now - s.depth_hold_first >= s.depth_hold_max_ms)
+            {
+                s.depth_hold_wait_said = true;
+                char hl[420];
+                snprintf(hl, sizeof hl,
+                         "[MGPU][R290] NO DEPTH in %llu s and %s: the bridge stays held, as before 0.3.1 - nothing is "
+                         "started on this launch. Please send this ReShade.log.",
+                         (now - s.depth_hold_first) / 1000ull,
+                         !tap_on ? "the depth tap is not on (see the [R53] TAP line and the status screen)"
+                                 : "the game's DLSS is not evaluating");
+                mgpu::diag::warn(hl);
+            }
+        }
         if (s.depth_mode != 0 && depth_handle == 0)
         {
             ++s.depth_arm_waits;
@@ -18594,7 +18720,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                  (unsigned long long)s.slot_bytes, stream_state::RING,
                  (unsigned long long)heap_bytes,
                  s.depth_mode,
-                 (s.depth_mode == 0) ? "OFF - control arm, byte-identical to every published run"
+                 (s.depth_mode == 0) ? (s.depth_fell_back ? "OFF - R290: no depth within DepthHoldMax, this session runs without depth"
+                                                          : "OFF - control arm, byte-identical to every published run")
                                      : ((s.depth_mode == 1) ? "TRANSPORTED AND BOUND"
                                                             : "ON THE BUS, NOT BOUND - the "
                                                               "transport-cost arm"),
@@ -19284,6 +19411,7 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     {
         ++s.mvec_copies;
         if (t_tap_copy_scope) ++s.mvec_copies_tap;   // R280o: same point, same condition, so tap <= copies
+        else ++s.mvec_copies_own;                     // R289: counted directly - no subtraction, no fake delivery
     }
     s.mvec_slot_valid[slot].store(1u, std::memory_order_release);
     // D2.0 NR step one: record that this slot got its copy. Off: one load.
@@ -21307,13 +21435,21 @@ void stream_poll()
                     // worse-count, no live switch, no verdict, nothing written. R258's probe lines
                     // continue as information. Evidence, not a flag: a title whose evaluate route
                     // never delivers (no NGX table: RE4, Skyrim) learns exactly as before.
-                    if (s.learn_on && mgpu::calibrator::eval_copies() != 0ull)
+                    // R289 (0.3.1): the same ladder with the barrier route as a rung too
+                    // (own_route_delivered). R280o's evaluate-route case is unchanged.
+                    const int r289_route = s.learn_on ? own_route_delivered() : 0;
+                    if (r289_route != 0)
                     {
                         s.learn_on = false; s.learn_write = false;
                         g_mv_cand_req.store(-1, std::memory_order_relaxed);
-                        mgpu::diag::warn("[MGPU][R280o] the evaluate route is delivering this title's own vectors (R118): "
+                        if (r289_route == 1)
+                            mgpu::diag::warn("[MGPU][R280o] the evaluate route is delivering this title's own vectors (R118): "
                                          "the first-launch learning stops here - nothing switched, nothing written. "
                                          "R258 lines continue as information.");
+                        else
+                            mgpu::diag::warn("[MGPU][R289] the game's NGX contract is seen and its own route (not the tap) is "
+                                             "delivering this title's vectors: the first-launch learning stops here - nothing "
+                                             "switched, nothing written. R258 lines continue as information.");
                     }
                     unsigned char *c0 = nullptr, *c1 = nullptr, *mv = nullptr;
                     D3D12_RANGE rc{ 0, (SIZE_T)s.payload_bytes }, rm{ 0, (SIZE_T)s.mvec_bytes2 }, none{ 0, 0 };
