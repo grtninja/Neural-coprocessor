@@ -9,9 +9,14 @@
 #   python latcmp.py RUN.csv                    one run: every swap chain in it
 #   python latcmp.py BASE.csv TEST.csv          a pair: TEST against BASE
 #   options: --bridge-a 0x...  --bridge-b 0x...   the bridge's swap chain in each
-#                run (ReShade.log, "[SL4] OBJECT CHECK: bridge swapchain"): the
-#                pair is then judged per role - the game's chain against the
-#                game's, the bridge's (what is on screen) against the bridge's.
+#                run, as the CSV's SwapChainAddress shows it: the pair is then
+#                judged per role - the game's chain against the game's, the
+#                bridge's (what is on screen) against the bridge's.
+#                Finding it: the game's chain is the one ReShade.log names in
+#                "[LAT] game chain" (LatencyProbe=1); the bridge's is the other
+#                one, with SyncInterval=1. Do not use the "[SL4] OBJECT CHECK:
+#                bridge swapchain" address: it is the pointer the add-on got
+#                back, and with DcompOverlay=1 it is not in the CSV (R298).
 #                Without them, chains are paired by present count, with a warning.
 #            --seed N        bootstrap seed (default 1)
 #
@@ -228,7 +233,7 @@ def main():
     ra, rb = roles(ch_a, br['a']), roles(ch_b, br['b'])
     if br['a'] is None and not ('slow-completion chain' in ra and 'slow-completion chain' in rb) and (len(ch_a) > 1 or len(ch_b) > 1):
         print("\n  WARNING: more than one swap chain and no --bridge-a/--bridge-b: chains are paired by present "
-              "count, which can pair the game's chain with the bridge's. Give the [SL4] addresses.")
+              "count, which can pair the game's chain with the bridge's. Give the bridge chain addresses (see the header).")
     for role in ra:
         if role not in rb: continue
         print(f"\n== [{role}] TEST {args[1]} {rb[role]} against BASE {args[0]} {ra[role]}")

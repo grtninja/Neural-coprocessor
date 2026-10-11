@@ -119,7 +119,11 @@ void feed_input(reshade::api::effect_runtime *runtime)
 
         void *host = g_host.load(std::memory_order_relaxed);
         if (host == nullptr) host = g_windowless.load(std::memory_order_relaxed);
-        if ((void *)runtime != host) { why = "not the host runtime"; break; }
+        // R298: the game runtime calls in every frame while the panel is open.
+        // Its reason never changes, but it shared last_why with the host, so
+        // the two alternated and every call logged a CHANGED line (86% of an
+        // FC6 log). It returns here without logging; nothing else differs.
+        if ((void *)runtime != host) return;
 
         // R293: the host is drawing the panel now.
         g_host_drawn_ms.store(GetTickCount64(), std::memory_order_relaxed);
