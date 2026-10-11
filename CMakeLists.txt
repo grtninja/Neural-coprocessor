@@ -84,6 +84,9 @@ add_library(mgpu_bridge SHARED
     src/tex_census.cpp
     # R280: the virtual velocity target for D3D12 titles without an NGX contract (MVEC_D3D12_LEDGER.md)
     src/mvec_extract.cpp
+    # PanelOverPicture (N01950): the live panel over the neural frame. OFF unless
+    # PanelOverPicture=1; registers its own ReShade event only then.
+    src/live_panel.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE

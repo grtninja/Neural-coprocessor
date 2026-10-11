@@ -95,6 +95,19 @@ namespace mgpu::gpu1
     bool dcomp_explicit_off_single_display();
     bool dcomp_peek_toggle();
 
+    // PanelOverPicture (N01950, R292). Off unless PanelOverPicture=1; the key
+    // is read once at add-on load in dllmain. These two accessors are all this
+    // file contributes: whether the visual is on screen, and the game's window.
+    // [OURS] Is the composed visual on screen right now? False before the
+    // first neural frame, and false while CTRL+ALT+F6 is peeking. dllmain
+    // reads it to decide whether the live panel has anywhere to be seen: with
+    // the visual unrooted, the GPU 1 runtime's overlay is composited into a
+    // swapchain nobody is looking at, so the author's path is the right one.
+    bool dcomp_visual_rooted();
+    // The GAME's HWND the visual is rooted on, for the live panel's input
+    // mapping. NULL until set_game_hwnd has run.
+    void *dcomp_game_hwnd();
+
     void stream_shutdown();
 
     void shutdown();

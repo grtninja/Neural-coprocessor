@@ -1,0 +1,30 @@
+; mgpu.ini keys used for the measurements in Cost-Scaler-Mount-Guide.md.
+; The file lives beside the add-on, and the bridge reads these at arm, so the
+; game has to be closed when they are changed.
+;
+; DcompOverlay=1 is the arrangement the numbers were taken in: the neural stage
+; runs on the card that drives the display and its result goes straight out.
+
+DcompOverlay=1
+Depth=1
+MVec=3
+MvecFromEval=2
+CopyQueue=2
+SRUpscale=0
+SRScale=0
+Passes=1
+Tuning=0
+AutoArm=1
+Frames=0
+
+; PanelOverPicture=1 belongs to the overlay patch and does not exist upstream:
+; with it, an open panel is drawn by the GPU 1 runtime on top of the live neural
+; frame instead of the composed visual being withdrawn. Omit it on an unpatched
+; build.
+;PanelOverPicture=1
+
+; The proxy's own keys are NOT here. They live in nvngx_dlssnr.ini, and the
+; lookup order is: the executable's directory first (only if a file exists
+; there), otherwise the copy beside the proxy, otherwise built-in defaults.
+; The key that matters for cost is ResolutionScale (1.00 = pass through,
+; 0.75 default, 0.65 and below is where the measurements above were taken).

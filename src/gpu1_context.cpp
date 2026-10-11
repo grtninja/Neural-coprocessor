@@ -461,7 +461,9 @@ static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
 static void *g_dcomp_d3d11  = nullptr;
 // V53: whether the visual is currently the target's root. Starts FALSE - the
 // tree is built at chain creation but deliberately left unrooted.
-static bool  g_dcomp_rooted = false;
+// [OURS] atomic: written on the bridge thread, read from the game's overlay
+// callback by dcomp_visual_rooted().
+static std::atomic<bool> g_dcomp_rooted{false};
 
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
@@ -581,6 +583,25 @@ bool dcomp_peek_toggle()
     if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
         return true;   // not composing: nothing is covering the overlay anyway
     return dcomp_set_rooted(!g_dcomp_rooted, "peek");
+}
+
+// PanelOverPicture (N01950): the key is read once, at add-on load, in dllmain
+// (R292) - the one place its event can be registered. Only the two read-only
+// accessors below live here, because they read this file's statics.
+// [OURS] Is the visual on screen? Read from the overlay callback, which runs on
+// the GAME's thread, while this is written on the bridge thread - so it is an
+// atomic rather than the plain bool it used to be. Every use of it is a
+// boolean test, which is why the type change costs nothing.
+bool dcomp_visual_rooted()
+{
+    return g_dcomp_rooted.load(std::memory_order_relaxed);
+}
+
+// [OURS] The window the visual is rooted on. Read by dllmain's live-panel input
+// mapping; NULL before the game's swapchain has been identified.
+void *dcomp_game_hwnd()
+{
+    return (void *)g_game_hwnd;
 }
 
 
@@ -12801,6 +12822,18 @@ namespace
         if (p_init == nullptr || p_caps == nullptr || p_iext == nullptr || p_pop == nullptr ||
             p_cre == nullptr || s.nr_eval == nullptr)
         {
+            // R291 (from the N01950 contribution, credited in CONTRIBUTORS.md).
+            // The resolvers above already wrote which module answered each name
+            // into w[] and w_iext41; until now the failure line printed none of
+            // it. Failure path only - a run that resolves never reaches this.
+            char r291[760];
+            snprintf(r291, sizeof r291,
+                     "[MGPU][R291] P4.1 resolve detail - Init[%s] Caps[%s] Init_Ext[%s] "
+                     "PopulateParameters[%s] CreateFeature[%s] EvaluateFeature[%s] | "
+                     "Release[%s] Shutdown[%s] DestroyParameters[%s] | Init_Ext(core)[%s]. "
+                     "An entry reading used:missing or no is the one that failed.",
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w_iext41);
+            mgpu::diag::error(r291);
             mgpu::diag::error("[MGPU][P4.1] an NGX entry point did not resolve - transport-only");
             return false;
         }

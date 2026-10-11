@@ -153,6 +153,16 @@ input reaching the game while the bridge window is on top.
 It is deliberately **not** in `assets/`. Anything in `assets/` reads as part of
 the release, and this is configuration for someone else's project.
 
+`workarounds/cost-scaler-as-nr-snippet/` \- running a third\-party DLSS\-NR proxy
+at `mgpu\nvngx_dlssnr.dll`, so the NR model runs at a reduced internal
+resolution while the frame that reaches the screen stays at the game's own
+resolution.
+
+| File                         |                                                                                      |
+| ---------------------------- | ------------------------------------------------------------------------------------ |
+| `README.md`                  | what the folder is and what it is not. GitHub renders it on the folder page          |
+| `Cost-Scaler-Mount-Guide.md` | the instructions, the snippet entry point 0.3.1 requires, and what was measured here |
+| `MGPU-Keys.txt`              | the `mgpu.ini` keys used for those measurements                                      |
 * * *
 
 ## Checks before tagging

@@ -155,6 +155,7 @@ I cannot test every game, so any report helps. The first two came from [@Zonnery
 | Battlefield 6 (SP executable) | 3840x2160 | [#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14) | Runs clean on 0.2.2 |
 | 007 First Light | 3840x2160 | [#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16) | Runs clean on 0.2.3 |
 | RoboCop Rogue City - Unfinished Business | 2560x1440 | [#29](https://github.com/maohgad-web/Neural-coprocessor/issues/29) | Runs clean on 0.2.5 |
+| Cyberpunk 2077, Kingdom Come: Deliverance II, Hogwarts Legacy | 3840x2160 | [#52](https://github.com/maohgad-web/Neural-coprocessor/issues/52) | Confirmed not working on one setup since 0.3.0 (below) |
 
 **Battlefield 6** SP Campaign ([#14](https://github.com/maohgad-web/Neural-coprocessor/issues/14)). On 0.2.0 and 0.2.1 this title crashed inside its own `sl.common.dll` on some machines every launch, and never delivered a motion vector frame on any of them. **Both are fixed in 0.2.2**, verified on the machine that crashed every time. Anti-cheat: online games are at your own risk.
 
@@ -173,6 +174,20 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 **007 First Light** ([#16](https://github.com/maohgad-web/Neural-coprocessor/issues/16)), 3840x2160, path tracing with Ray Reconstruction - game on an RTX 5090, neural stage on an RTX 5070 Ti. On 0.2.2 it armed and then stopped, because the game's ReShade runtime was never compiling the depth tap. Fixed in 0.2.3.
 
 **RoboCop Rogue City - Unfinished Business** ([#29](https://github.com/maohgad-web/Neural-coprocessor/issues/29)), 2560x1440, on an RTX 3080 Ti with an RTX 5060 Ti. Reported as depth and motion vectors going silent after a reboot, on a machine where display ownership kept moving between the two cards. It did not reproduce on 0.2.5, in either a single- or a dual-display arrangement, and that build is what settled which card was doing what.
+
+**Post 0.3.0 Regression: There is one confirmed setup where the add-on does not work since 0.3.0** ([#52](https://github.com/maohgad-web/Neural-coprocessor/issues/52)). On this setup the add-on has not worked on any title the reporter tried with 0.3.0 or 0.3.1. Versions before 0.3.0 worked on it, with the bridge in its own window, which was the default before 0.3.0. You can turn that window back on in 0.3.0 and 0.3.1 by writing `DcompOverlay=0` in `mgpu.ini`. In Cyberpunk 2077 the picture freezes about 2 seconds after the stream starts, while the game's audio continues. Kingdom Come: Deliverance II behaves the same, and Hogwarts Legacy crashes before its window opens. In Cyberpunk 2077 it froze with either card running the game, with depth on and off, with the add-on's reading of the game's DLSS off, at 1920x1080 and at 3840x2160, and with a 60 fps cap.
+
+| | Reporter's setup | My comparison run |
+| --- | --- | --- |
+| Motherboard and lanes | Maxsun MS-iCraft B850 AIGA, PCIe 5.0 x8/x8 to the CPU | x8/x8 to the CPU |
+| Cards | RTX 5080 and RTX 5070 | 2x RTX 5060 Ti 16 GB |
+| Driver | 617.42 | 617.42 |
+| Cyberpunk 2077 DLSS settings | NVIDIA app override | The same override |
+| Display mode | `DcompOverlay=1` (the default since 0.3.0), borderless | `DcompOverlay=1`, borderless |
+| Resolution | 1920x1080 and 3840x2160 | 2560x1440 |
+| Result | Freezes about 2 seconds after the stream starts | Ran to the end, no freeze |
+
+The 617.42 result on my side is one run on one rig. It does not show that this driver works on every setup. If your setup matches the reporter's, An earlier version than 0.3.0 or DcompOverlay=0 may fix the freeze issue.. If you see the same freeze on a different setup, please report it with your driver version.
 
 ### Starfield, experimental
 

@@ -2,6 +2,28 @@
 
 Code contributed by people other than the primary author, and what it covers.
 
+## [NO1950](https://github.com/NO1950)
+
+Two changes to the add-on, from a two-GPU machine where the composition mode
+and the overlay could not be used at the same time:
+
+- **The overlay relationship.** The overlay request is refused on the game's
+  runtime and opened on the GPU 1 runtime instead, whose swapchain is the
+  composition swapchain - the neural picture - so the panel is drawn over the
+  live neural frame rather than in place of it. The host runtime is identified
+  by having no window and is recorded when the panel opens; input is fed from
+  `reshade_overlay` (the only per-frame callback that is not behind a tab
+  selection) out of the game runtime's own `ImGuiIO.MousePos`, and the game's
+  input is blocked while the panel is up. Opt-in via `PanelOverPicture`.
+  Verified on Far Cry 6 and Kingdom Come: Deliverance II, in opposite
+  arrangements of the two cards.
+
+- **The P4.1 strict lookup against a proxy-style snippet.** `[P4.1]` resolves
+  `NVSDK_NGX_D3D12_PopulateParameters_Impl` strictly from the private snippet,
+  which cannot answer while that snippet's surface is made of linker
+  forwarders to a module it loads later. The forwarder target is now loaded
+  before the strict resolve, and the failure line names the entry point.
+
 ## [grtninja](https://github.com/grtninja)
 
 Two fixes to the add-on's own code, reviewed and merged from external pull
