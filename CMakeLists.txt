@@ -121,11 +121,20 @@ set(MGPU_IMGUI_SHA "3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c")
 set(MGPU_IMGUI_DIR "${CMAKE_BINARY_DIR}/ext/imgui")
 foreach(_h imgui.h imconfig.h)
     if(NOT EXISTS "${MGPU_IMGUI_DIR}/${_h}")
-        file(DOWNLOAD
-             "https://raw.githubusercontent.com/ocornut/imgui/${MGPU_IMGUI_SHA}/${_h}"
-             "${MGPU_IMGUI_DIR}/${_h}"
-             STATUS _mgpu_dl TLS_VERIFY ON)
-        list(GET _mgpu_dl 0 _mgpu_code)
+        # R299c: three attempts (N01950 lost the panel to one failed fetch). Still green
+        # on failure by design; CI fails the job instead (build.yml, Configure step).
+        foreach(_try 1 2 3)
+            file(DOWNLOAD
+                 "https://raw.githubusercontent.com/ocornut/imgui/${MGPU_IMGUI_SHA}/${_h}"
+                 "${MGPU_IMGUI_DIR}/${_h}"
+                 STATUS _mgpu_dl TLS_VERIFY ON)
+            list(GET _mgpu_dl 0 _mgpu_code)
+            if(_mgpu_code EQUAL 0)
+                break()
+            endif()
+            message(STATUS "MGPU: ${_h} fetch attempt ${_try}/3 failed")
+            execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 2)
+        endforeach()
         if(NOT _mgpu_code EQUAL 0)
             list(GET _mgpu_dl 1 _mgpu_msg)
             message(WARNING "MGPU: could not fetch ${_h} (${_mgpu_msg}) - building without the overlay panel.")

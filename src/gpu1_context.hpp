@@ -472,6 +472,25 @@ struct ui_state
     double fps_produced = 0.0;   // the GAME's frame rate, from the seal counter
     double fps_consumed = 0.0;   // what GPU 1 is actually finishing
 
+    // ---- [OURS] NRS: the scale knob and the DISPLAYED frame rate (2026-10-12) ----
+    //
+    // fps_consumed counts what GPU 1 FINISHED. That is NOT what reached the panel, and
+    // the operator measured it reading HIGH on this rig - the consumer can finish frames
+    // that are superseded before they are ever shown. present_* below is the bridge's own
+    // present cadence, sampled where a frame is handed to the compositor, and it is
+    // reported as percentiles: an average hides exactly the stalls an eye notices.
+    bool   nrs_on = false, nrs_live = false, present_peek = false;
+    float  nrs_scale = 1.0f, nrs_stage = -1.0f;          // nrs_stage < 0 = nothing staged
+    float  nrs_cap = 1.0f;                                // ini NRScaleCap: the slider's top
+    unsigned nrs_work_w = 0, nrs_work_h = 0, nrs_native_w = 0, nrs_native_h = 0;
+    float  nrs_gain = 1.0f, nrs_sharpness = 0.0f, nrs_color = 1.0f;
+    unsigned nrs_mode = 1;
+    double nrs_probe_d = -1.0;                            // last mean|composite-native|
+    unsigned long long nrs_rebuilds = 0;
+    double since_rebuild_ms = -1.0;
+    unsigned present_n = 0;
+    double present_fps = 0.0, present_p50_ms = 0.0, present_p99_ms = 0.0, present_low1_ms = 0.0;
+
     // GPU 1's own timestamps on GPU 1's own queue. gpu1_eval_ms SPANS EVERY
     // PASS and, when SR is up, it also contains the reduce and the upscale -
     // it is not the neural cost on its own.
@@ -556,6 +575,16 @@ struct ui_state
 };
 void ui_read(ui_state &out);
 
+// [OURS] NRS (2026-10-12). The panel and the hotkeys drive the neural scale through these.
+// ui_nrs_stage only RECORDS a value under the stream lock - the consumer thread applies it
+// on the next evaluate, which is also where the rebuild happens. That is the same rule the
+// Super Resolution staging follows, and for the same reason: a UI thread must never release
+// an NGX feature the GPU may still be executing against (that froze the stream once).
+void ui_nrs_stage(float scale);
+// which: 0 = gain (TransferStrength), 1 = sharpness (RCAS), 2 = colour strength, 3 = mode.
+// These are read by the very next dispatch, so they need no rebuild; they are written back
+// to the ini so a panel change survives the next launch.
+void ui_nrs_set(int which, float v);
 // Pass count, live. Every NGX feature handle is created at arm time, so this is
 // only a count change - nothing is created or destroyed, and it takes effect on
 // the next consumed frame. Clamped to 1..max_passes.

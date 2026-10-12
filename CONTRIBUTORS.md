@@ -4,7 +4,7 @@ Code contributed by people other than the primary author, and what it covers.
 
 ## [NO1950](https://github.com/NO1950)
 
-Two changes to the add-on, from a two-GPU machine where the composition mode
+Three changes to the add-on, from a two-GPU machine where the composition mode
 and the overlay could not be used at the same time:
 
 - **The overlay relationship.** The overlay request is refused on the game's
@@ -21,8 +21,14 @@ and the overlay could not be used at the same time:
 - **The P4.1 strict lookup against a proxy-style snippet.** `[P4.1]` resolves
   `NVSDK_NGX_D3D12_PopulateParameters_Impl` strictly from the private snippet,
   which cannot answer while that snippet's surface is made of linker
-  forwarders to a module it loads later. The forwarder target is now loaded
-  before the strict resolve, and the failure line names the entry point.
+  forwarders to a module it loads later. The failure line now names the entry
+  point.
+
+- **Residual neural rendering at a reduced scale (R299).** The neural stage can run
+  at a fraction of native while the picture stays native: the frame is downsampled,
+  the model runs small, and its difference is composited back onto the native frame.
+  The feature is created once and the scale changes live without rebuilding it.
+  Uses the shaders from xenmods/DLSSNR-Cost-Scaler (MIT). Opt-in via `NRScale`.
 
 ## [grtninja](https://github.com/grtninja)
 

@@ -125,7 +125,15 @@ jobs:
           }
 
       - name: Configure
-        run: cmake -B build -A x64
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -B build -A x64 | tee configure.log
+          # R299c: a failed imgui.h fetch builds green with no panel. Not in CI.
+          grep -q 'overlay panel ENABLED' configure.log || {
+            echo "::error::The overlay panel is not in this build (imgui.h / imconfig.h fetch failed)"
+            exit 1
+          }
 
       - name: Build
         run: cmake --build build --config Release

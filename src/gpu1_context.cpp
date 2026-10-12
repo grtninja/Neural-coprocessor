@@ -38,6 +38,11 @@
 
 #include "adapter.hpp"
 #include "diag.hpp"
+// [OURS] NRS (2026-10-11): the two MIT compute shaders from the Cost-Scaler
+// project, used by the caller-side NR scaling path. Bytecode only - nothing is
+// compiled at build or run time. See build\bridge-nrscale\PLAN_nr_scale_in_bridge.md.
+#include "Downsample_Shader.h"
+#include "Resolve_Shader.h"
 #include "gpu1_context.hpp"
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
@@ -1294,9 +1299,40 @@ void report_process_census_at_arm();
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
 
+// [OURS] 2026-10-12: the DISPLAYED frame rate ring. Written by the present thread, read
+// by the panel for display only. See the sampler inside present_frame.
+static double        g_pr_ms[180] = {};
+static unsigned      g_pr_n = 0u, g_pr_i = 0u;
+static LARGE_INTEGER g_pr_last{};
+static std::atomic<int> g_pr_on{0};   // R299: the sampler runs only when the NRScale path armed
+
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
+
+    // ---- [OURS] 2026-10-12: THE DISPLAYED FRAME RATE ---------------------------
+    // This function is where a frame is actually handed to the compositor, so the gap
+    // between two calls to it is the cadence the eye judges. That number was missing:
+    // the panel's "GPU 1" figure counts what the consumer FINISHED, and the operator
+    // measured it reading HIGH on this rig - the consumer can finish frames that are
+    // superseded before they are ever shown. Percentiles are computed in ui_read.
+    if (g_pr_on.load(std::memory_order_relaxed) != 0)   // R299: off without NRScale
+    {
+        LARGE_INTEGER pr_now{}, pr_f{};
+        QueryPerformanceCounter(&pr_now);
+        QueryPerformanceFrequency(&pr_f);
+        if (g_pr_last.QuadPart != 0 && pr_f.QuadPart != 0)
+        {
+            const double ms = (double)(pr_now.QuadPart - g_pr_last.QuadPart) * 1000.0 / (double)pr_f.QuadPart;
+            if (ms > 0.0 && ms < 1000.0)
+            {
+                g_pr_ms[g_pr_i] = ms;
+                g_pr_i = (g_pr_i + 1u) % 180u;
+                if (g_pr_n < 180u) ++g_pr_n;
+            }
+        }
+        g_pr_last = pr_now;
+    }
 
     ID3D12Device *dev = nullptr;
     ID3D12CommandQueue *queue = nullptr;
@@ -9362,6 +9398,96 @@ namespace
         ID3D12Resource *cv_out = nullptr;         // the chained field, R32G32_FLOAT
         ID3D12RootSignature *cv_rs = nullptr;
         ID3D12PipelineState *cv_pso = nullptr;
+        // [OURS] NRS - caller-side NR scaling (2026-10-11). STEP 1 plumbed only:
+        // with NRScale<1 these get built and the work-sized scratch pair is
+        // allocated, but nothing is dispatched and no NGX parameter is touched,
+        // so the picture must be byte-identical (that is step 1's acceptance
+        // test). Step 2 adds the dispatches and the create-time key swap.
+        // Absent or >= 1.0 = every published run unchanged.
+        bool  nrs_on = false;
+        bool  nrs_ready = false;
+        float nrs_scale = 1.0f;
+        float nrs_gain = 1.0f;
+        unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
+        float nrs_sharpness = 0.50f;         // RCAS, matched to the proxys ini (Sharpness=0.50)
+        float nrs_color_strength = 0.90f;    // matched to the proxys ini (ColorStrength=0.90)
+        unsigned nrs_w = 0u, nrs_h = 0u;
+        UINT  nrs_inc = 0u;
+        ID3D12RootSignature *nrs_rs_down = nullptr;
+        ID3D12RootSignature *nrs_rs_res = nullptr;
+        ID3D12PipelineState *nrs_pso_down = nullptr;
+        ID3D12PipelineState *nrs_pso_res = nullptr;
+        ID3D12DescriptorHeap *nrs_heap = nullptr;
+        ID3D12Resource *nrs_color = nullptr;
+        ID3D12Resource *nrs_out = nullptr;
+        // TRACKED states, not guesses. The proxy keeps slot->colorSmallState /
+        // outputSmallState and passes them into every TransitionBarrier; assuming
+        // a state is how a write ends up invisible to the next reader.
+        D3D12_RESOURCE_STATES nrs_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        D3D12_RESOURCE_STATES nrs_out_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        ID3D12Device *nrs_dev = nullptr;    // stashed at arm: the per-frame path needs it for descriptor writes
+        // NRS instrument (step 2): ms per evaluate at a known work extent. This
+        // is the ONE quantity that can be compared across games - the same
+        // network on the same card at the same size - whereas fps is set by
+        // whichever card is slower and the neural card's total power also pays
+        // for the cross-card transport and the composition.
+        unsigned long long nrs_ev_n = 0ull;
+        double nrs_ev_ms_sum = 0.0;
+        double nrs_ev_ms_min = 0.0;
+        double nrs_ev_ms_max = 0.0;
+        bool   nrs_ev_fresh = false;
+        // ---- E2 readback probe, v2 (2026-10-11) ------------------------------
+        // Every 240 evaluates: record a 64x4 box copy of the native frame this pass
+        // consumed and of the composite it produced, then read the PREVIOUS pair back
+        // and log the difference. v1 copied the snippet's own textures with invented
+        // state transitions and a blocking fence wait, and froze the stream on its
+        // first copy (23:32 run). v2 is the bridge's own pattern - see the block
+        // comment over nrs_probe_init, and STUDY_proxy_module_contract.md section 12.
+        ID3D12Resource *nrs_probe_buf = nullptr;
+        UINT            nrs_probe_w = 64u, nrs_probe_h = 4u;
+        UINT            nrs_probe_pitch = 0u;
+        UINT64          nrs_probe_off_in = 0ull, nrs_probe_off_out = 0ull;
+        UINT            nrs_probe_x = 0u, nrs_probe_y = 0u;
+        unsigned        nrs_probe_n = 0u;
+        bool            nrs_probe_have = false;   // the buffer holds a complete pair
+        double          nrs_probe_last = -1.0;
+        bool            nrs_probe_ok2 = false;      // buffer + footprint exist (v2)
+        bool            nrs_probe_enable = false;   // ini NRProbe; DEFAULT OFF - v1 froze the stream
+        // [OURS] NRS live scale knob (2026-10-12). The one thing the proxy could do that
+        // this port could not: change the neural extent WITHOUT a relaunch - which is
+        // what makes a one-session scale sweep possible. nrs_cre_v is the create entry
+        // point stashed at arm (kept as void* so this struct needs no NGX typedef).
+        bool  nrs_live = false;
+        bool  nrs_reset_next = false;   // the evaluate after a rebuild must Reset once
+        void *nrs_cre_v = nullptr;
+        // The panel/hotkey staging slot. -1 = nothing staged. Written by the UI thread
+        // under the stream lock, consumed by the evaluate path (the live-knob block).
+        float nrs_stage_scale = -1.0f;
+        // THE FEATURE'S OWN SIZE, decided once. Scale changes never rebuild it - see
+        // nrs_live_resize_scratch for why (NGX leaks gigabytes per rebuild).
+        unsigned nrs_cap_w = 0u, nrs_cap_h = 0u;
+        float nrs_cap_scale = 1.0f;    // ini NRScaleCap: how far above native the slider may go
+        float nrs_stage_seen = -1.0f;      // the value seen last frame, for the debounce
+        LARGE_INTEGER nrs_stage_t{};       // when the staged value last CHANGED
+        unsigned long long nrs_rebuilds = 0ull;
+        LARGE_INTEGER nrs_rebuild_t{};
+        // DEFERRED RELEASE, and this is not a nicety. 2026-10-12 00:31: the first live
+        // rebuild released the old feature and its two scratch textures on the spot,
+        // while the GPU could still be executing commands that reference them - the
+        // consumer stopped and the neural picture froze on screen with the game still
+        // running behind it. The proxy does not release either: it hands the old feature
+        // to ParkNrFeature and TickRetired() frees it later. Same idea here: park, then
+        // free once the NR fence has passed the value it was parked at.
+        struct nrs_parked_t
+        {
+            NVSDK_NGX_Handle *h;
+            ID3D12Resource   *c;
+            ID3D12Resource   *o;
+            UINT64            fence;
+        };
+        static const unsigned NRS_PARK_MAX = 8u;
+        nrs_parked_t nrs_park[NRS_PARK_MAX] = {};
+        unsigned     nrs_park_n = 0u;
         ID3D12DescriptorHeap *cv_heap = nullptr;
         UINT cv_inc = 0;
         unsigned long long cv_built = 0, cv_fb_far = 0, cv_fb_old = 0, cv_fb_slot = 0;
@@ -11094,6 +11220,17 @@ namespace
         if (s.cv_pso  != nullptr) { s.cv_pso->Release();  s.cv_pso  = nullptr; }
         if (s.cv_rs   != nullptr) { s.cv_rs->Release();   s.cv_rs   = nullptr; }
         if (s.cv_heap != nullptr) { s.cv_heap->Release(); s.cv_heap = nullptr; }
+        // [OURS] NRS (2026-10-11): the caller-side scale plumbing. Null when
+        // NRScale is absent, so this is a no-op on every published run.
+        if (s.nrs_pso_down != nullptr) { s.nrs_pso_down->Release(); s.nrs_pso_down = nullptr; }
+        if (s.nrs_pso_res  != nullptr) { s.nrs_pso_res->Release();  s.nrs_pso_res  = nullptr; }
+        if (s.nrs_rs_down  != nullptr) { s.nrs_rs_down->Release();  s.nrs_rs_down  = nullptr; }
+        if (s.nrs_rs_res   != nullptr) { s.nrs_rs_res->Release();   s.nrs_rs_res   = nullptr; }
+        if (s.nrs_heap     != nullptr) { s.nrs_heap->Release();     s.nrs_heap     = nullptr; }
+        if (s.nrs_color    != nullptr) { s.nrs_color->Release();    s.nrs_color    = nullptr; }
+        if (s.nrs_out      != nullptr) { s.nrs_out->Release();      s.nrs_out      = nullptr; }
+        // E2 probe resources (null unless the scale path ran)
+        if (s.nrs_probe_buf   != nullptr) { s.nrs_probe_buf->Release();   s.nrs_probe_buf   = nullptr; }
         for (unsigned ci = 0; ci < stream_state::CV_MAX; ++ci)
             if (s.cv_prev[ci] != nullptr) { s.cv_prev[ci]->Release(); s.cv_prev[ci] = nullptr; }
         if (s.cv_out != nullptr) { s.cv_out->Release(); s.cv_out = nullptr; }
@@ -12749,6 +12886,626 @@ namespace
         s.nl->Dispatch((s.mvec_w + 7u) / 8u, (s.mvec_h + 7u) / 8u, 1u);
     }
 
+    // =====================================================================
+    // [OURS] NRS - caller-side scaling for the NR stage (2026-10-11).
+    //
+    // WHY THIS EXISTS. Measured on this rig: the NR snippet does NOT scale
+    // itself. DLSSNR.ScalingRatio / PerfQualityValue are inert - at 0.30 the
+    // picture was identical to native and the neural card's power did not move -
+    // while the Cost-Scaler proxy at the same nominal 0.30 cut that card from
+    // 200 W to 83 W. So the scaling has to come from the CALLER, which is what
+    // RenoDX does (its own DownsampleFilter + ProcessingScale). The bridge IS the
+    // caller here (P4.1), so this is where it has to live.
+    // Evidence: skills\mgpu-bridge-ops\NR_MODULE_SCALING.md section 4.3.
+    //
+    // STEP 1 (this patch): plumbing only. Build the two compute PSOs, allocate
+    // the work-sized scratch pair, log what was built. NOTHING is dispatched and
+    // no parameter is touched.
+    // STEP 2: the per-frame downsample + residual resolve dispatches, and the
+    // create-time key swap that makes the feature itself work-sized.
+    //
+    // The bytecodes are the MIT ones from the Cost-Scaler project, compiled
+    // against exactly these root signatures (copied from its proxy_main.cpp:795-928):
+    // constants at b0, one descriptor table holding the SRVs then the UAV, and a
+    // linear/clamp static sampler at s0.
+    //   Downsample: 4 uints  | SRV t0     | UAV u0
+    //   Resolve   : 10 uints | SRV t0..t3  | UAV u0
+    // =====================================================================
+    struct nrs_consts_down
+    {
+        unsigned src_w, src_h, dst_w, dst_h;
+    };
+
+    struct nrs_consts_res
+    {
+        unsigned native_w, native_h, work_w, work_h;
+        float    transfer, sharpness;
+        unsigned mode;
+        float    color;
+        unsigned skip, has_depth;
+    };
+
+    static bool nrs_build_one(ID3D12Device *ndev, bool resolve,
+                              const void *code, size_t code_len,
+                              ID3D12RootSignature **out_rs, ID3D12PipelineState **out_pso,
+                              char *line, size_t cap)
+    {
+        D3D12_DESCRIPTOR_RANGE rng[2] = {};
+        rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng[0].NumDescriptors = resolve ? 4u : 1u;
+        rng[0].BaseShaderRegister = 0;
+        rng[0].RegisterSpace = 0;
+        rng[0].OffsetInDescriptorsFromTableStart = 0;
+        rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        rng[1].NumDescriptors = 1u;
+        rng[1].BaseShaderRegister = 0;
+        rng[1].RegisterSpace = 0;
+        rng[1].OffsetInDescriptorsFromTableStart = resolve ? 4u : 1u;
+
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[0].Constants.ShaderRegister = 0;
+        rp[0].Constants.RegisterSpace = 0;
+        rp[0].Constants.Num32BitValues = resolve ? 10u : 4u;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[1].DescriptorTable.NumDescriptorRanges = 2;
+        rp[1].DescriptorTable.pDescriptorRanges = rng;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderRegister = 0;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2;
+        rsd.pParameters = rp;
+        rsd.NumStaticSamplers = 1;
+        rsd.pStaticSamplers = &ss;
+
+        ID3DBlob *sig = nullptr, *err = nullptr;
+        HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] %s root signature failed 0x%08X %s",
+                     resolve ? "resolve" : "downsample", (unsigned)hr,
+                     (err != nullptr) ? (const char *)err->GetBufferPointer() : "");
+            if (err != nullptr) err->Release();
+            return false;
+        }
+        hr = ndev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                       IID_PPV_ARGS(out_rs));
+        sig->Release();
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] %s CreateRootSignature failed 0x%08X",
+                     resolve ? "resolve" : "downsample", (unsigned)hr);
+            return false;
+        }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = *out_rs;
+        pd.CS.pShaderBytecode = code;
+        pd.CS.BytecodeLength = code_len;
+        hr = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(out_pso));
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] %s CreateComputePipelineState failed 0x%08X",
+                     resolve ? "resolve" : "downsample", (unsigned)hr);
+            return false;
+        }
+        return true;
+    }
+
+    static bool nrs_init(ID3D12Device *ndev, stream_state &s, char *line, size_t cap)
+    {
+        if (s.nrs_ready) return true;
+        if (!nrs_build_one(ndev, false, (const void *)g_DownsampleShader, sizeof(g_DownsampleShader),
+                           &s.nrs_rs_down, &s.nrs_pso_down, line, cap))
+            return false;
+        if (!nrs_build_one(ndev, true, (const void *)g_ResolveShader, sizeof(g_ResolveShader),
+                           &s.nrs_rs_res, &s.nrs_pso_res, line, cap))
+            return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 8;          // downsample 2 + resolve 5, room to spare
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        const HRESULT hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.nrs_heap));
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] descriptor heap failed 0x%08X", (unsigned)hr);
+            return false;
+        }
+        s.nrs_inc = ndev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        s.nrs_ready = true;
+        return true;
+    }
+
+    static bool nrs_alloc(ID3D12Device *ndev, stream_state &s, char *line, size_t cap)
+    {
+        const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
+        HRESULT hr = make_tex(ndev, s.nrs_w, s.nrs_h, fmt,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.nrs_color);
+        if (SUCCEEDED(hr))
+            hr = make_tex(ndev, s.nrs_w, s.nrs_h, fmt,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.nrs_out);
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] scratch allocation failed 0x%08X (%ux%u fmt=%d)",
+                     (unsigned)hr, s.nrs_w, s.nrs_h, (int)fmt);
+            return false;
+        }
+        return true;
+    }
+
+    // Park the current features + scratch pair instead of freeing them. They are freed
+    // by nrs_tick_retired once the NR fence has passed the value they were parked at.
+    // If the fence is not available (profile runs, unusual paths) the entry is freed on
+    // the next tick - which is still later than the frame that used it, and the ring is
+    // deep enough that the difference does not matter.
+    static void nrs_park_now(stream_state &s)
+    {
+        stream_state::nrs_parked_t entry{};
+        entry.h = s.nr_handle[0];
+        entry.c = s.nrs_color;
+        entry.o = s.nrs_out;
+        entry.fence = (s.nf != nullptr) ? s.nf_value : 0ull;
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.nr_handle[i] = nullptr;
+        s.nrs_color = nullptr;
+        s.nrs_out = nullptr;
+        if (entry.h == nullptr && entry.c == nullptr && entry.o == nullptr) return;
+        if (s.nrs_park_n >= stream_state::NRS_PARK_MAX)
+        {
+            // The list is full: free the oldest entry, which is the one most likely to be
+            // long finished. This is the only path that frees without a fence.
+            stream_state::nrs_parked_t &old = s.nrs_park[0];
+            if (old.h != nullptr && s.nr_release != nullptr) (void)s.nr_release(old.h);
+            if (old.c != nullptr) old.c->Release();
+            if (old.o != nullptr) old.o->Release();
+            for (unsigned i = 1u; i < s.nrs_park_n; ++i) s.nrs_park[i - 1u] = s.nrs_park[i];
+            s.nrs_park_n -= 1u;
+        }
+        s.nrs_park[s.nrs_park_n++] = entry;
+    }
+
+    static void nrs_tick_retired(stream_state &s)
+    {
+        if (s.nrs_park_n == 0u) return;
+        const UINT64 done = (s.nf != nullptr) ? s.nf->GetCompletedValue() : ~0ull;
+        unsigned w = 0u;
+        for (unsigned i = 0u; i < s.nrs_park_n; ++i)
+        {
+            stream_state::nrs_parked_t &e = s.nrs_park[i];
+            if (done >= e.fence)
+            {
+                if (e.h != nullptr && s.nr_release != nullptr) (void)s.nr_release(e.h);
+                if (e.c != nullptr) e.c->Release();
+                if (e.o != nullptr) e.o->Release();
+            }
+            else s.nrs_park[w++] = e;
+        }
+        s.nrs_park_n = w;
+    }
+
+
+    // =====================================================================
+    // [OURS] NRS live scale change, second design (2026-10-12, later the same night).
+    //
+    // THE FIRST DESIGN REBUILT THE FEATURE, AND THAT WAS WRONG. The operator dragged the
+    // slider and the rig bogged down; a VRAM trace settled it: 2.24 GB baseline, +2.6 GB at
+    // arm, then +1.5-2.4 GB PER REBUILD, 2.2 -> 15.4 GB in one drag session, never coming
+    // back down. NGX allocates large internal buffers for a network of a given size and
+    // releasing the feature does not return them. So the feature is now built ONCE, at the
+    // cap (native), and a scale change only resizes OUR OWN two scratch textures - which we
+    // allocate, and which therefore free cleanly. The snippet re-reads DLSSNR.Width/Height
+    // on every evaluate (that is P6.2c's finding), so the cap-sized feature happily runs a
+    // smaller extent. A scale change is now two key writes and a 30-45 MB texture swap.
+    // =====================================================================
+    static bool nrs_live_resize_scratch(stream_state &s, char *line, size_t cap)
+    {
+        if (s.nrs_color != nullptr || s.nrs_out != nullptr)
+        {
+            if (s.nrs_park_n < stream_state::NRS_PARK_MAX)
+            {
+                stream_state::nrs_parked_t e{};
+                e.h = nullptr;                       // textures only: the feature is untouched
+                e.c = s.nrs_color;
+                e.o = s.nrs_out;
+                e.fence = (s.nf != nullptr) ? s.nf_value : 0ull;
+                s.nrs_park[s.nrs_park_n++] = e;
+            }
+            else
+            {
+                if (s.nrs_color != nullptr) s.nrs_color->Release();
+                if (s.nrs_out   != nullptr) s.nrs_out->Release();
+            }
+            s.nrs_color = nullptr;
+            s.nrs_out   = nullptr;
+        }
+        s.nrs_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.nrs_out_state   = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!nrs_alloc(s.nrs_dev, s, line, cap)) return false;
+        snprintf(line, cap,
+                 "[MGPU][OURS][NRS] LIVE scale -> work %ux%u: scratch resized, FEATURE UNTOUCHED "
+                 "(no NGX call, no rebuild, nothing to leak)", s.nrs_w, s.nrs_h);
+        return true;
+    }
+
+    // =====================================================================
+    // [OURS] NRS live scale change (2026-10-12).
+    //
+    // Release the NR features and build them again at the new work extent, inside the
+    // running session. The choreography is the arm's, verbatim (see the create loop at
+    // gpu1_context.cpp:14298-14349): release handles, rebuild the scratch pair, set the
+    // create-time keys, take the arm sentinel, create one feature per pass at the new
+    // extent, put the keys back to the native extent, clear the sentinel.
+    //
+    // The keys are re-read on a timer in the evaluate path, so a sweep driver only has
+    // to rewrite mgpu.ini - the same trick the proxy uses (its CheckConfigHotReload).
+    // =====================================================================
+    static bool nrs_live_recreate(stream_state &s, char *line, size_t cap)
+    {
+        if (s.nrs_cre_v == nullptr || s.nl == nullptr || s.nrs_dev == nullptr) return false;
+
+        // PARK, DO NOT FREE - the freeze of 2026-10-12 00:31 came from freeing these on
+        // the spot while the GPU could still be executing work that referenced them.
+        const unsigned parked_before = s.nrs_park_n;
+        nrs_park_now(s);
+        s.nrs_color_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        s.nrs_out_state   = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!nrs_alloc(s.nrs_dev, s, line, cap)) return false;
+
+        s.nr_params->Set("DLSSNR.Color", s.nrs_color);
+        s.nr_params->Set("DLSSNR.Output", s.nrs_out);
+        s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+        s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+        s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.nrs_w);
+        s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.nrs_h);
+        s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+        s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+        s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.nrs_w);
+        s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.nrs_h);
+
+        arm_sentinel_set();
+        NVSDK_NGX_Result rr = NVSDK_NGX_Result_Success;
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        {
+            const bool nrs1 = (i == 0u);
+            const UINT cw  = nrs1 ? s.nrs_w : s.width;
+            const UINT chh = nrs1 ? s.nrs_h : s.height;
+            s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
+            s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
+            unsigned long seh_code = 0ul;
+            rr = ngx_create_guarded((ngx_pf_create_seh_fn)s.nrs_cre_v, s.nl,
+                                    (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                                    s.nr_params, &s.nr_handle[i], &seh_code);
+            if ((unsigned)rr == NGX_RESULT_MGPU_SEH_FAULT)
+            {
+                arm_sentinel_clear();
+                snprintf(line, cap, "[MGPU][OURS][NRS] LIVE recreate: NGX faulted (SEH 0x%08lX); "
+                                    "the NR scale path is off and the stream keeps running.",
+                         seh_code);
+                return false;
+            }
+            snprintf(line, cap,
+                     "[MGPU][OURS][NRS] LIVE recreate handle %u/%u %ux%u: result=0x%08X handle=0x%p",
+                     i + 1, stream_state::MAX_PASSES, cw, chh, (unsigned)rr, (void *)s.nr_handle[i]);
+            mgpu::diag::info(line);
+            if (rr != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
+        }
+        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+        arm_sentinel_clear();
+
+        const bool ok = (rr == NVSDK_NGX_Result_Success && s.nr_handle[0] != nullptr);
+        snprintf(line, cap,
+                 "[MGPU][OURS][NRS] LIVE scale change done: work=%ux%u, parked=%u (deferred release), %s",
+                 s.nrs_w, s.nrs_h, s.nrs_park_n - parked_before, ok ? "rebuild OK" : "REBUILD FAILED");
+        s.nrs_reset_next = ok;   // a fresh feature has no history: Reset once
+        return ok;
+    }
+
+    // Descriptor writes for the two passes. The heap is ours and small; the same
+    // five slots are rewritten each frame, which is legal and costs nothing.
+    static void nrs_make_srv(ID3D12Device *dev, ID3D12Resource *res, D3D12_CPU_DESCRIPTOR_HANDLE h, DXGI_FORMAT fmt)
+    {
+        if (dev == nullptr || res == nullptr) return;
+        D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+        d.Format = fmt;
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Texture2D.MipLevels = 1;
+        dev->CreateShaderResourceView(res, &d, h);
+    }
+
+    static void nrs_make_uav(ID3D12Device *dev, ID3D12Resource *res, D3D12_CPU_DESCRIPTOR_HANDLE h, DXGI_FORMAT fmt)
+    {
+        if (dev == nullptr || res == nullptr) return;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+        d.Format = fmt;
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        dev->CreateUnorderedAccessView(res, nullptr, &d, h);
+    }
+
+    // Transition a resource to `to` USING the state we recorded last time, and
+    // record the new one. Exactly what the proxy does with colorSmallState /
+    // outputSmallState - and the reason its downsample lands where the snippet can
+    // read it while ours did not: a UAV write is not visible to the next reader
+    // without this barrier (2026-10-11, the "identical picture in residual mode,
+    // black screen in direct mode" pair of symptoms).
+    static void nrs_to(stream_state &s, ID3D12Resource *res, D3D12_RESOURCE_STATES *tracked,
+                       D3D12_RESOURCE_STATES to, bool is_out)
+    {
+        if (res == nullptr || tracked == nullptr) return;
+        barrier(s.nl, res, *tracked, to);
+        *tracked = to;
+        if (is_out) s.nrs_out_state = to; else s.nrs_color_state = to;
+    }
+
+    // =====================================================================
+    // E2 v2: the readback probe, rebuilt on the bridge's own pattern.
+    //
+    // v1 (23:32) hung the stream: it copied the SNIPPET's textures with state
+    // transitions it invented, and waited on a fence it marked itself. The bridge
+    // has been sampling a texture into a readback buffer every frame for months
+    // without ever hanging, and it does none of those three things:
+    //   :23937-23956  a 64x4 box into a 1024-byte READBACK buffer, source taken
+    //                 from a state it owns (UNORDERED_ACCESS -> COPY_SOURCE -> back)
+    //   :20816        the Map happens a frame LATER, on the consumer path
+    //   :20027-20032  and there is no wait anywhere, because the ring is 6 deep
+    //                 against a consumer at most one frame behind
+    // v2 copies exactly that way: 64x4 boxes, states taken from what this frame
+    // has already established, no fence, no wait, inspect 240 evaluates later.
+    // It measures the two things that matter: the native frame this pass consumed,
+    // and the composite it produced. Their difference is the net visible effect.
+    // =====================================================================
+    static bool nrs_probe_init(ID3D12Device *ndev, stream_state &s, char *line, size_t cap)
+    {
+        if (s.nrs_probe_ok2) return true;
+        s.nrs_probe_w = 64u; s.nrs_probe_h = 4u;
+        s.nrs_probe_x = (UINT)((s.width / 2u) & ~1u);
+        s.nrs_probe_y = (UINT)((s.height / 2u) & ~1u);
+        if (s.nrs_probe_x + s.nrs_probe_w > s.width)  s.nrs_probe_x = s.width  - s.nrs_probe_w;
+        if (s.nrs_probe_y + s.nrs_probe_h > s.height) s.nrs_probe_y = s.height - s.nrs_probe_h;
+
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = s.nrs_probe_w;
+        td.Height = s.nrs_probe_h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = (DXGI_FORMAT)s.format;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT rows = 0u; UINT64 row_bytes = 0ull; UINT64 total = 0ull;
+        ndev->GetCopyableFootprints(&td, 0, 1, 0ull, &fp, &rows, &row_bytes, &total);
+        if (row_bytes == 0ull || total == 0ull)
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] probe: GetCopyableFootprints gave nothing");
+            return false;
+        }
+        s.nrs_probe_pitch = (UINT)row_bytes;
+        s.nrs_probe_off_in = 0ull;
+        s.nrs_probe_off_out = ((total + 511ull) / 512ull) * 512ull;   // 512-byte aligned
+
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = s.nrs_probe_off_out + total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        HRESULT hr = ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(&s.nrs_probe_buf));
+        if (FAILED(hr))
+        {
+            snprintf(line, cap, "[MGPU][OURS][NRS] probe: readback buffer failed 0x%08X", (unsigned)hr);
+            return false;
+        }
+        // NO FENCE AND NO EVENT, deliberately. See the block comment above: the
+        // bridge's own probe waits for nothing, and v1's invented fence plus its
+        // 2-second blocking wait is exactly what is NOT done here.
+        s.nrs_probe_ok2 = true;
+        return true;
+    }
+
+    // Record this frame's two box copies. The states used here are the ones this
+    // frame has ALREADY established - not assumptions:
+    //   composite : left in UNORDERED_ACCESS by the resolve (the bridge's own sample
+    //               at :23944 uses exactly this before-state for the same reason)
+    //   native    : s.tex_in[ii], transitioned to NON_PIXEL_SHADER_RESOURCE at :22194
+    //               and not touched again until the end of the frame at :23961
+    // Both are restored to those same states, so nothing downstream can tell.
+    static void nrs_probe_issue(stream_state &s, unsigned ii, ID3D12Resource *composite)
+    {
+        if (!s.nrs_probe_ok2 || s.nl == nullptr || composite == nullptr) return;
+        ID3D12Resource *native_tex = (ii < stream_state::RING) ? s.tex_in[ii] : nullptr;
+        if (native_tex == nullptr) return;
+
+        const D3D12_BOX box{ s.nrs_probe_x, s.nrs_probe_y, 0u,
+                             s.nrs_probe_x + s.nrs_probe_w,
+                             s.nrs_probe_y + s.nrs_probe_h, 1u };
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0u;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.pResource = s.nrs_probe_buf;
+        dst.PlacedFootprint.Footprint.Format = (DXGI_FORMAT)s.format;
+        dst.PlacedFootprint.Footprint.Width = s.nrs_probe_w;
+        dst.PlacedFootprint.Footprint.Height = s.nrs_probe_h;
+        dst.PlacedFootprint.Footprint.Depth = 1u;
+        dst.PlacedFootprint.Footprint.RowPitch = s.nrs_probe_pitch;
+
+        barrier(s.nl, native_tex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(s.nl, composite, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        src.pResource = native_tex;
+        dst.PlacedFootprint.Offset = s.nrs_probe_off_in;
+        s.nl->CopyTextureRegion(&dst, 0u, 0u, 0u, &src, &box);
+        src.pResource = composite;
+        dst.PlacedFootprint.Offset = s.nrs_probe_off_out;
+        s.nl->CopyTextureRegion(&dst, 0u, 0u, 0u, &src, &box);
+
+        barrier(s.nl, composite, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrier(s.nl, native_tex, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        s.nrs_probe_have = true;
+    }
+    // Read the pair issued 240 evaluates ago and report it. NO WAIT: the bridge reads
+    // its own sample a frame later and never waits, because the ring is 6 deep against
+    // a consumer at most one frame behind (:20027-20032).
+    static void nrs_probe_collect(stream_state &s)
+    {
+        if (!s.nrs_probe_ok2 || !s.nrs_probe_have || s.nrs_probe_buf == nullptr) return;
+        void *p = nullptr;
+        const D3D12_RANGE rd{ (SIZE_T)s.nrs_probe_off_in,
+                              (SIZE_T)(s.nrs_probe_off_out + (UINT64)s.nrs_probe_pitch * s.nrs_probe_h) };
+        if (FAILED(s.nrs_probe_buf->Map(0u, &rd, &p)) || p == nullptr)
+        {
+            mgpu::diag::warn("[MGPU][OURS][NRS] probe: Map of the readback buffer failed - readout off.");
+            return;
+        }
+
+        const unsigned char *base = (const unsigned char *)p;
+        const unsigned *in_rows = (const unsigned *)(base + s.nrs_probe_off_in);
+        const unsigned *out_rows = (const unsigned *)(base + s.nrs_probe_off_out);
+        const UINT pitch_u32 = s.nrs_probe_pitch / 4u;
+
+        double sum_in = 0.0, sum_out = 0.0, sum_abs = 0.0, max_abs = 0.0;
+        unsigned long long n = 0ull, moved = 0ull;
+        for (UINT y = 0u; y < s.nrs_probe_h; ++y)
+        {
+            const unsigned *ri = in_rows + (SIZE_T)y * pitch_u32;
+            const unsigned *ro = out_rows + (SIZE_T)y * pitch_u32;
+            for (UINT x = 0u; x < s.nrs_probe_w; ++x)
+            {
+                // R10G10B10A2_UNORM: R = bits 0..9, G = 10..19, B = 20..29
+                const double ir = (double)(ri[x] & 0x3FFu) / 1023.0;
+                const double ig = (double)((ri[x] >> 10) & 0x3FFu) / 1023.0;
+                const double ib = (double)((ri[x] >> 20) & 0x3FFu) / 1023.0;
+                const double orr = (double)(ro[x] & 0x3FFu) / 1023.0;
+                const double og = (double)((ro[x] >> 10) & 0x3FFu) / 1023.0;
+                const double ob = (double)((ro[x] >> 20) & 0x3FFu) / 1023.0;
+                const double li = 0.2126 * ir + 0.7152 * ig + 0.0722 * ib;
+                const double lo = 0.2126 * orr + 0.7152 * og + 0.0722 * ob;
+                const double a = fabs(lo - li);
+                sum_in += li; sum_out += lo; sum_abs += a;
+                if (a > max_abs) max_abs = a;
+                if (a > (2.0 / 1023.0)) moved += 1ull;
+                n += 1ull;
+            }
+        }
+        s.nrs_probe_buf->Unmap(0u, nullptr);
+        ++s.nrs_probe_n;
+        if (n == 0ull) return;
+        char pl[340];
+        snprintf(pl, sizeof pl,
+                 "[MGPU][OURS][NRS] PROBE #%u work=%ux%u box %ux%u@%u,%u: luma native=%.4f composite=%.4f | "
+                 "mean|composite-native|=%.5f (%.2f%% of full scale) max=%.4f moved(>2/1023)=%.1f%% "
+                 "[net visual effect of this path = neural delta + RCAS]",
+                 s.nrs_probe_n, s.nrs_w, s.nrs_h, s.nrs_probe_w, s.nrs_probe_h,
+                 s.nrs_probe_x, s.nrs_probe_y, sum_in / (double)n, sum_out / (double)n,
+                 sum_abs / (double)n, (sum_abs / (double)n) * 100.0, max_abs,
+                 100.0 * (double)moved / (double)n);
+        mgpu::diag::info(pl);
+        s.nrs_probe_last = sum_abs / (double)n;
+    }
+
+    // Pass 1: native colour -> the work-sized model input. Constants are the
+    // 4 uints the bytecode reads (src w/h, dst w/h).
+    static void nrs_dispatch_down(stream_state &s, ID3D12Resource *native_src)
+    {
+        if (s.nl == nullptr || s.nrs_heap == nullptr || native_src == nullptr) return;
+        const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
+        ID3D12DescriptorHeap *heaps[1] = { s.nrs_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.nrs_rs_down);
+        s.nl->SetPipelineState(s.nrs_pso_down);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.nrs_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.nrs_heap->GetGPUDescriptorHandleForHeapStart();
+        nrs_make_srv(s.nrs_dev, native_src, cpu, fmt);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu; cpu1.ptr += s.nrs_inc;
+        nrs_make_uav(s.nrs_dev, s.nrs_color, cpu1, fmt);
+        s.nl->SetComputeRootDescriptorTable(1, gpu);
+        const nrs_consts_down c{ (unsigned)s.width, (unsigned)s.height, s.nrs_w, s.nrs_h };
+        s.nl->SetComputeRoot32BitConstants(0, 4, &c, 0);
+        s.nl->Dispatch((s.nrs_w + 7u) / 8u, (s.nrs_h + 7u) / 8u, 1u);
+    }
+
+    // Pass 2: the residual composite. smallInput/smallOutput are the model's
+    // own input and output at the work extent, native_color is the untouched 1:1
+    // anchor, depth is the native depth buffer (may be null - the bytecode takes
+    // a has_depth flag), and native_out is where the frame's final image goes.
+    static void nrs_dispatch_res(stream_state &s, ID3D12Resource *native_color,
+                                 ID3D12Resource *native_out, ID3D12Resource *depth)
+    {
+        if (s.nl == nullptr || s.nrs_heap == nullptr || native_color == nullptr ||
+            native_out == nullptr || s.nrs_color == nullptr || s.nrs_out == nullptr)
+            return;
+        const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
+        ID3D12DescriptorHeap *heaps[1] = { s.nrs_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.nrs_rs_res);
+        s.nl->SetPipelineState(s.nrs_pso_res);
+        // SEPARATE DESCRIPTOR SLOTS PER PASS - the fix for the whole 2026-10-11 night.
+        //
+        // Both dispatches are recorded into the SAME command list, and the GPU reads a
+        // shader-visible descriptor heap at EXECUTION time. So any slot the two passes
+        // share holds the SECOND pass's descriptor by the time the first one runs.
+        // With both starting at slot 0 that meant: the downsample read the resolve's t0
+        // (its own output texture, still all zeros) and wrote the resolve's u0 (the final
+        // image), leaving nrs_color all zeros for ever. The snippet was then fed zeros,
+        // returned zeros, the residual composite collapsed to native + 0 = native
+        // bit-exactly, mode 0 produced a pure black screen, the power still fell (the
+        // network really was smaller - it was denoising zero), and the probe measured
+        // 0.00000 with Sharpness=0 (23:55 run). One heap, two disjoint slot ranges:
+        //   downsample 0..1   resolve 2..6   (the heap holds 8)
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.nrs_heap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += 2u * s.nrs_inc;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.nrs_heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += 2u * s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, s.nrs_color, cpu, fmt);                                  // t0
+        D3D12_CPU_DESCRIPTOR_HANDLE h1 = cpu; h1.ptr += s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, s.nrs_out, h1, fmt);                                     // t1
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = cpu; h2.ptr += 2u * s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, native_color, h2, fmt);                                  // t2
+        D3D12_CPU_DESCRIPTOR_HANDLE h3 = cpu; h3.ptr += 3u * s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, depth, h3, DXGI_FORMAT_R32_FLOAT);                       // t3 (may be null)
+        D3D12_CPU_DESCRIPTOR_HANDLE h4 = cpu; h4.ptr += 4u * s.nrs_inc;
+        nrs_make_uav(s.nrs_dev, native_out, h4, fmt);                                    // u0
+        s.nl->SetComputeRootDescriptorTable(1, gpu);
+        nrs_consts_res c{};
+        c.native_w = (unsigned)s.width;
+        c.native_h = (unsigned)s.height;
+        c.work_w = s.nrs_w;
+        c.work_h = s.nrs_h;
+        c.transfer = s.nrs_gain;          // 1.0 = the model's full contribution
+        c.sharpness = s.nrs_sharpness;
+        c.mode = s.nrs_mode;              // 1 = RGB residual over the native anchor, 0 = the model output itself
+        c.color = s.nrs_color_strength;
+        c.skip = 0u;
+        c.has_depth = (depth != nullptr) ? 1u : 0u;
+        s.nl->SetComputeRoot32BitConstants(0, 10, &c, 0);
+        s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
+    }
+
     bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
     {
         char line[900];
@@ -12914,6 +13671,164 @@ namespace
         (void)p_pop(s.nr_params);
         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+
+        // ---- [OURS] P6.2c: the Set.* keys, BEFORE CreateFeature (2026-10-11) ----
+        //
+        // WHY THIS EXISTS. The Set.* list is applied in the EVALUATE path only
+        // (see the P6.2 application site, near the per-frame parameter writes),
+        // i.e. AFTER this CreateFeature. A key that decides the size of the
+        // network the feature builds - DLSSNR.ScalingRatio, or the generic
+        // PerfQualityValue the snippet turns into that ratio (its own string:
+        // "Error: missing PerfQualityValue for DLSSNR scaling ratio
+        // computation") - therefore cannot affect the network this call
+        // creates. Measured 2026-10-11: Set.DLSSNR.ScalingRatio=0.30 with
+        // Set.PerfQualityValue=0 left the neural card's utilisation (52 -> 66%),
+        // power (141 -> 156 W) and memory (4786 -> 4871 MiB) unmoved - i.e. what
+        // you would see if the key arrived after the size was already fixed.
+        //
+        // Gated by NRSetAtCreate (absent = off) so one run can A/B it without a
+        // rebuild and so the shipped behaviour is unchanged by default.
+        if (s.set_n > 0u && ini_read_flag("NRSetAtCreate"))
+        {
+            for (unsigned si = 0; si < s.set_n; ++si)
+            {
+                if (s.set_is_float[si]) s.nr_params->Set(s.set_key[si], s.set_f[si]);
+                else                    s.nr_params->Set(s.set_key[si], s.set_u[si]);
+            }
+            char p6c[430];
+            snprintf(p6c, sizeof p6c,
+                     "[OURS][P6.2c] %u Set.* key(s) applied to the NR block BEFORE CreateFeature "
+                     "(NRSetAtCreate=1); first: %s=%s",
+                     s.set_n, s.set_key[0], s.set_is_float[0] ? "(float)" : "(unsigned)");
+            mgpu::diag::info(p6c);
+        }
+        else if (s.set_n > 0u)
+        {
+            char p6c[300];
+            snprintf(p6c, sizeof p6c,
+                     "[OURS][P6.2c] %u Set.* key(s) are present but NOT applied before "
+                     "CreateFeature (NRSetAtCreate off) - they reach the evaluate path only.",
+                     s.set_n);
+            mgpu::diag::info(p6c);
+        }
+
+        // ---- [OURS] NRS: caller-side scale, arm-time plumbing (STEP 1) ----
+        //
+        // Read once, at arm, like every other key in this file. NRScale absent or
+        // >= 1.0 -> this block does nothing, and the run is byte-identical to every
+        // published one. Fail-soft on purpose: if anything here fails, nrs_on goes
+        // back to false and the stream arms exactly as before - the neural layer is
+        // not worth risking for an experiment.
+        {
+            const float nrs_sc  = ini_read_float("NRScale", 1.0f);
+            const float nrs_scx = ini_read_float("NRScaleX", nrs_sc);
+            const float nrs_scy = ini_read_float("NRScaleY", nrs_sc);
+            s.nrs_gain      = ini_read_float("NRDetailGain", 1.0f);
+            s.nrs_mode      = (unsigned)ini_read_float("NRMode", 1.0f);
+            s.nrs_sharpness = ini_read_float("NRSharpness", 0.50f);
+            s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
+            // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
+            // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
+            const bool nrs_want = ini_has_key("NRScale") &&
+                                  ((nrs_scx > 0.05f && nrs_scx <= 2.0f) ||
+                                   (nrs_scy > 0.05f && nrs_scy <= 2.0f));
+            s.nrs_on = false;
+            if (nrs_want)
+            {
+                // The extent is round(native x scale), even, floor 128. NO UPPER CLAMP:
+                // a scale above 1.0 is a legitimate step (the network then runs larger
+                // than native, fed by a bilinear upscale - exactly what the proxy's 1.50
+                // step did, work=5760x3240), and exactly 1.0 degenerates to the plain 1:1
+                // path, which is the baseline every ladder wants as its first rung.
+                const float sxl = (nrs_scx > 0.05f) ? nrs_scx : nrs_sc;
+                const float syl = (nrs_scy > 0.05f) ? nrs_scy : nrs_sc;
+                // 2026-10-12: the scale is capped at 1.00. A larger network needs a larger
+                // FEATURE, and rebuilding a feature leaks NGX memory that release never
+                // returns (measured +1.5-2.4 GB per rebuild). Supersampling was a sweep
+                // curiosity; the cap is where the feature is created, once.
+                // NRScaleCap (default 1.00) is how far ABOVE native the slider may go. The
+                // feature is created at this cap ONCE, so a supersampled setting needs no
+                // rebuild either - it only means the one-time NGX allocation is larger.
+                // (Rebuilding a feature per setting is what leaked gigabytes; the cap is the
+                // way to offer >1.00 without that.)
+                float capsc = ini_read_float("NRScaleCap", 1.0f);
+                if (capsc < 1.0f) capsc = 1.0f;
+                if (capsc > 2.0f) capsc = 2.0f;
+                s.nrs_cap_scale = capsc;
+                s.nrs_cap_w = ((unsigned)((double)s.width  * (double)capsc + 0.5)) & ~1u;
+                s.nrs_cap_h = ((unsigned)((double)s.height * (double)capsc + 0.5)) & ~1u;
+                if (s.nrs_cap_w > 8192u) s.nrs_cap_w = 8192u;
+                if (s.nrs_cap_h > 8192u) s.nrs_cap_h = 8192u;
+                const bool nrs_clamped = (sxl > capsc + 0.001f) || (syl > capsc + 0.001f);
+                const double sxl_c = (sxl > capsc) ? (double)capsc : (double)sxl;
+                const double syl_c = (syl > capsc) ? (double)capsc : (double)syl;
+                if (nrs_clamped)
+                    mgpu::diag::warn("[MGPU][OURS][NRS] NRScale above 1.00 is clamped to 1.00: a bigger "
+                                     "network would need a rebuilt feature, and rebuilding leaks memory.");
+                unsigned nw = (unsigned)((double)s.width  * sxl_c + 0.5);
+                unsigned nh = (unsigned)((double)s.height * syl_c + 0.5);
+                if (nw < 128u) nw = 128u;
+                if (nh < 128u) nh = 128u;
+                nw &= ~1u; nh &= ~1u;                    // even extents
+                if (nw > 8192u) nw = 8192u;
+                if (nh > 8192u) nh = 8192u;
+                s.nrs_w = nw; s.nrs_h = nh; s.nrs_scale = nrs_scx;
+                if (nrs_init(ndev, s, line, sizeof line) && nrs_alloc(ndev, s, line, sizeof line))
+                {
+                    s.nrs_on = true;
+                    g_pr_on.store(1, std::memory_order_relaxed);   // R299
+                    s.nrs_dev = ndev;
+                    s.nrs_cre_v = (void *)p_cre;   // [OURS] NRS: stashed for live scale changes
+                    s.nrs_live = true;
+                    snprintf(line, sizeof line,
+                             "[MGPU][OURS][NRS] scale x=%.3f y=%.3f -> work=%ux%u native=%ux%u "
+                             "gain=%.2f sharp=%.2f fmt=%d: PSOs built, scratch allocated. Each evaluate "
+                             "downsamples to the work extent, runs DLSS-NR there and composites the "
+                             "residual onto the native frame (R299c: text updated).",
+                             (double)nrs_scx, (double)nrs_scy, s.nrs_w, s.nrs_h, s.width, s.height,
+                             (double)s.nrs_gain, (double)s.nrs_sharpness, (int)s.format);
+                    mgpu::diag::info(line);
+                    if (!nrs_probe_init(ndev, s, line, sizeof line))
+                    {
+                        mgpu::diag::warn("[MGPU][OURS][NRS] the E2 readback probe could not start - the "
+                                         "scale path still runs, only the numeric readout is missing.");
+                    }
+                    // DEFAULT OFF, and it stays that way until it is re-implemented on top of
+                    // the bridge's own readback pattern. 2026-10-11 23:32: the first version
+                    // copied nrs_out/nrs_color with COPY_SOURCE transitions of its own, and the
+                    // producer stopped sealing frames in the same second (last [SEAL] new
+                    // f=610 at 23:32:06.565, probe issue at 23:32:06.601) - the neural visual
+                    // froze on screen, which is exactly what the operator reported. An
+                    // instrument that can hang the thing it measures is not an instrument.
+                    // R299c: the probe is armed once, below, outside this branch (N01950's 0001).
+                }
+                else
+                {
+                    mgpu::diag::error(line);            // the helper filled in the reason
+                    mgpu::diag::warn("[MGPU][OURS][NRS] plumbing failed - the NR scale path is OFF for "
+                                     "this run and the stream arms as if NRScale were 1.0.");
+                    s.nrs_on = false;
+                }
+            }
+        }
+
+        // ---- the readback probe, INDEPENDENT of the scale path --------------
+        // It must be able to measure the DAILY configuration too (the proxy at 0.84)
+        // - that is the reference number we have never had. So it is armed by
+        // NRProbe alone, and its per-frame hook lives after the pass loop where the
+        // final image exists, not inside the NRS branch.
+        // R299c: ini_read_word returns bool; the old "!= '0'" was true for every value and
+        // for an absent key, so the probe armed on every launch. NRProbe=1 only, now.
+        if (ini_read_word("NRProbe", '1'))
+        {
+            s.nrs_probe_enable = true;
+            if (nrs_probe_init(ndev, s, line, sizeof line))
+                mgpu::diag::warn("[MGPU][OURS][NRS] NRProbe=1: the numeric readback probe is ON (v2: the bridge's "
+                                 "own copy pattern - 64x4 box, no fence, no wait, read 240 frames later).");
+            else
+                mgpu::diag::warn("[MGPU][OURS][NRS] NRProbe=1 but the probe could not start; the run is otherwise "
+                                 "unaffected.");
+        }
 
         // NATIVE FORMAT, no conversion. P3.1 established DLSS-NR consumes the
         // game's R10G10B10A2 buffer as rendered, so the stream hands it over
@@ -13508,12 +14423,40 @@ namespace
             // loop would put three of them in the hot part of the arm for no
             // extra coverage - any death in any iteration is the same event
             // as far as the next launch is concerned.
+            if (s.nrs_on && s.nrs_color != nullptr && s.nrs_out != nullptr)
+            {
+                // [OURS] NRS step 2, create half. The snippet sizes the network it
+                // builds from the extent it is handed HERE, so the work-sized
+                // binding has to be in place for this call. Values and order copied
+                // from the proxy (proxy_main.cpp:1499-1590): Width/Height and both
+                // subrects at the work extent, Color/Output at our scratch. Depth
+                // and motion vectors keep their own (native) subrects - the proxy
+                // does not rescale them either. Everything is rebound per frame.
+                s.nr_params->Set("DLSSNR.Color", s.nrs_color);
+                s.nr_params->Set("DLSSNR.Output", s.nrs_out);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.nrs_cap_w);
+                s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.nrs_cap_h);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.nrs_cap_w);
+                s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.nrs_cap_h);
+                mgpu::diag::info("[MGPU][OURS][NRS] create-time block: Color/Output on the work scratch, "
+                                 "subrects at the work extent (step 2)");
+            }
             arm_sentinel_set();
             for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
                 // R212: pass 2's own feature at the region's size, when asked.
+                // [OURS] NRS step 2: when the caller-side scale path is on, PASS
+                // 1's feature is built at the WORK extent instead - that is what
+                // tells the snippet how big a network to run, and it is the whole
+                // point of the port. Pass 2's region feature keeps its own size.
                 const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
-                const UINT cw = p2f ? s.p2r_w : s.width, chh = p2f ? s.p2r_h : s.height;
+                const bool nrs1 = s.nrs_on && i == 0u;
+                const UINT cw  = nrs1 ? s.nrs_cap_w : (p2f ? s.p2r_w : s.width);
+                const UINT chh = nrs1 ? s.nrs_cap_h : (p2f ? s.p2r_h : s.height);
                 s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
                 s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
@@ -16486,6 +17429,44 @@ void ui_read(ui_state &out)
     out.fps_produced = s.ui_fps_prod;
     out.fps_consumed = s.ui_fps_cons;
 
+    // ---- [OURS] NRS telemetry + the DISPLAYED frame rate (2026-10-12) ----
+    out.nrs_on = s.nrs_on; out.nrs_live = s.nrs_live;
+    out.nrs_scale = s.nrs_scale; out.nrs_stage = s.nrs_stage_scale;
+    out.nrs_cap = s.nrs_cap_scale;
+    out.nrs_work_w = s.nrs_w; out.nrs_work_h = s.nrs_h;
+    out.nrs_native_w = s.width; out.nrs_native_h = s.height;
+    out.nrs_gain = s.nrs_gain; out.nrs_sharpness = s.nrs_sharpness;
+    out.nrs_color = s.nrs_color_strength; out.nrs_mode = s.nrs_mode;
+    out.nrs_probe_d = s.nrs_probe_last;
+    out.nrs_rebuilds = s.nrs_rebuilds;
+    {
+        LARGE_INTEGER now{}, f{};
+        QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+        if (s.nrs_rebuild_t.QuadPart != 0 && f.QuadPart != 0)
+            out.since_rebuild_ms = (double)(now.QuadPart - s.nrs_rebuild_t.QuadPart) * 1000.0 / (double)f.QuadPart;
+    }
+    // The displayed cadence, from the present ring. PERCENTILES, not a mean: an average
+    // hides exactly the stalls the eye notices, which is why the old pair read wrong.
+    out.present_peek = false;   // (the rooting state lives on the present side; see below)
+    if (s.nrs_on)   // R299: no sort on the panel's thread without NRScale
+    {
+        double v[180]; unsigned n = g_pr_n; if (n > 180u) n = 180u;
+        for (unsigned i = 0; i < n; ++i) v[i] = g_pr_ms[i];
+        for (unsigned i = 1; i < n; ++i) { const double k = v[i]; unsigned j = i; while (j > 0u && v[j-1u] > k) { v[j] = v[j-1u]; --j; } v[j] = k; }
+        out.present_n = n;
+        if (n > 0u)
+        {
+            double sum = 0.0; for (unsigned i = 0; i < n; ++i) sum += v[i];
+            out.present_fps = (sum > 0.0) ? (1000.0 * (double)n / sum) : 0.0;
+            out.present_p50_ms = v[n / 2u];
+            unsigned p99 = (n * 99u) / 100u; if (p99 >= n) p99 = n - 1u;
+            out.present_p99_ms = v[p99];
+            unsigned worst = (n >= 100u) ? (n / 100u) : 1u;
+            double wsum = 0.0; for (unsigned i = n - worst; i < n; ++i) wsum += v[i];
+            out.present_low1_ms = (worst > 0u) ? (wsum / (double)worst) : 0.0;
+        }
+    }
+
     // ---- GPU 1's own timestamps. THE SAME DIVISOR THE P2.2 SUMMARY USES. ----
     // A panel that computes a mean differently from the summary is a second
     // instrument disagreeing with the first, which is how an afternoon goes.
@@ -16626,6 +17607,41 @@ void ui_set_passes(unsigned n)
 // P7.9. Live, from the panel. Values are clamped only where the guide gives a
 // range; the strengths are not documented with one, so they are passed as typed
 // and the log records what was in force.
+// [OURS] NRS (2026-10-12). The panel and the hotkeys drive the neural scale through these.
+// ui_nrs_stage only RECORDS a value under the stream lock: the consumer thread applies it
+// on the next evaluate, and that is also where the rebuild happens. Same rule as the SR
+// staging, same reason - a UI thread must never release an NGX feature the GPU may still
+// be executing against. (It did once; the stream froze on screen with the game running.)
+void ui_nrs_stage(float scale)
+{
+    // Up to 2.00 here; the apply site clamps to NRScaleCap, because that is what the feature
+    // was actually built for.
+    if (!(scale > 0.05f)) return;
+    if (scale > 2.0f) scale = 2.0f;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    s.nrs_stage_scale = scale;
+}
+
+void ui_nrs_set(int which, float v)
+{
+    stream_state &s = str();
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        switch (which)
+        {
+            case 0: s.nrs_gain = v; break;                      // TransferStrength
+            case 1: s.nrs_sharpness = v; break;                 // RCAS
+            case 2: s.nrs_color_strength = v; break;            // ColorStrength
+            case 3: s.nrs_mode = (v >= 0.5f) ? 1u : 0u; break;  // EnlargementMode
+            default: break;
+        }
+    }
+    const char *key = (which == 0) ? "NRDetailGain" : (which == 1) ? "NRSharpness"
+                    : (which == 2) ? "NRColorStrength" : (which == 3) ? "NRMode" : nullptr;
+    if (key != nullptr) (void)ui_ini_write_float(key, v);   // persists: panel and ini cannot drift
+}
+
 void ui_set_tuning(bool on)
 {
     stream_state &s = str();
@@ -16667,6 +17683,19 @@ void ui_set_tuning_value(int which, float v)
     // nobody touched is still identical to every published measurement.
     s.tuning_on = true;
     ++s.intensity_edits;
+    // [OURS] 2026-10-12: AND NOW THEY PERSIST. The arm has always read these keys (P7.9:
+    // Tuning / ToneStrength / StructureStrength / SkinStrength / Style / AutoMask), so the
+    // only thing missing was the write side - which is why a panel change used to vanish on
+    // the next launch. Tuning=1 goes with them, or the next arm reads the values and ignores
+    // them because the group was never enabled.
+    if (s.nrs_on)   // R299: the tuning keys persist only with NRScale set (one key for the contributed path)
+    {
+        const char *fkey = (which == 0) ? "ToneStrength" : (which == 1) ? "StructureStrength"
+                         : (which == 2) ? "SkinStrength"  : (which == 3) ? "Style" : nullptr;
+        if (fkey != nullptr) (void)ui_ini_write_float(fkey, v);
+        else if (which == 4) (void)ui_ini_write("AutoMask", (v != 0.0f) ? 1 : 0);
+        (void)ui_ini_write("Tuning", 1);
+    }
 }
 
 // P8.0. Live from the panel. Nothing is created or destroyed - the texture
@@ -22585,6 +23614,9 @@ void stream_poll()
                     if (p1f_here && s.p1f_fresh[fidx]) rst = 1u;           // R214
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     s.nr_params->Set("DLSSNR.Reset", rst);
+                    // [OURS] NRS: a feature rebuilt by a live scale change has no history;
+                    // the first evaluate on it must discard whatever the module still has.
+                    if (s.nrs_reset_next) { s.nr_params->Set("DLSSNR.Reset", 1u); s.nrs_reset_next = false; }
 
                     const bool p2f = p2r && s.p2r_feature_region;   // R212
                     if (p2f)
@@ -22592,8 +23624,296 @@ void stream_poll()
                         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.p2r_w);
                         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.p2r_h);
                     }
+
+                    // ---- [OURS] NRS step 2: the caller-side scale path ----
+                    //
+                    // Only the plain full-frame pass 1 case takes it. Every other
+                    // shape (region passes, foveated passes, the 16-bit bridge, the
+                    // VR box, partial subrects, skipped frames) keeps its own path
+                    // untouched - those are exactly the cases whose extents this
+                    // code does not own, and guessing there would be how a working
+                    // feature gets broken.
+                    bool nrs_here = s.nrs_on && pi == 0u && sk == 0u && !p2f && !p1f_here &&
+                                    !vr_c && !vr_wh && !nr16_on &&
+                                    ew == s.width && eh == s.height &&
+                                    s.nrs_color != nullptr && s.nrs_out != nullptr;
+                    ID3D12Resource *nrs_anchor = nullptr;
+                    float nrs_mvx0 = 1.0f, nrs_mvy0 = 1.0f;
+                    if (nrs_here)
+                    {
+                        nrs_anchor = nr_color;   // the untouched native frame: the 1:1 anchor
+                        nrs_to(s, s.nrs_color, &s.nrs_color_state,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
+                        nrs_dispatch_down(s, nrs_anchor);
+                        // THE WRITE IS NOT VISIBLE UNTIL THIS BARRIER SAYS IT IS. The
+                        // snippet reads the colour as an SRV on its own schedule; with
+                        // the resource still declared as a UAV it read the allocation's
+                        // original contents - zeros - and denoised black into black.
+                        nrs_to(s, s.nrs_color, &s.nrs_color_state,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false);
+                        nrs_to(s, s.nrs_out, &s.nrs_out_state,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+                        // THE SNIPPET RE-READS Width/Height ON EVERY EVALUATE - that
+                        // is exactly why this file's own region path (R212) sets them
+                        // around its evaluate call. Sizing the feature at create time
+                        // is NOT enough: without these two lines the snippet is told
+                        // the network is native while the colour it is handed is the
+                        // work-sized scratch, the neural pass contributes almost
+                        // nothing, the residual composite then reproduces the native
+                        // frame - and the screen shows the game's own picture with the
+                        // power down, which is precisely what the 22:42 run looked
+                        // like. Found 2026-10-11 from that symptom.
+                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.nrs_w);
+                        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.nrs_h);
+                        s.nr_params->Set("DLSSNR.Color", s.nrs_color);
+                        s.nr_params->Set("DLSSNR.Output", s.nrs_out);
+                        s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+                        s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+                        s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.nrs_w);
+                        s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.nrs_h);
+                        s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+                        s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+                        s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.nrs_w);
+                        s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.nrs_h);
+                        // THE MOTION VECTORS ARE IN NATIVE PIXELS; THE NETWORK IS NOT.
+                        // The proxy multiplies whatever the caller set by work/native
+                        // (proxy_main.cpp:1731 and :1868) and this port was missing it.
+                        // Without it the snippet reprojects with vectors 33% too large,
+                        // its temporal accumulation is wrong, and what it hands back is
+                        // close enough to its own input that the residual composite
+                        // reproduces the native frame - the screen then shows the game's
+                        // own picture while the power still drops. That is exactly the
+                        // 22:42 and 22:48 runs, and it is why the peek hotkey showed no
+                        // difference: there was nothing on screen to see.
+                        (void)s.nr_params->Get("DLSSNR.MVecScaleX", &nrs_mvx0);
+                        (void)s.nr_params->Get("DLSSNR.MVecScaleY", &nrs_mvy0);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", nrs_mvx0 * ((float)s.nrs_w / (float)s.width));
+                        s.nr_params->Set("DLSSNR.MVecScaleY", nrs_mvy0 * ((float)s.nrs_h / (float)s.height));
+                    }
+
+                    // NRS instrument: milliseconds per evaluate at a known work
+                    // extent. This is the one number that CAN be compared across
+                    // games - same network, same card, same size. Fps cannot: it is
+                    // set by whichever card is slower. Power cannot either: the
+                    // neural card's total also pays for the cross-card transport
+                    // and the composition, and those are game dependent.
+                    LARGE_INTEGER nrs_t0{}; LARGE_INTEGER nrs_fq{};
+                    if (nrs_here) { QueryPerformanceFrequency(&nrs_fq); QueryPerformanceCounter(&nrs_t0); }
+
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
+
+                    if (nrs_here)
+                    {
+                        LARGE_INTEGER nrs_t1{}; QueryPerformanceCounter(&nrs_t1);
+                        if (nrs_fq.QuadPart > 0)
+                        {
+                            const double ms = (double)(nrs_t1.QuadPart - nrs_t0.QuadPart) * 1000.0 /
+                                              (double)nrs_fq.QuadPart;
+                            if (s.nrs_ev_n == 0ull || ms < s.nrs_ev_ms_min) s.nrs_ev_ms_min = ms;
+                            if (ms > s.nrs_ev_ms_max) s.nrs_ev_ms_max = ms;
+                            s.nrs_ev_ms_sum += ms;
+                            ++s.nrs_ev_n;
+                            s.nrs_ev_fresh = true;
+                        }
+                        {   // the snippet wrote the work-sized output as a UAV
+                            D3D12_RESOURCE_BARRIER ub{};
+                            ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            ub.UAV.pResource = nr_output;
+                            s.nl->ResourceBarrier(1, &ub);
+                        }
+                        nrs_to(s, s.nrs_color, &s.nrs_color_state,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false);
+                        nrs_to(s, s.nrs_out, &s.nrs_out_state,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true);
+                        ID3D12Resource *nrs_depth = nullptr;
+                        (void)s.nr_params->Get("DLSSNR.Depth", &nrs_depth);
+                        // Depth is a GIFT, not a given: the proxy validates it before
+                        // binding (SRV allowed, and the size must be the native one)
+                        // and falls back to a harmless SRV with hasDepth=0 otherwise.
+                        // An invalid SRV here would be undefined reads in the shader's
+                        // depth-aware branch, i.e. a silently wrong picture.
+                        if (nrs_depth != nullptr)
+                        {
+                            const D3D12_RESOURCE_DESC dd = nrs_depth->GetDesc();
+                            const bool srv_ok = (dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0;
+                            const bool size_ok = ((unsigned)dd.Width == s.width &&
+                                                  dd.Height == s.height);
+                            const bool fmt_ok = (dd.Format == DXGI_FORMAT_R32_FLOAT ||
+                                                 dd.Format == DXGI_FORMAT_D32_FLOAT ||
+                                                 dd.Format == DXGI_FORMAT_R32_TYPELESS);
+                            if (!srv_ok || !size_ok || !fmt_ok)
+                            {
+                                nrs_depth = nullptr;
+                                if (s.nrs_ev_n < 2ull)
+                                    mgpu::diag::warn("[MGPU][OURS][NRS] depth buffer rejected for the "
+                                                     "resolve (srv/size/format) - compositing without the "
+                                                     "silhouette guard, exactly as the proxy does.");
+                            }
+                        }
+                        if (s.nrs_ev_n < 2ull)
+                        {
+                            // One line, once: the structural facts nobody can guess from
+                            // the outside - whether colour and output are the SAME
+                            // resource (the proxy has a whole branch for that case),
+                            // what the motion-vector scale actually became, and what the
+                            // resolve constants are.
+                            char nrl[300];
+                            snprintf(nrl, sizeof nrl,
+                                     "[MGPU][OURS][NRS] bind: in-place=%d anchor==dst=%d mvScale=%.3f/%.3f "
+                                     "depth=%d mode=%u gain=%.2f sharp=%.2f color=%.2f work=%ux%u",
+                                     (nr_color == nr_output) ? 1 : 0,
+                                     (nrs_anchor == nr_output) ? 1 : 0,
+                                     (double)(nrs_mvx0 * ((float)s.nrs_w / (float)s.width)),
+                                     (double)(nrs_mvy0 * ((float)s.nrs_h / (float)s.height)),
+                                     (nrs_depth != nullptr) ? 1 : 0, s.nrs_mode,
+                                     (double)s.nrs_gain, (double)s.nrs_sharpness,
+                                     (double)s.nrs_color_strength, s.nrs_w, s.nrs_h);
+                            mgpu::diag::info(nrl);
+                        }
+                        // The proxy skips its resolve when the model call failed
+                        // ("skip resolve pass to avoid corrupting output"), and it is
+                        // right to: a failed evaluate leaves the small output stale,
+                        // and compositing a stale delta smears the previous frame in.
+                        if (er == NVSDK_NGX_Result_Success)
+                            nrs_dispatch_res(s, nrs_anchor, nr_output, nrs_depth);
+                        nrs_to(s, s.nrs_out, &s.nrs_out_state,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+                        // Put the caller's binding back, exactly as the proxy does:
+                        // the rest of the frame and the next pass expect the native
+                        // resources with the native subrects, not our scratch.
+                        s.nr_params->Set("DLSSNR.Color", nr_color);
+                        s.nr_params->Set("DLSSNR.Output", nr_output);
+                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+                        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+                        s.nr_params->Set("DLSSNR.ColorSubrectBaseX", (unsigned int)rbx);
+                        s.nr_params->Set("DLSSNR.ColorSubrectBaseY", (unsigned int)rby);
+                        s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)rw);
+                        s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)rh);
+                        s.nr_params->Set("DLSSNR.OutputSubrectBaseX", (unsigned int)rbx);
+                        s.nr_params->Set("DLSSNR.OutputSubrectBaseY", (unsigned int)rby);
+                        s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)rw);
+                        s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)rh);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", nrs_mvx0);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", nrs_mvy0);
+
+                        // E2: the numeric probe. Collect the window issued NRS_PROBE_EVERY
+                        // evaluates ago first, then issue this one. The interval was 600
+                        // and that was a design mistake: the first line only appears on
+                        // the SECOND boundary, and a 77-second session never reached it
+                        // (2026-10-11 23:31 run: submit ms printed n=600 once and stopped).
+                        // 120 evaluates is about two seconds of gameplay - short enough
+                        // that no session can fail to produce a reading.
+                        if (s.nrs_probe_ok2 && s.nrs_probe_enable && s.nrs_ev_n > 0ull &&
+                            (s.nrs_ev_n % 240ull) == 0ull)
+                        {
+                            nrs_probe_collect(s);                 // the pair issued 240 evaluates ago
+                            nrs_probe_issue(s, ii, nr_output);    // this frame's pair
+                        }
+
+                        // ---- [OURS] NRS live scale knob -------------------------
+                        // Re-read the keys every 240 evaluates. The constants below are
+                        // picked up by the very next dispatch (they are read from s.nrs_*
+                        // there), so only a SCALE change needs the rebuild - which is what
+                        // nrs_live_recreate is for. This is what makes a one-session sweep
+                        // possible: the driver only has to rewrite mgpu.ini.
+                        if (s.nrs_live)
+                        {
+                            // Free what the fence has passed EVERY frame, not every 240: the
+                            // operator dragged the slider and the rig bogged down, and the reason
+                            // is memory - each rebuild parks an old feature plus two scratch
+                            // textures (at scale 1.17 that is ~90 MB) and NGX allocates its own
+                            // buffers for the new one. A prompt tick keeps the park list near
+                            // empty; see the ceiling on the rebuild below as the second half.
+                            nrs_tick_retired(s);
+                            // Two sources, one path. The panel/hotkey STAGE is checked every
+                            // frame so the UI feels instant; the ini is read every 240
+                            // evaluates so a sweep driver only has to rewrite mgpu.ini.
+                            float want = -1.0f;
+                            bool from_ini = false;
+                            if (s.nrs_stage_scale > 0.05f)
+                            {
+                                // DEBOUNCE, and this is the fix for "dragging it many times makes
+                                // everything slow". Every step of a drag used to be a full rebuild;
+                                // a drag across the range was dozens of rebuilds and gigabytes of
+                                // VRAM waiting on the fence. A staged value now takes effect only
+                                // once it has been STILL for 350 ms - which is also what a person
+                                // expects from a slider: move it, let go, see the result.
+                                LARGE_INTEGER dn{}, df{};
+                                QueryPerformanceCounter(&dn);
+                                QueryPerformanceFrequency(&df);
+                                const double since_ms = (s.nrs_stage_t.QuadPart != 0 && df.QuadPart != 0)
+                                    ? (double)(dn.QuadPart - s.nrs_stage_t.QuadPart) * 1000.0 / (double)df.QuadPart : 0.0;
+                                if (fabsf(s.nrs_stage_scale - s.nrs_stage_seen) > 0.0001f)
+                                {
+                                    s.nrs_stage_seen = s.nrs_stage_scale;   // still moving: restart
+                                    s.nrs_stage_t = dn;
+                                }
+                                else if (since_ms >= 350.0)
+                                {
+                                    want = s.nrs_stage_scale;
+                                    s.nrs_stage_scale = -1.0f;
+                                    s.nrs_stage_seen = -1.0f;
+                                    s.nrs_stage_t.QuadPart = 0;
+                                }
+                            }
+                            else if ((s.nrs_ev_n % 240ull) == 0ull)
+                            {
+                                nrs_tick_retired(s);   // free what the fence has passed
+                                s.nrs_gain           = ini_read_float("NRDetailGain", s.nrs_gain);
+                                s.nrs_sharpness      = ini_read_float("NRSharpness", s.nrs_sharpness);
+                                s.nrs_color_strength = ini_read_float("NRColorStrength", s.nrs_color_strength);
+                                s.nrs_mode           = (unsigned)ini_read_float("NRMode", (float)s.nrs_mode);
+                                want = ini_read_float("NRScale", s.nrs_scale);
+                                if (want > s.nrs_cap_scale) { mgpu::diag::warn("[MGPU][OURS][NRS] NRScale is above NRScaleCap - clamped (the feature is built at the cap; see the arm)."); want = s.nrs_cap_scale; }
+                                from_ini = true;
+                            }
+                            // A staged change is written back to the ini so the panel and the
+                            // ini cannot fight each other on the next tick, and so the
+                            // operator's choice survives the next launch.
+                            if (!from_ini && want > 0.05f) (void)ui_ini_write_float("NRScale", want);
+                            // THE CEILING: never rebuild while two parked generations are still
+                            // waiting on the fence. Forcing a free without the fence is exactly
+                            // what froze the stream on 2026-10-12 00:31, so the rebuild simply
+                            // waits a frame - the tick above drains the list in two or three.
+                            if (s.nrs_park_n < 2u && want > 0.05f && want <= 2.0f && fabsf(want - s.nrs_scale) > 0.005f)
+                            {
+                                unsigned nw = (unsigned)((double)s.width  * (double)want + 0.5);
+                                unsigned nh = (unsigned)((double)s.height * (double)want + 0.5);
+                                nw &= ~1u; nh &= ~1u;
+                                if (nw < 128u) nw = 128u;
+                                if (nh < 128u) nh = 128u;
+                                if (nw > 8192u) nw = 8192u;
+                                if (nh > 8192u) nh = 8192u;
+                                char lv[300];
+                                snprintf(lv, sizeof lv,
+                                         "[MGPU][OURS][NRS] LIVE scale %.3f -> %.3f (work %ux%u -> %ux%u): "
+                                         "resizing the scratch pair, FEATURE NOT REBUILT (built once at the cap)",
+                                         (double)s.nrs_scale, (double)want, s.nrs_w, s.nrs_h, nw, nh);
+                                mgpu::diag::warn(lv);
+                                s.nrs_w = nw; s.nrs_h = nh; s.nrs_scale = want;
+                                if (nrs_live_resize_scratch(s, lv, sizeof lv)) { mgpu::diag::info(lv); ++s.nrs_rebuilds; QueryPerformanceCounter(&s.nrs_rebuild_t); }
+                                else
+                                {
+                                    mgpu::diag::error(lv);
+                                    mgpu::diag::error("[MGPU][OURS][NRS] the live rebuild failed - the NR scale "
+                                                      "path is OFF from here; the stream keeps running.");
+                                    s.nrs_on = false;
+                                }
+                            }
+                        }
+                        if (s.nrs_ev_n % 600ull == 0ull)
+                        {
+                            char nsl[300];
+                            snprintf(nsl, sizeof nsl,
+                                     "[MGPU][OURS][NRS] submit ms (CPU side, NOT the GPU cost - "
+                                     "nr_eval only records work) at work=%ux%u: n=%llu floor=%.3f "
+                                     "mean=%.3f max=%.3f",
+                                     s.nrs_w, s.nrs_h, s.nrs_ev_n, s.nrs_ev_ms_min,
+                                     s.nrs_ev_ms_sum / (double)s.nrs_ev_n, s.nrs_ev_ms_max);
+                            mgpu::diag::info(nsl);
+                        }
+                    }
                     if (p2f)
                     {
                         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
@@ -22949,6 +24269,18 @@ void stream_poll()
                 }
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+
+                // ---- the readback probe's per-frame hook -------------------------
+                // Runs in EVERY configuration, not just ours: collect the pair recorded
+                // 240 frames ago, then record this frame's pair (native in, final image
+                // out). Both copies are the bridge's own pattern - a 64x4 box from a
+                // state this frame already established, and no wait anywhere. See the
+                // block comment over nrs_probe_init and NR_MODULE_SCALING section 12.
+                if (s.nrs_probe_enable && s.nrs_probe_ok2 && (f % 240ull) == 0ull)
+                {
+                    nrs_probe_collect(s);
+                    nrs_probe_issue(s, ii, s.nr_final);
+                }
 
                 if (!s.profile)
                 {
