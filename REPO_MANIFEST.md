@@ -64,16 +64,16 @@ results that had accumulated in it are in `history/RECORD.md`.
 | `src/` | the add\-on sources \- see the module table below |
 | `assets/` | what the artifact is built from, plus `README.txt` |
 | `.github/` | `workflows/build.yml` (CI and packaging), `FUNDING.yml` |
-| `tests/` | adapter selection and ini parser tests, and the script that runs them |
+| `tests/` | adapter selection and ini parser tests, and the script that runs them; the R300 instrument tests, `check_killswitch.py` and `check_hlsl_names.py` |
 | `tools/` | `provenance_scan.py`, the shingle scan behind `THIRD_PARTY.md` |
-| `docs/` | `0.2.0/` run logs for the five titles the README lists, `scenes/` comparison images |
+| `docs/` | `0.2.0/` run logs for the five titles the README lists, `scenes/` comparison images, `R300_T119.md` (the contributed T1.19 revision: parts, keys, tags), `CONTRIBUTED_KEYS.md` (every contributed key) |
 | `reference/` | a sample `ReShade.ini` and a complete `ReShade.log` |
 | `history/` | the working record \- see below |
 | `workarounds/` | unsupported arrangements that worked here. Not part of the add\-on |
 
 ### `src/` \- the modules
 
-One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1.
+One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1, and 2026\-10\-13 for R300.
 
 | Module | What it is |
 | --- | --- |
@@ -102,6 +102,12 @@ One `.cpp`/`.hpp` pair per module. Updated 2026\-10\-09 for 0.3.1.
 | `journal.cpp/.hpp` | what the add\-on did to the game's subsystems, when and why |
 | `stall_watch.cpp/.hpp` | the stall watch (`StallWatch`) |
 | `discovery.cpp/.hpp` | the discovery calibrator (R&D scouting path) |
+| `t119_keys.cpp/.hpp` | R300: the one place the contributed T1.19 keys are read (`docs/R300_T119.md`) |
+| `temporal_diag.cpp/.hpp` | R300a: temporal record and policy (`TemporalDiag` and the policy keys) |
+| `perf_diag.cpp/.hpp` | R300e: GPU 1 job timing and the prefetch experiment (`Perf11`, `PerfPrefetch`) |
+| `feature_diag.cpp/.hpp` | R300f: the scene-feature silence detector (`FeatureDiag`) |
+| `producer_diag.cpp/.hpp` | R300g: the producer's cost on GPU 0 (`ProducerDiag`) |
+| `producer_gpu_timers.cpp/.hpp` | R300h: GPU 0 timestamps around the producer's copies (`Gpu0Timers`) |
 
 ### `history/` \- the working record
 

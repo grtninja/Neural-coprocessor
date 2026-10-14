@@ -87,6 +87,14 @@ add_library(mgpu_bridge SHARED
     # PanelOverPicture (N01950): the live panel over the neural frame. OFF unless
     # PanelOverPicture=1; registers its own ReShade event only then.
     src/live_panel.cpp
+    # R300 - T1.19 (Dom / LordZaxxon), docs/R300_T119.md. Every path OFF unless its mgpu.ini key is set:
+    # t119_keys.cpp is the one place the keys are read (from probe's ini read).
+    src/t119_keys.cpp
+    src/temporal_diag.cpp         # R300a1-R300a8: temporal record + gated policy (TemporalDiag, TemporalMV, ...)
+    src/perf_diag.cpp             # R300e1-R300e6: consumer timing + T1.12 prefetch (Perf11, PerfPrefetch)
+    src/feature_diag.cpp          # R300f1: scene-feature silence detector (FeatureDiag)
+    src/producer_diag.cpp         # R300g1-R300g6: producer (GPU 0) cost bookkeeping (ProducerDiag)
+    src/producer_gpu_timers.cpp   # R300h: GPU 0 timestamps (Gpu0Timers)
 )
 
 target_include_directories(mgpu_bridge PRIVATE
@@ -215,4 +223,13 @@ if(MGPU_BUILD_TESTS)
     )
     add_test(NAME mgpu_adapter_selection_test
              COMMAND mgpu_adapter_selection_test)
+    # T1.19 (Dom): the instruments' state machines, off-device
+    add_executable(mgpu_temporal_diag_test tests/temporal_diag_test.cpp src/temporal_diag.cpp)
+    add_test(NAME mgpu_temporal_diag_test COMMAND mgpu_temporal_diag_test)
+    add_executable(mgpu_perf_diag_test tests/perf_diag_test.cpp src/perf_diag.cpp)
+    add_test(NAME mgpu_perf_diag_test COMMAND mgpu_perf_diag_test)
+    add_executable(mgpu_feature_diag_test tests/feature_diag_test.cpp src/feature_diag.cpp)
+    add_test(NAME mgpu_feature_diag_test COMMAND mgpu_feature_diag_test)
+    add_executable(mgpu_producer_diag_test tests/producer_diag_test.cpp src/producer_diag.cpp)
+    add_test(NAME mgpu_producer_diag_test COMMAND mgpu_producer_diag_test)
 endif()

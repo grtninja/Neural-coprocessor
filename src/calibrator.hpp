@@ -314,6 +314,13 @@ void eval_threads(unsigned long *first, unsigned long *last, unsigned *changes);
 bool game_ngx_init_in_flight();
 bool game_ngx_init_seen();
 
+// R300 (T1.19, Dom). R300f1 (FeatureDiag=1): CreateFeature / ReleaseFeature / Evaluate calls
+// seen so far, any handle. JitterFallback=sync|zero: sets R104's previous-jitter state to the newest
+// game evaluate. R300b (SceneHandleSet=1) is read from t119_keys, no setter.
+unsigned long long feature_creates();
+unsigned long long feature_releases();
+unsigned long long feature_evaluates();
+void sync_jitter_state();
 void set_jitter_mode(int mode);
 
 // ---- R180: the scene-latch repair, and its key ----

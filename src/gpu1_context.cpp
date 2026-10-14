@@ -48,6 +48,12 @@
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
+#include "t119_keys.hpp"         // R300 (T1.19): Dom's keys, every one absent = off
+#include "temporal_diag.hpp"     // R300a1 (Dom, T1.9)
+#include "perf_diag.hpp"         // R300e1 (Dom, T1.11)
+#include "feature_diag.hpp"      // R300f1 (Dom, T1.15)
+#include "producer_diag.hpp"     // R300g1 (Dom, T1.16)
+#include "producer_gpu_timers.hpp"   // R300h (Dom, T1.16)
 #include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 
@@ -398,6 +404,11 @@ std::atomic<bool> g_mvec_x_deciding{false};   // R280j
 // concurrently on another thread is never mistaken for the tap's.
 static thread_local bool t_tap_copy_scope = false;
 void tap_copy_scope(bool on) { t_tap_copy_scope = on; }
+// T1.19 R300d (his R221; SLTagsCapture only). Set by stream_mvec_copy_tagged around its call and read by
+// stream_mvec_copy right around the copy, so the transition to COPY_SOURCE is recorded ONLY when the copy
+// itself is - after every guard in stream_mvec_copy has passed. Key absent: never set, one TLS load per copy.
+static thread_local bool     t_t119_tag_barrier = false;
+static thread_local unsigned t_t119_tag_state = 0u;
 bool game_contract_seen()   // R280k
 {
     if (mgpu::calibrator::game_ngx_init_seen()) return true;
@@ -837,6 +848,17 @@ bool create_present_chain(HWND hwnd)
         }
 
         bool want_dcomp = dcomp_overlay_mode() && g_game_hwnd != nullptr;
+        // T1.19 R300k (DcompNoFallback=1 only). Dom: in composition mode the fall-back bridge window is
+        // never shown (V49), so the fall-back displays nothing AND goes through CreateSwapChainForHwnd,
+        // the call BetterConsole aborts in (his dumps 2026-10-05/08/09). Stop the chain instead.
+        // Key absent: the V49 fall-back below runs exactly as on live.
+        if (mgpu::t119::dcomp_no_fallback() && dcomp_overlay_mode() && g_game_hwnd == nullptr)
+        {
+            mgpu::diag::error("[MGPU][R300k] DcompOverlay is on but the game's HWND was never seen - "
+                              "NO present chain this run (DcompNoFallback=1: no fall-back to a bridge "
+                              "window). The game is unaffected.");
+            return fail("V49 game hwnd never seen", E_FAIL);
+        }
         if (dcomp_overlay_mode() && g_game_hwnd == nullptr)
             mgpu::diag::error("[MGPU][V49] DcompOverlay=1 but the game's HWND was never seen, so "
                               "there is nothing to compose into. Falling back to the bridge's own "
@@ -916,6 +938,20 @@ bool create_present_chain(HWND hwnd)
                     if (d11 != nullptr)   { d11->Release();   d11 = nullptr; }
                     if (dcomp != nullptr) { dcomp->Release(); dcomp = nullptr; }
                     want_dcomp = false;
+                    // T1.19 R300k (DcompNoFallback=1 only): same rule as above. Key absent: V71 demotes as on live.
+                    if (mgpu::t119::dcomp_no_fallback())
+                    {
+                        if (sc1 != nullptr) { sc1->Release(); sc1 = nullptr; }
+                        char w19[420];
+                        snprintf(w19, sizeof w19,
+                                 "[MGPU][R300k] no composition device ON GPU 1 (EnumAdapterByLuid "
+                                 "hr=0x%08X, D3D11CreateDevice hr=0x%08X) - NO present chain this "
+                                 "run (DcompNoFallback=1: no fall-back to a bridge window). "
+                                 "The game is unaffected.",
+                                 (unsigned)adapter_hr, (unsigned)d11_hr);
+                        mgpu::diag::error(w19);
+                        return fail("V71 composition device not on GPU 1", E_FAIL);
+                    }
                 }
             }
             if (!want_dcomp)
@@ -1039,6 +1075,12 @@ bool create_present_chain(HWND hwnd)
 
         if (!want_dcomp)
         {
+        // T1.18 R300j (BetterConsoleGuard=1 only). Say it before it happens: if this is the last line of a
+        // log and BetterConsole is resident, the abort is the known one.
+        if (mgpu::t119::better_console_guard() && GetModuleHandleW(L"BetterConsole.dll") != nullptr)
+            mgpu::diag::warn("[MGPU][R300j] entering CreateSwapChainForHwnd WITH BetterConsole.dll "
+                             "resident. IF THIS IS THE LAST LINE, IT ABORTED INSIDE BetterConsole "
+                             "(stack: ReShade dxgi -> sl.interposer -> BetterConsole -> abort).");
         swapchain_hr = factory->CreateSwapChainForHwnd(
             static_cast<IUnknown *>(queue), hwnd, &scd, nullptr, nullptr, &sc1);
         if (FAILED(swapchain_hr))
@@ -14081,6 +14123,11 @@ namespace
                 }
             }
         }
+        // R300 (T1.19): Dom's instruments are configured at arm ONLY when their key is set. All
+        // keys absent: nothing here runs and none of [R300a4] [R300e4] [R300g6] is logged.
+        if (mgpu::t119::temporal_active()) mgpu::tdiag::configure(mgpu::t119::temporal_config());   // R300a4
+        if (mgpu::t119::perf_active())     mgpu::perf::configure(mgpu::t119::perf_config());        // R300e4
+        if (mgpu::t119::producer_active()) mgpu::pdiag::configure(mgpu::t119::producer_config());   // R300g6
         // R217: late-frame vectors. Absent: NR multiplies (R87) and SR is
         // handed the vectors as they are - the shipped behaviour.
         {
@@ -16057,6 +16104,46 @@ bool dcomp_overlay_mode()
         if (out) mgpu::diag::info(v55);
         else     mgpu::diag::warn(v55);
     }
+    // ---- T1.18 R300j (BetterConsoleGuard=1 only): BETTERCONSOLE GUARD ----
+    //
+    // Dom's three SFSE crash dumps (2026-10-05 19:18, 10-08 20:59, 10-09 14:32) carry the SAME stack
+    // on the bridge thread: add-on -> ReShade dxgi.dll -> sl.interposer -> BetterConsole.dll -> abort(),
+    // each time while the bridge built its OWN WINDOW chain (CreateSwapChainForHwnd). The composition
+    // path (CreateSwapChainForComposition) is a different call and is not on BetterConsole's hook.
+    // So with the key set and BetterConsole resident, a refusal above is turned into composition -
+    // unless DcompOverlay=0 was written explicitly or the desktop is duplicated / unreadable.
+    // NOTE (0.3.1): R273 refuses composition when the display under the game's window is on the GAME's
+    // card, because the neural frame would travel back across the bus. Forcing it here accepts that
+    // cost to avoid the abort. Key absent: nothing here runs.
+    if (out == 0 && mgpu::t119::better_console_guard() && GetModuleHandleW(L"BetterConsole.dll") != nullptr)
+    {
+        const unsigned bc_paths = dispcfg::active_paths();
+        const bool bc_dup = (bc_paths >= 2u) && dispcfg::duplicated();
+        if (want == 0)
+            mgpu::diag::warn("[MGPU][R300j] BetterConsole.dll is loaded but DcompOverlay=0 was written "
+                             "explicitly, so it is respected: the bridge builds its OWN WINDOW chain, "
+                             "the call that aborted inside BetterConsole three times. Remove "
+                             "DcompOverlay=0 (or disable BetterConsole) to avoid it.");
+        else if (bc_paths == 0u || bc_dup)
+            mgpu::diag::error("[MGPU][R300j] BetterConsole.dll is loaded and the composition mode cannot be "
+                              "forced (display configuration unreadable or DUPLICATED). The bridge builds "
+                              "its OWN WINDOW chain - the call that aborted inside BetterConsole three "
+                              "times. Disable BetterConsole for MGPU runs.");
+        else
+        {
+            out = 1;
+            char bc1[700];
+            snprintf(bc1, sizeof bc1,
+                     "[MGPU][R300j] BetterConsole.dll is loaded -> DcompOverlay FORCED ON (%u active display "
+                     "path(s), extended desktop; BetterConsoleGuard=1). The bridge will NOT call "
+                     "CreateSwapChainForHwnd: that call aborted the game inside BetterConsole on 2026-10-05, "
+                     "10-08 and 10-09. The neural frame is composed onto the GAME's window, even where [R273] "
+                     "refused it (bus cost accepted).",
+                     bc_paths);
+            mgpu::diag::warn(bc1);
+        }
+    }
+
     latched.store(out, std::memory_order_relaxed);
     return out != 0;
 }
@@ -16707,6 +16794,12 @@ void stream_shutdown()
     // the lock. Runs even when the stream was never armed, and is itself
     // idempotent.
     reflex::restore();
+    // T1.19: Dom's run-end summaries, each only with its key.
+    if (mgpu::t119::temporal_active()) mgpu::tdiag::final_summary();          // R300a2
+    if (mgpu::t119::perf_active())     mgpu::perf::final_summary();           // R300e2
+    if (mgpu::t119::feature_diag())    mgpu::feature_diag::final_summary();   // R300f1
+    if (mgpu::t119::producer_active()) mgpu::pdiag::final_summary();          // R300g1
+    if (mgpu::t119::gpu0_timers())     mgpu::p0t::shutdown();                 // R300h
 
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
@@ -16928,6 +17021,12 @@ bool ui_ini_write_float(const char *key, float value)
     char v[32];
     snprintf(v, sizeof v, "%.2f", (double)value);
     return ini_write_text(key, v);
+}
+
+// T1.19 (Dom, T1.17): a word value through the same line-anchored writer. Used only by PanelPersist=1.
+bool ui_ini_write_word(const char *key, const char *value)
+{
+    return (key != nullptr && value != nullptr) ? ini_write_text(key, value) : false;
 }
 
 // R219. The same parse as the arm's R216/R218 block, on the file as it is now.
@@ -17428,6 +17527,14 @@ void ui_read(ui_state &out)
     }
     out.fps_produced = s.ui_fps_prod;
     out.fps_consumed = s.ui_fps_cons;
+    if (mgpu::t119::panel_stats())   // T1.17 (PanelStats=1): derived figures for the panel only
+    {
+        out.slot_bytes_live = (unsigned long long)s.slot_bytes;
+        out.bus_requested_mib_s = (double)s.slot_bytes * out.fps_produced / (1024.0 * 1024.0);
+        out.bus_consumed_mib_s = (double)s.slot_bytes * out.fps_consumed / (1024.0 * 1024.0);
+        for (unsigned q = 0; q < 8; ++q) out.mv_age[q] = s.mvec_elapsed_hist[q];
+        out.mv_age_worst = s.mvec_elapsed_max;
+    }
 
     // ---- [OURS] NRS telemetry + the DISPLAYED frame rate (2026-10-12) ----
     out.nrs_on = s.nrs_on; out.nrs_live = s.nrs_live;
@@ -17572,6 +17679,7 @@ void ui_set_preset(int mode)
                                 ? "Pass 1 at 2.00, every other pass at 0.10."
                                 : "The LAST pass at 2.00, every other pass at 0.10."));
     mgpu::diag::info(l);
+    if (mgpu::t119::panel_persist()) ui_ini_write_word("Preset", mode == 1 ? "front" : (mode == 2 ? "back" : "manual"));   // T1.17
 }
 
 void ui_set_passes(unsigned n)
@@ -17602,6 +17710,7 @@ void ui_set_passes(unsigned n)
              "created at arm, so nothing is built or torn down here.",
              was, n, stream_state::MAX_PASSES);
     mgpu::diag::info(l);
+    if (mgpu::t119::panel_persist()) ui_ini_write("Passes", (int)n);   // T1.17
 }
 
 // P7.9. Live, from the panel. Values are clamped only where the guide gives a
@@ -17662,6 +17771,7 @@ void ui_set_tuning(bool on)
              "published ones, which were all taken with these unset.",
              on ? "ON" : "OFF", tone, structure, skin, style, mask ? 1u : 0u);
     mgpu::diag::info(l);
+    if (mgpu::t119::panel_persist()) ui_ini_write("Tuning", on ? 1 : 0);   // T1.17
 }
 
 void ui_set_tuning_value(int which, float v)
@@ -17688,7 +17798,7 @@ void ui_set_tuning_value(int which, float v)
     // only thing missing was the write side - which is why a panel change used to vanish on
     // the next launch. Tuning=1 goes with them, or the next arm reads the values and ignores
     // them because the group was never enabled.
-    if (s.nrs_on)   // R299: the tuning keys persist only with NRScale set (one key for the contributed path)
+    if (s.nrs_on || mgpu::t119::panel_persist())   // R299 (NRScale set) or T1.17 (PanelPersist=1): the tuning keys persist
     {
         const char *fkey = (which == 0) ? "ToneStrength" : (which == 1) ? "StructureStrength"
                          : (which == 2) ? "SkinStrength"  : (which == 3) ? "Style" : nullptr;
@@ -17795,6 +17905,18 @@ void ui_set_intensity(unsigned pass_1based, float v)
     // Silently keeping the preset label over hand-edited numbers is how a run
     // gets recorded as back-loaded when it is not.
     s.preset = 0;
+    if (mgpu::t119::panel_persist())   // T1.17
+    {
+        if (pass_1based == 0) {
+            ui_ini_write_float("Intensity", v);
+            ui_ini_write_float("Intensity1", v);
+            ui_ini_write_float("Intensity2", v);
+        } else {
+            char key[32]; snprintf(key, sizeof key, "Intensity%u", pass_1based);
+            ui_ini_write_float(key, v);
+        }
+        ui_ini_write_word("Preset", "manual");
+    }
 }
 
 // P7.5. Move the split seam. `dir` is -1 (left) or +1 (right); `coarse` takes
@@ -17832,6 +17954,7 @@ void ui_set_split_pos(float v)
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
     s.split_pos = v;
+    if (mgpu::t119::panel_persist()) ui_ini_write_float("SplitPos", v);   // T1.17
 }
 
 // P7.4. The present mode, LIVE. 0 nr, 1 in, 2 split.
@@ -17861,6 +17984,7 @@ void ui_set_present_mode(int mode)
              "copy into the bridge backbuffer changes.",
              nm[was], nm[mode]);
     mgpu::diag::info(l);
+    if (mgpu::t119::panel_persist()) ui_ini_write_word("Present", mode == 1 ? "in" : (mode == 2 ? "split" : "nr"));   // T1.17
 }
 
 void ui_set_neural(bool on)
@@ -17880,6 +18004,7 @@ void ui_set_neural(bool on)
     snprintf(l, sizeof l, "[MGPU][P6.4] neural stage %s (handles kept alive either way)",
              on ? "ON" : "OFF - transport only, the window shows the last neural frame");
     mgpu::diag::info(l);
+    if (mgpu::t119::panel_persist()) ui_ini_write("Neural", on ? 1 : 0);   // T1.17
 }
 
 // Cycle which pass the steps act on: all -> 1 -> 2 -> ... -> passes -> all.
@@ -17933,6 +18058,24 @@ void intensity_step(int dir)
                  "%s", s.armed ? " (live from the next frame)"
                                : " (stream not armed yet - this is the starting value)");
     mgpu::diag::info(l);
+
+    // T1.17-PERSIST (PanelPersist=1 only): keyboard intensity edits survive the next launch, like the
+    // overlay's. All active pass values, and the preset switched to manual, or a front/back preset would
+    // override the saved intensities on the next arm.
+    if (mgpu::t119::panel_persist())
+    {
+        bool saved = true;
+        for (unsigned i = 0; i < n; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "Intensity%u", i + 1);
+            if (!ui_ini_write_float(key, s.intensity[i])) saved = false;
+        }
+        if (n > 0 && !ui_ini_write_float("Intensity", s.intensity[0])) saved = false;
+        if (!ui_ini_write_word("Preset", "manual")) saved = false;
+        if (!saved)
+            mgpu::diag::error("[MGPU][R300m] Hotkey intensity changed live but could NOT be saved to mgpu.ini.");
+    }
 }
 
 // R227. See the header. One flag, one reason, read at stream_request.
@@ -17988,6 +18131,7 @@ void stream_request()
     s.max_frames = stream_read_frames();
     s.profile = stream_read_profile();
     s.present_mode = ini_read_present_mode();
+    if (mgpu::t119::panel_persist()) s.split_pos = ini_read_named_float("SplitPos", s.split_pos);   // T1.17 (PanelPersist=1)
     // P8.0. Mode 2 has no estimator in this build; say so rather than behaving
     // like mode 0 in silence, which is the failure shape this project keeps
     // paying for.
@@ -19558,6 +19702,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (SUCCEEDED(h))
             h = gdev->CreateSharedHandle(s.gfence, nullptr, GENERIC_ALL, nullptr,
                                          &s.gfence_share);
+        // R300h (T1.16a, Gpu0Timers=1 only): GPU 0 timestamps on the game's device. A failure only turns
+        // the measurement off. Read from the key here, not from a module configured later (Dom's T1.16 defect).
+        if (SUCCEEDED(h) && mgpu::t119::gpu0_timers()) (void)mgpu::p0t::init(gdev, gq);
 
         ID3D12Device *ndev = nullptr;
         {
@@ -20282,6 +20429,17 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // and the metric would quietly under-report the true motion gap. This is
     // the right unit, recorded where the seal is written.
     s.slot_game_frame[slot] = s.game_frames;
+    // R300 (T1.19): Dom's per-seal stamps, each only with its key.
+    if (mgpu::t119::temporal_active())
+        mgpu::tdiag::note_seal(slot, fi, s.game_frames, seal.mvec_valid != 0u, s.depth_slot_valid[slot] != 0u);   // R300a1
+    if (mgpu::t119::perf_active()) mgpu::perf::note_seal(slot, fi);   // R300e1: producer clock for the age counters
+    if (mgpu::t119::feature_diag())
+    {   // R300f1: has the game stopped evaluating its scene feature? One table read per frame.
+        mgpu::calibrator::table fct;
+        if (mgpu::calibrator::read(fct))
+            mgpu::feature_diag::observe(s.game_frames, fct.evals, mgpu::calibrator::feature_evaluates(),
+                                        mgpu::calibrator::feature_creates(), mgpu::calibrator::feature_releases());
+    }
 
     // Fault injection. Each of these corrupts exactly one field, so the
     // checker's diagnosis names the field it was given. Absent = none.
@@ -20295,6 +20453,10 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Seal first, payload second, in one list. Command-list order guarantees
     // the seal is written before the pixels within the same submission, and the
     // single fence signal covers both.
+    // R300g1/R300h (ProducerDiag=1 / Gpu0Timers=1 only): CPU recording cost and GPU 0 timestamps of this block.
+    const bool t119_pd = mgpu::t119::producer_active();
+    LARGE_INTEGER pq0{};
+    if (t119_pd) { QueryPerformanceCounter(&pq0); mgpu::p0t::mark(gl, fi, 0); }
     gl->CopyBufferRegion(s.gxfer, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
 
     D3D12_RESOURCE_BARRIER b{};
@@ -20310,6 +20472,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     cs.SubresourceIndex = 0;
     cd.pResource = s.gxfer; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     cd.PlacedFootprint = s.fp; cd.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
+    if (t119_pd) mgpu::p0t::mark(gl, fi, 1);   // R300h: after the first barrier, before the colour copy
     gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
 
     // Restore EXACTLY. The game did not ask us to change its resource state and
@@ -20330,6 +20493,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // The colour copy above transitions the game's own back buffer and is
     // therefore raw. The two are not the same case and are not written the
     // same way.
+    if (t119_pd) mgpu::p0t::mark(gl, fi, 2);   // R300h: after the colour copy and the barrier back
     if (depth_ok && dsrc != nullptr)
     {
         D3D12_TEXTURE_COPY_LOCATION ds{}, dt{};
@@ -20343,6 +20507,15 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         gl->CopyTextureRegion(&dt, 0, 0, 0, &ds, nullptr);
     }
 
+    if (t119_pd)
+    {   // R300h end mark + resolve; R300g1 recording cost and the volume this frame puts on the bus
+        mgpu::p0t::mark(gl, fi, 3);
+        mgpu::p0t::resolve_frame(gl, fi);
+        LARGE_INTEGER pq1{}; QueryPerformanceCounter(&pq1);
+        mgpu::pdiag::note_cpu_record(0, (double)(pq1.QuadPart - pq0.QuadPart) * 1000.0 / (double)s.freq.QuadPart);
+        mgpu::pdiag::note_sealed(fi, (unsigned long long)seal.payload_bytes + (depth_ok ? (unsigned long long)s.depth_bytes : 0ull),
+                                 (seal.mvec_valid != 0u) ? (unsigned long long)s.mvec_bytes2 : 0ull);
+    }
     s.produced = fi;
     s.produced_a.store(fi, std::memory_order_release);   // R88: the lock-free mirror
 
@@ -20455,6 +20628,18 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     const unsigned slot =
         (unsigned)(s.produced_a.load(std::memory_order_acquire) % stream_state::RING);
     const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
+    // R300 (T1.19), each only with its key.
+    const unsigned long long t119_mfi = s.produced_a.load(std::memory_order_acquire) + 1ull;   // the seal this vector travels with
+    if (mgpu::t119::temporal_active())
+    {
+        mgpu::tdiag::note_mvec_copy(slot, t119_mfi);   // R300a1
+        mgpu::calibrator::table jt;                    // R300a7: the game's jitter for THIS evaluate
+        if (mgpu::calibrator::read(jt) && (jt.have & mgpu::calibrator::KEY_JITTER) != 0u)
+            mgpu::tdiag::note_jitter(slot, t119_mfi, jt.jitter_x, jt.jitter_y, jt.mv_jittered, s.mvec_w, s.mvec_h);
+    }
+    const bool t119_pd = mgpu::t119::producer_active();
+    LARGE_INTEGER mq0{};
+    if (t119_pd) QueryPerformanceCounter(&mq0);   // R300g1
 
     D3D12_TEXTURE_COPY_LOCATION ms{}, mt{};
     ms.pResource = msrc;
@@ -20464,7 +20649,31 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     mt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     mt.PlacedFootprint = s.mvec_fp2;
     mt.PlacedFootprint.Offset = slot_off + s.mvec_off;
+    if (t119_pd) mgpu::p0t::mark(gl, t119_mfi, 4);   // R300h: MVec begin
+    D3D12_RESOURCE_BARRIER t119_b{};                  // R300d: only with SLTagsCapture, see t_t119_tag_barrier
+    if (t_t119_tag_barrier)
+    {
+        t119_b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        t119_b.Transition.pResource = msrc;
+        t119_b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        t119_b.Transition.StateBefore = (D3D12_RESOURCE_STATES)t_t119_tag_state;
+        t119_b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        gl->ResourceBarrier(1, &t119_b);
+    }
     gl->CopyTextureRegion(&mt, 0, 0, 0, &ms, nullptr);
+    if (t_t119_tag_barrier)
+    {   // restore exactly the state the game declared
+        t119_b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        t119_b.Transition.StateAfter = (D3D12_RESOURCE_STATES)t_t119_tag_state;
+        gl->ResourceBarrier(1, &t119_b);
+    }
+    if (t119_pd)
+    {
+        mgpu::p0t::mark(gl, t119_mfi, 5);             // R300h: MVec end
+        mgpu::p0t::note_mvec_recorded(t119_mfi);
+        LARGE_INTEGER mq1{}; QueryPerformanceCounter(&mq1);
+        mgpu::pdiag::note_cpu_record(1, (double)(mq1.QuadPart - mq0.QuadPart) * 1000.0 / (double)s.freq.QuadPart);
+    }
 
     // Counted ONCE per frame even if the engine binds the target twice, so
     // that copies + missing equals the number of frames sealed and a
@@ -20478,6 +20687,67 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     s.mvec_slot_valid[slot].store(1u, std::memory_order_release);
     // D2.0 NR step one: record that this slot got its copy. Off: one load.
     if (mgpu::fgmap::on()) mgpu::fgmap::on_mvec_copy(slot);
+}
+
+// ---- R300d (Dom's R221, T1.5): STREAMLINE-TAGGED MVEC CAPTURE AT TAG TIME. SLTagsCapture=1|2 ONLY ----
+//
+// Dom: SLT1 gives, at one point in time, the game's declared resource, its declared D3D12 state, its
+// lifecycle and the command list the producer work is ordered on. NVIDIA allows eOnlyValidNow resources
+// to stop being valid after tagging, so a later barrier can be too late even with the right identity.
+// This records the SAME slot copy (stream_mvec_copy, the single copy implementation) at that moment.
+//
+// Adapted for 0.3.1 (R300):
+//   - the state transition is recorded INSIDE stream_mvec_copy, right around the copy, only when every
+//     guard there passed (live, MVec=3, lock, size). T1.19 recorded it around the call, so a skipped
+//     copy still left a barrier pair on the game's list.
+//   - sl::Resource.state == UINT_MAX (Streamline's "not set") is skipped: there is no state to restore.
+//   - SLTagsCapture=1 takes eOnlyValidNow tags only; the header says the declared state has to hold
+//     "when tagged resources are actually used", which for the other lifecycles need not be the tag
+//     point. SLTagsCapture=2 takes every lifecycle, which is T1.19's behaviour.
+//   - These copies are not made by the tap, so R289 counts them as the game's own route
+//     (mvec_copies_own). They are the game's declared vectors, so that reading holds; recorded here
+//     because it changes what R289 sees when the key is on.
+void stream_mvec_copy_tagged(void *cmd_list_v, unsigned long long mvec_handle,
+                             unsigned declared_state, int lifecycle)
+{
+    const int mode = mgpu::t119::sltags_capture();
+    if (mode == 0 || cmd_list_v == nullptr || mvec_handle == 0ull) return;
+    static std::atomic<bool> said_unset{false}, said_life{false}, said{false};
+    if (declared_state == 0xFFFFFFFFu)
+    {
+        if (!said_unset.exchange(true))
+            mgpu::diag::warn("[MGPU][R300d] TAG-TIME MVEC CAPTURE SKIPPED: the game tagged its MotionVectors with "
+                             "sl::Resource.state unset (UINT_MAX), so there is no state to transition from or "
+                             "restore. The barrier / evaluate routes are unchanged.");
+        return;
+    }
+    if (mode == 1 && lifecycle != 0)
+    {
+        if (!said_life.exchange(true))
+        {
+            char l[360];
+            snprintf(l, sizeof l,
+                     "[MGPU][R300d] TAG-TIME MVEC CAPTURE SKIPPED: SLTagsCapture=1 takes eOnlyValidNow tags only and "
+                     "this one is lifecycle=%d. SLTagsCapture=2 takes every lifecycle (T1.19's behaviour).", lifecycle);
+            mgpu::diag::info(l);
+        }
+        return;
+    }
+    t_t119_tag_state = declared_state;
+    t_t119_tag_barrier = (declared_state != (unsigned)D3D12_RESOURCE_STATE_COPY_SOURCE);
+    stream_mvec_copy(cmd_list_v, mvec_handle);
+    t_t119_tag_barrier = false;
+    if (!said.exchange(true))
+    {
+        char l[520];
+        snprintf(l, sizeof l,
+                 "[MGPU][R300d] TAG-TIME MVEC CAPTURE ACTIVE (SLTagsCapture=%d): resource=0x%llx state=0x%X "
+                 "lifecycle=%d. The copy is recorded on the game's slSetTag command list through the same "
+                 "stream_mvec_copy; the transition is recorded only when that copy is, and the declared state "
+                 "is restored. No new queue, fence or transport.",
+                 mode, mvec_handle, declared_state, lifecycle);
+        mgpu::diag::info(l);
+    }
 }
 
 // ---- R26: the cross-adapter unpack, on GPU 1's dedicated COPY queue ----
@@ -20859,6 +21129,12 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
                 if (sane)
                 {
+                    if (mgpu::t119::perf_active())
+                    {   // R300e1: this job's own GPU1 timestamps, ms - pre-NGX (seal copy + unpack), NGX evaluate, output
+                        const double kms = 1000.0 / (double)s.ts_freq;
+                        mgpu::perf::note_gpu((double)(tv[2] - tv[0]) * kms, (double)(tv[3] - tv[2]) * kms,
+                                             (double)(tv[4] - tv[3]) * kms, s.cc_state == 1u || s.cc_state == 2u);
+                    }
                     for (UINT i = 0; i + 1 < stream_state::TS_MARKS; ++i)
                     {
                         const double ms = (double)(tv[i + 1] - tv[i]) * 1000.0
@@ -21041,6 +21317,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     if (cms < s.cq_ts_min) s.cq_ts_min = cms;
                     if (cms > s.cq_ts_max) s.cq_ts_max = cms;
                     ++s.cq_ts_n;
+                    if (mgpu::t119::perf_active()) mgpu::perf::note_cq_copy(cms, (double)s.slot_bytes);   // R300e5
                 }
                 D3D12_RANGE cn{0, 0};
                 s.cq_tsread->Unmap(0, &cn);
@@ -21762,6 +22039,15 @@ void stream_poll()
     sfdiag::hold_timer r168_poll(sfdiag::SITE_POLL);
     if (!s.armed || s.summarised) return;
 
+    if (mgpu::t119::producer_active() && s.gfence != nullptr)
+    {   // R300g1/R300g4/R300h (ProducerDiag / Gpu0Timers only): non-blocking. GetCompletedValue() never waits.
+        mgpu::p0t::poll((unsigned long long)s.gfence->GetCompletedValue());
+        mgpu::pdiag::backlog bk{};
+        for (int bi = 0; bi < 8; ++bi) bk.hist[bi] = s.q_hist[bi];
+        bk.sum = s.q_sum; bk.n = s.q_n; bk.max = s.q_max;
+        mgpu::pdiag::periodic(s.produced, bk);
+    }
+
     // ---- V28: THE INNER LOOP. Decide, then fall through to the commit. ----
     //
     // Runs BEFORE the rebuild block on purpose: a decision made here is
@@ -22089,14 +22375,21 @@ void stream_poll()
     // transport, and this is neither - it is the consumer choosing the newest
     // frame on purpose. Conflating the three would turn a working feature into
     // a scary summary.
+    // T1.12 (PerfPrefetch=1 with Perf11=1 only): the frame the loop below works up to - the frame the copy
+    // queue already armed instead of the newest. Key absent: sched_to == completed, the live loop exactly.
+    // Overrun detection keeps `completed`.
+    const unsigned long long sched_to = mgpu::t119::prefetch_active()
+        ? mgpu::perf::sched_target(completed, s.consumed, s.cq_issued,
+                                   s.copy_queue && s.cq_gated && s.cq != nullptr, s.finished)
+        : completed;
     if (s.rw_at == 0ull)
     {
         s.rw_at = s.consumed;
         s.rw_over_at = s.overrun;
     }
-    if (s.rw_on != 0u && completed > s.consumed + (unsigned long long)s.rw)
+    if (s.rw_on != 0u && sched_to > s.consumed + (unsigned long long)s.rw)
     {
-        const unsigned long long target = completed - (unsigned long long)s.rw;
+        const unsigned long long target = sched_to - (unsigned long long)s.rw;
         s.rw_skipped += target - s.consumed;
         s.consumed = target;
         // THE SKIP MUST NOT READ AS A DROP. last_seen is what the seal checker
@@ -22175,9 +22468,9 @@ void stream_poll()
     //
     // WHAT THIS DOES NOT CHANGE: which frame is evaluated, and which frame
     // reaches the screen. Both were already the newest and both still are.
-    if (s.consumed + 1 < completed)
+    if (s.consumed + 1 < sched_to)
     {
-        const unsigned long long bulk_last = completed - 1;
+        const unsigned long long bulk_last = sched_to - 1;
         unsigned long long bfi[stream_state::RING] = {};
         unsigned           bsl[stream_state::RING] = {};
         unsigned           n = 0;
@@ -22240,7 +22533,7 @@ void stream_poll()
         }
     }
 
-    while (s.consumed < completed)
+    while (s.consumed < sched_to)
     {
         const unsigned long long f = s.consumed + 1;
 
@@ -22299,7 +22592,7 @@ void stream_poll()
         // DECLARED HERE, at the frame's scope, NOT inside the command-list
         // block below: the timestamp read and the liveness sample both test it
         // and both live after that block closes.
-        const bool newest = (f >= completed);
+        const bool newest = (f >= sched_to);   // T1.12: == completed unless PerfPrefetch=1
         // ---- D2.0 NR2 / NR3: is this seal a generated frame? ----
         //
         // The N1 map (2026-10-05): frame generation reads the same vector
@@ -22324,6 +22617,9 @@ void stream_poll()
         const bool fg_thin = fg_gen && mgpu::fgmap::thin_this();
         const bool run_nr = s.nr_ok && newest && s.neural && !fg_thin;
         if (!newest) ++s.nr_skipped;
+        if (mgpu::t119::perf_active())
+            mgpu::perf::job_begin(f, slot, completed, run_nr, newest, s.game_frames, s.slot_game_frame[slot]);   // R300e1
+        if (run_nr && mgpu::t119::producer_active()) mgpu::pdiag::note_evaluated(f);   // R300g3
 
         // ---- R26: the unpack goes to the COPY queue, one frame ahead when
         // there is a frame to go ahead to ----
@@ -22360,6 +22656,7 @@ void stream_poll()
         {
             ii = (unsigned)(f & 1ull);
             // Never re-issue for a frame the overrun check already walked past.
+            if (mgpu::t119::perf_active()) mgpu::perf::note_cq_state(s.cq_issued >= f);   // R300e1/R300e5
             if (s.cq_issued + 1 < f) s.cq_issued = f - 1;
             // MODE 1: only ever arm a frame the CPU already knows has landed,
             // so the overlap needs a backlog and a paced run gets none.
@@ -22372,15 +22669,22 @@ void stream_poll()
             // STILL EXACTLY ONE AHEAD IN BOTH MODES. tex_in has two halves;
             // f+2 would land in the one frame f is reading. The bound and the
             // pair are the same fact and neither mode may exceed it.
-            const unsigned long long want = (s.cq_gated || completed > f) ? (f + 1) : f;
+            unsigned long long want = (s.cq_gated || completed > f) ? (f + 1) : f;
+            // T1.12 (PerfPrefetch=1 only): arm the first frame that will ARRIVE after now, on the parity the
+            // running evaluate is not reading, and spend no DMA on frames in between that will not be evaluated.
+            const bool pf_on = mgpu::t119::prefetch_active();
+            const unsigned long long arm_n = pf_on ? mgpu::perf::arm_target(completed, f) : 0ull;
+            if (pf_on && arm_n > want) want = arm_n;
             bool ok = true;
             while (ok && s.cq_issued < want)
             {
-                const unsigned long long n = s.cq_issued + 1;
+                unsigned long long n = s.cq_issued + 1;
+                if (pf_on && n > f && n < arm_n) n = arm_n;   // T1.12: jump over frames that will not be evaluated
                 ok = stream_cq_submit(s, n);
                 if (ok)
                 {
                     s.cq_issued = n;
+                    if (mgpu::t119::perf_active()) mgpu::perf::note_cq_issue();   // R300e5
                     if (n > f) ++s.cq_ahead;
                     if (n > completed) ++s.cq_spec;   // armed before arrival - mode 2 only
                 }
@@ -23274,6 +23578,46 @@ void stream_poll()
                     }
                 }
                 const bool cv_nr_on = cv_ran && s.cv_nr != 0u;
+                // R300a1 / R300a7 (T1.19, any temporal key only). Keys absent: nothing is called and tdec / jout
+                // keep their inert values - k = the live multiply, no reset, bind, the author's R104 jitter.
+                const bool t119_temporal = mgpu::t119::temporal_active();
+                mgpu::tdiag::decision tdec;
+                mgpu::tdiag::jitter_out jout;
+                if (t119_temporal)
+                {
+                    mgpu::tdiag::eval_in ti;
+                    ti.sealed_id = f; ti.slot = slot; ti.game_frame = gnow;
+                    ti.cur_game_frame = s.game_frames;
+                    ti.prev_eval_gf = (gnow > mv_elapsed) ? gnow - mv_elapsed : 0ull;
+                    ti.produced = s.produced; ti.elapsed = (unsigned)mv_elapsed;
+                    ti.mvec_valid_live = s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u;
+                    { bool known = false;
+                      const bool sv = mgpu::tdiag::seal_mvec_valid(slot, f, known);
+                      ti.mvec_valid_seal = known ? sv : ti.mvec_valid_live; ti.seal_known = known; }
+                    ti.depth_valid = s.depth_slot_valid[slot] != 0u;
+                    float tsx = s.mvec_scale_x, tsy = s.mvec_scale_y;
+                    mgpu::calibrator::override_scale(tsx, tsy);   // same R105 value NR is handed
+                    ti.scale_x = tsx; ti.scale_y = tsy;
+                    { mgpu::calibrator::table ct; if (mgpu::calibrator::read(ct)) {
+                        ti.jitter_x = ct.jitter_x; ti.jitter_y = ct.jitter_y; ti.mv_jittered = ct.mv_jittered; } }
+                    ti.render_w = ew; ti.render_h = eh; ti.mvec_w = s.mvec_w; ti.mvec_h = s.mvec_h;
+                    ti.ring = stream_state::RING;
+                    tdec = mgpu::tdiag::decide(ti);
+                    mgpu::tdiag::periodic(s.game_frames);
+
+                    mgpu::tdiag::jitter_in ji;
+                    ji.sealed_id = f; ji.slot = slot; ji.game_frame = gnow;
+                    ji.queue_lag = (s.produced > f) ? (s.produced - f) : 0ull;
+                    float jsx = s.mvec_scale_x, jsy = s.mvec_scale_y;
+                    mgpu::calibrator::override_scale(jsx, jsy);   // the un-multiplied NGX scale R104 divides by
+                    ji.scale_x = jsx; ji.scale_y = jsy;
+                    mgpu::calibrator::table jct;
+                    if (mgpu::calibrator::read(jct) && (jct.have & mgpu::calibrator::KEY_JITTER) != 0u)
+                    { ji.newest_have = true; ji.newest_jx = jct.jitter_x; ji.newest_jy = jct.jitter_y; ji.newest_mvj = jct.mv_jittered; }
+                    ji.nr_reset = tdec.reset ||
+                                  ((jct.have & mgpu::calibrator::KEY_RESET) != 0u && jct.reset != 0u);
+                    jout = mgpu::tdiag::jitter_decide(ji);
+                }
                 for (unsigned pi = 0; pi < npass; ++pi)
                 {
                     ID3D12Resource *src = (pi == 0)
@@ -23439,7 +23783,8 @@ void stream_poll()
                     // input carries its own subrect; this is the input that
                     // makes that mandatory rather than tidy.
                     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                        s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+                        s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u &&
+                        tdec.bind_mvec)   // R300a1: false only with TemporalRequireTuple=1 on an incoherent tuple
                     {
                         // R217: the chained field on a late frame, in place of
                         // R87's multiply - not for a strip's own count.
@@ -23453,10 +23798,19 @@ void stream_poll()
                         // motion while frame generation is active (fg_frac is
                         // 1.0 otherwise). With a thinned frame before this one
                         // mv_el is 2 and the product is one rendered step.
-                        const float mv_k = cv_here ? 1.0f : mv_el * fg_frac;   // R217
+                        const float mv_k = cv_here ? 1.0f : ((t119_temporal && !own_el) ? tdec.mv_k : mv_el) * fg_frac;   // R217 / R300a1: tdec.mv_k == mv_el unless TemporalMV=single
                         s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
                         s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
+                        {
+                            s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
+                            s.nr_params->Set("DLSSNR.MVecOffsetY", jout.oy);
+                            s.nr_params->Set("MV.Offset.X", jout.ox);
+                            s.nr_params->Set("MV.Offset.Y", jout.oy);
+                            if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
+                        }
+                        else
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
                         // R212: the region, scaled to the vectors' own size.
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
                             ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
@@ -23518,7 +23872,16 @@ void stream_poll()
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
                         s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x);
                         s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
+                        {
+                            s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
+                            s.nr_params->Set("DLSSNR.MVecOffsetY", jout.oy);
+                            s.nr_params->Set("MV.Offset.X", jout.ox);
+                            s.nr_params->Set("MV.Offset.Y", jout.oy);
+                            if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
+                        }
+                        else
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in ? (unsigned int)rbx : 0u);   // R212
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in ? (unsigned int)rby : 0u);
                         s.nr_params->Set("DLSSNR.MVecSubrectWidth",
@@ -23613,6 +23976,7 @@ void stream_poll()
                     if (pi == 0u && mgpu::nr16::take_reset()) rst = 1u;   // R208
                     if (p1f_here && s.p1f_fresh[fidx]) rst = 1u;           // R214
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
+                    if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     s.nr_params->Set("DLSSNR.Reset", rst);
                     // [OURS] NRS: a feature rebuilt by a live scale change has no history;
                     // the first evaluate on it must discard whatever the module still has.
@@ -24379,11 +24743,13 @@ void stream_poll()
             // until the copy queue has finished frame f's unpack, and the
             // barrier that a copy queue is not allowed to record happens on
             // this side of it.
+            if (mgpu::t119::perf_active()) mgpu::perf::job_recorded();   // R300e1
             if (use_cq && s.cqf != nullptr) (void)s.nq->Wait(s.cqf, (UINT64)f);
             ID3D12CommandList *const ls[1] = { s.nl };
             s.nq->ExecuteCommandLists(1, ls);
             ++s.nf_value;
             h = s.nq->Signal(s.nf, s.nf_value);
+            if (mgpu::t119::perf_active()) mgpu::perf::job_exec(use_cq);   // R300e1
             if (SUCCEEDED(h))
             {
                 s.nf->SetEventOnCompletion(s.nf_value, s.nev);
@@ -24403,14 +24769,16 @@ void stream_poll()
                 lk.unlock();
                 const DWORD wr = WaitForSingleObject(s.nev, 5000);
                 lk.lock();
+                if (mgpu::t119::perf_active()) mgpu::perf::job_done();   // R300e1
                 if (wr != WAIT_OBJECT_0) h = E_FAIL;
             }
         }
-        if (FAILED(h)) { s.consumed = f; continue; }
+        if (FAILED(h)) { if (mgpu::t119::perf_active()) mgpu::perf::job_abort(); s.consumed = f; continue; }   // R300e1
 
         // D1: one checker, two callers. See seal_consume.
         seal_consume(s, f, slot, run_nr, use_cq, ii);
         s.consumed = f;
+        if (mgpu::t119::perf_active()) { mgpu::perf::job_end(s.produced); mgpu::perf::periodic(s.consumed); }   // R300e1
     }
 
     // ---- summary, once, after the producer has stopped and drained ----

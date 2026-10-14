@@ -471,6 +471,12 @@ struct ui_state
     // and is useless for watching a change land.
     double fps_produced = 0.0;   // the GAME's frame rate, from the seal counter
     double fps_consumed = 0.0;   // what GPU 1 is actually finishing
+    // T1.17 (Dom; PanelStats=1 only, zero otherwise): derived figures for the panel.
+    double bus_requested_mib_s = 0.0; // slot bytes x game frames / s (payload-equivalent, not a PCIe counter)
+    double bus_consumed_mib_s = 0.0;  // slot bytes x GPU 1 consumed fps
+    unsigned long long slot_bytes_live = 0;
+    unsigned long long mv_age[8] = {};
+    unsigned long long mv_age_worst = 0;
 
     // ---- [OURS] NRS: the scale knob and the DISPLAYED frame rate (2026-10-12) ----
     //
@@ -730,6 +736,8 @@ void ui_ini_read_crop(unsigned &mode, bool &crop_auto);
 // R219-2. A decimal key, written with two decimals by the same line-anchored
 // writer as ui_ini_write.
 bool ui_ini_write_float(const char *key, float value);
+// T1.19 (Dom, T1.17): a word value, same writer. Used only by PanelPersist=1.
+bool ui_ini_write_word(const char *key, const char *value);
 
 // ---- V46: THE INSTALL LAYOUT, AND IT IS NOT A COSMETIC WARNING ----
 //
@@ -902,6 +910,12 @@ void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
 // Inert unless MVec=3 and the stream is armed, so a colour-only or synthetic
 // run costs one mutex and two loads per frame.
 void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
+
+// R300d (Dom's R221, T1.5; SLTagsCapture=1|2 only). The same landing path, called at Streamline's tag
+// moment with the state the game declared in sl::Resource. The transition is recorded inside
+// stream_mvec_copy, only when the copy itself is, and the declared state is restored.
+void stream_mvec_copy_tagged(void *cmd_list, unsigned long long mvec_handle,
+                             unsigned declared_state, int lifecycle);
 
 // Bridge thread, once per present. Consumes whatever the fence says has
 // arrived, checks each seal, and prints the summary once the producer has

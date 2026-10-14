@@ -291,6 +291,8 @@ Two cables from two cards into one monitor was explored and did not reach anythi
 | `SFPath` | Absent by default, and absent is not off: the detector runs, the repair does not, and the add-on sets `1` itself if it sees the fault. `0` stops that. New in 0.2.5 |
 | `Frames=0` | Stop after this many frames. `0` runs until you quit. A bounded run is what prints a summary |
 
+Keys contributed by others (`NRScale`, `PanelOverPicture`, the R300 keys and more) are listed in [`docs/CONTRIBUTED_KEYS.md`](docs/CONTRIBUTED_KEYS.md). All are off until set.
+
 Changes to `mgpu.ini` are read when the bridge arms, so **restart the game after editing it.** The same applies to changing resolution or DLSS mode in the game's own settings while the bridge is running.
 
 **Troubleshooting Note:** If output appears washed out, reduce the `tone` parameter in the panel (default `0.00` on development machine).
@@ -354,6 +356,7 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 | `VENDOR_LOCK.md` | Hardware, driver, and configuration details |
 | `ACKNOWLEDGEMENTS.md` | Prior work, AI use disclosure, and disclaimer |
 | `CONTRIBUTORS.md` | Code contributed by others |
+| `docs/CONTRIBUTED_KEYS.md` | Every `mgpu.ini` key contributed by others: who, what, and whether it changes the picture |
 | `THIRD_PARTY.md` | Licenses and provenance |
 | `docs/` | Run logs from the titles listed above |
 | `reference/` | Sample `ReShade.ini`, a complete `ReShade.log`, and two example `mgpu.ini` configurations with Super Resolution on |

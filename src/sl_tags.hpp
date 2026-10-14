@@ -82,6 +82,15 @@ namespace mgpu::sltags
     // existing caller already treats as "keep the ranked pick".
     unsigned long long mvec_handle();
 
+    // R300d (Dom's R221, T1.5). Optional immediate-capture callback for the officially tagged
+    // motion-vector resource, run synchronously from the game's slSetTagForFrame / slSetTag call before
+    // Streamline consumes the tag. `cmd_buffer` is sl::CommandBuffer* (the native
+    // ID3D12GraphicsCommandList* on D3D12), `state` is sl::Resource.state as declared by the game, and
+    // `lifecycle` the ResourceTag lifecycle. Installed only with SLTagsCapture=1|2; none = observer only.
+    using mvec_capture_fn = void (*)(void *cmd_buffer, unsigned long long resource,
+                                     unsigned state, int lifecycle);
+    void set_mvec_capture(mvec_capture_fn fn);
+
     // The same for the colour buffers that matter to HDR work:
     // kBufferTypeHUDLessColor, then kBufferTypeScalingInputColor. Zero when
     // neither was ever tagged.

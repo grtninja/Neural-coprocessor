@@ -63,6 +63,7 @@ namespace
     //       uint32_t     usage{};         // +100
     //       uint32_t     reserved{};      // +104
     const unsigned RES_NATIVE = 40u;
+    const unsigned RES_STATE  = 64u;   // R300d: uint32 state, after view (sl_core_types.h)
     const unsigned RES_WIDTH  = 68u;
     const unsigned RES_HEIGHT = 72u;
     const unsigned RES_FORMAT = 76u;
@@ -135,6 +136,8 @@ namespace
     std::atomic<unsigned long long> g_h_mvec{0};
     std::atomic<unsigned long long> g_h_hudless{0};
     std::atomic<unsigned long long> g_h_scale_in{0};
+    std::atomic<mvec_capture_fn> g_mvec_capture{nullptr};       // R300d
+    std::atomic<unsigned long long> g_mvec_capture_calls{0};    // R300d
 
     // One "said" bit per buffer type we name, plus a catch-all.
     bool g_said[24] = {};
@@ -187,13 +190,13 @@ namespace
         unsigned type;
         int      life;
         unsigned long long native;
-        unsigned w, h, fmt;
+        unsigned state, w, h, fmt;
     };
 
     bool read_fields(const void *tag, tag_fields &out)
     {
         out.type = 0xFFFFFFFFu; out.life = -1; out.native = 0;
-        out.w = 0; out.h = 0; out.fmt = 0;
+        out.state = 0; out.w = 0; out.h = 0; out.fmt = 0;
         __try
         {
             const unsigned char *t = (const unsigned char *)tag;
@@ -205,6 +208,7 @@ namespace
                 const unsigned char *r = (const unsigned char *)res;
                 out.native = (unsigned long long)(uintptr_t)
                              *(const void *const *)(r + RES_NATIVE);
+                out.state = *(const unsigned *)(r + RES_STATE);
                 out.w   = *(const unsigned *)(r + RES_WIDTH);
                 out.h   = *(const unsigned *)(r + RES_HEIGHT);
                 out.fmt = *(const unsigned *)(r + RES_FORMAT);
@@ -214,7 +218,7 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
 
-    void read_one(const void *tag)
+    void read_one(const void *tag, void *cmd)
     {
         tag_fields f{};
         if (!read_fields(tag, f))
@@ -226,6 +230,18 @@ namespace
         const int life = f.life;
         const unsigned long long native = f.native;
         const unsigned w = f.w, h = f.h, fmt = f.fmt;
+
+        // R300d (SLTagsCapture only: the callback is installed by dllmain only with the key). The Streamline
+        // call is the one point where identity, declared D3D12 state, lifetime and the command list coexist.
+        if (type == BT_MVEC && native != 0ull && cmd != nullptr)
+        {
+            const mvec_capture_fn cb = g_mvec_capture.load(std::memory_order_acquire);
+            if (cb != nullptr)
+            {
+                cb(cmd, native, f.state, life);
+                g_mvec_capture_calls.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         g_tags_read.fetch_add(1, std::memory_order_relaxed);
 
@@ -264,7 +280,7 @@ namespace
         mgpu::diag::info(line);
     }
 
-    void read_array(const void *tags, unsigned n)
+    void read_array(const void *tags, unsigned n, void *cmd)
     {
         if (tags == nullptr || n == 0u) return;
         g_calls.fetch_add(1, std::memory_order_relaxed);
@@ -286,7 +302,7 @@ namespace
             return;
         }
 
-        read_one(tags);
+        read_one(tags, cmd);
         if (n == 1u) return;
 
         unsigned stride = (unsigned)g_stride.load(std::memory_order_relaxed);
@@ -316,7 +332,7 @@ namespace
         {
             const void *e = p + (size_t)i * stride;
             if (!is_tag(e)) { g_skipped.fetch_add(1, std::memory_order_relaxed); break; }
-            read_one(e);
+            read_one(e, cmd);
         }
     }
 
@@ -327,14 +343,14 @@ namespace
     int hook_stff(const void *frame, const void *viewport,
                   const void *tags, unsigned n, void *cmd)
     {
-        read_array(tags, n);
+        read_array(tags, n, cmd);
         return (g_real_stff != nullptr)
                    ? g_real_stff(frame, viewport, tags, n, cmd) : 0;
     }
 
     int hook_st(const void *viewport, const void *tags, unsigned n, void *cmd)
     {
-        read_array(tags, n);
+        read_array(tags, n, cmd);
         return (g_real_st != nullptr) ? g_real_st(viewport, tags, n, cmd) : 0;
     }
 
@@ -515,9 +531,17 @@ void report()
         g_h_hudless.load(std::memory_order_relaxed),
         g_h_scale_in.load(std::memory_order_relaxed));
     mgpu::diag::info(line);
+    if (g_mvec_capture.load(std::memory_order_relaxed) != nullptr)
+    {   // R300d: its own line, so the [SLT1] line keeps exactly its live shape
+        char r309[200];
+        snprintf(r309, sizeof r309, "[MGPU][R300d] SLT1 tag-time MVec callbacks=%llu",
+                 g_mvec_capture_calls.load(std::memory_order_relaxed));
+        mgpu::diag::info(r309);
+    }
 }
 
 unsigned long long mvec_handle()          { return g_h_mvec.load(std::memory_order_relaxed); }
+void set_mvec_capture(mvec_capture_fn fn) { g_mvec_capture.store(fn, std::memory_order_release); }   // R300d
 unsigned long long hudless_handle()       { return g_h_hudless.load(std::memory_order_relaxed); }
 unsigned long long scaling_input_handle() { return g_h_scale_in.load(std::memory_order_relaxed); }
 

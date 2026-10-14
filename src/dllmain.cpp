@@ -41,6 +41,8 @@
 #include <cstring>    // R137: strstr, to spot the depth tap by its effect name.
 #include <cwchar>     // R142: wcsrchr, to split our own module path for [R142].
 #include <atomic>     // R138: the present counter and the said-once flags.
+#include <chrono>     // T1.1 FrameCap (FrameCap line present only)
+#include <thread>     // T1.1 FrameCap
 
 // ---- R141: BUILD IDENTITY, SAID ONCE, FIRST ----
 //
@@ -121,6 +123,8 @@
 #include "calibrator.hpp"
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
+#include "sl_tags.hpp"    // R300c/R300d (Dom's R220/R221): the Streamline-tagged vectors
+#include "t119_keys.hpp"  // R300 (T1.19): Dom's keys, every one absent = off
 #include "worker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -215,6 +219,13 @@ static void on_finish_present(reshade::api::command_queue *, reshade::api::swapc
 static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long resource)
 {
     mgpu::gpu1::stream_mvec_copy(cmd_list_native, resource);
+}
+// R300d (Dom's R221, T1.5). SLT1 callback: capture while the game's ResourceTag is valid. Installed only
+// with SLTagsCapture=1|2 (on_init_swapchain, after the ini is read).
+static void mgpu_tagged_mvec_capture_hook(void *cmd_list_native, unsigned long long resource,
+                                          unsigned declared_state, int lifecycle)
+{
+    mgpu::gpu1::stream_mvec_copy_tagged(cmd_list_native, resource, declared_state, lifecycle);
 }
 // R232: the D3D11 twin - the game's context and its DLSS MotionVectors go to
 // the DX11 producer, which hops them. Inert unless DX11=1 (one load).
@@ -576,6 +587,8 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
             mgpu::probe::set_mvec_hook(&mgpu_mvec_transport_hook);
 
             mgpu::probe::set_mode(mgpu::probe::mode_from_ini());
+            if (mgpu::t119::sltags_capture() != 0)   // R300d: key absent = SLT1 stays observer-only
+                mgpu::sltags::set_mvec_capture(&mgpu_tagged_mvec_capture_hook);
 
             // ---- R101: THE NGX TAP, INSTALLED ON THE SAME ONE-SHOT ----
             //
@@ -893,6 +906,94 @@ namespace
     }
 }
 
+// ---- T1.17 (Dom; PanelStats=1 only): CPU present cadence of the GAME swapchain ----
+// Not GPU1 jobs, not GPU latency. No timestamps, fences or waits. Adapted for 0.3.1: the game's LUID is
+// cached once adapter selection knows it, so the selection mutex is not taken on every present (the P7.10
+// note in adapter.cpp keeps present-path callers off that lock).
+static std::atomic<long>     g_t119_luid_lo{0};
+static std::atomic<long>     g_t119_luid_hi{0};
+static std::atomic<bool>     g_t119_luid_known{false};
+static bool t119_is_game_d3d12(reshade::api::swapchain *sc)
+{
+    if (sc == nullptr) return false;
+    reshade::api::device *dev = sc->get_device();
+    if (dev == nullptr || dev->get_api() != reshade::api::device_api::d3d12) return false;
+    auto *native = reinterpret_cast<ID3D12Device *>(dev->get_native());
+    if (native == nullptr) return false;
+    if (!g_t119_luid_known.load(std::memory_order_acquire))
+    {
+        mgpu::adapter::selection_result sel;
+        mgpu::adapter::get_selection(sel);
+        if (!sel.game_luid_known) return false;
+        g_t119_luid_lo.store((long)sel.game_luid.LowPart, std::memory_order_relaxed);
+        g_t119_luid_hi.store(sel.game_luid.HighPart, std::memory_order_relaxed);
+        g_t119_luid_known.store(true, std::memory_order_release);
+    }
+    const LUID l = native->GetAdapterLuid();
+    return (long)l.LowPart == g_t119_luid_lo.load(std::memory_order_relaxed) &&
+           l.HighPart == g_t119_luid_hi.load(std::memory_order_relaxed);
+}
+static std::atomic<double> g_t117_present_fps{0.0};
+static std::atomic<double> g_t117_present_ms{0.0};
+static std::atomic<unsigned long long> g_t117_present_samples{0};
+static std::atomic<long long> g_t117_window_start{0};
+static std::atomic<unsigned> g_t117_window_frames{0};
+static std::atomic<unsigned> g_t117_report_windows{0};
+static void t117_count_game_present(reshade::api::swapchain *sc)
+{
+    if (!t119_is_game_d3d12(sc)) return;
+    LARGE_INTEGER t, frequency;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&frequency);
+    long long start = g_t117_window_start.load(std::memory_order_relaxed);
+    if (!start) {
+        g_t117_window_start.compare_exchange_strong(start, t.QuadPart, std::memory_order_relaxed);
+        return;
+    }
+    g_t117_window_frames.fetch_add(1, std::memory_order_relaxed);
+    const double elapsed = double(t.QuadPart - start) / double(frequency.QuadPart);
+    if (elapsed < 1.0) return;
+    if (!g_t117_window_start.compare_exchange_strong(start, t.QuadPart, std::memory_order_relaxed)) return;
+    const unsigned frames = g_t117_window_frames.exchange(0, std::memory_order_relaxed);
+    if (!frames) return;
+    const double fps = frames / elapsed;
+    g_t117_present_fps.store(fps, std::memory_order_relaxed);
+    g_t117_present_ms.store(1000.0 / fps, std::memory_order_relaxed);
+    g_t117_present_samples.fetch_add(frames, std::memory_order_relaxed);
+    const unsigned windows = g_t117_report_windows.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (windows % 10 == 0)
+    {
+        char report[256];
+        std::snprintf(report, sizeof(report), "[MGPU][R300l] GAME PRESENT cadence %.2f FPS | %.3f ms/present | window_frames=%u | window_seconds=%.3f (CPU cadence, NOT GPU latency)", fps, 1000.0 / fps, frames, elapsed);
+        mgpu::diag::info(report);
+    }
+}
+
+// ---- T1.1 (Dom; a FrameCap line present, value 20..500): synchronized whole-game frame cap ----
+// Paces the GAME present, never the GPU1 worker by itself: a GPU1-only cap would manufacture the frame-age
+// problem the control is meant to test. Sleeps on the present thread by design (like OwnReflex). The value
+// comes from t119_keys (the ini at init, then the panel), not from a file read per present.
+static void mgpu_frame_cap_tick(reshade::api::swapchain *swapchain)
+{
+    const int cap = mgpu::t119::frame_cap();
+    if (cap < 20 || cap > 500) return;
+    if (!t119_is_game_d3d12(swapchain)) return;
+    using clock = std::chrono::steady_clock;
+    static clock::time_point next{};
+    static int last_cap = 0;
+    const auto now = clock::now();
+    const auto period = std::chrono::duration<double>(1.0 / (double)cap);
+    if (last_cap != cap || next.time_since_epoch().count() == 0 || now > next + period * 4)
+    {
+        next = now;
+        last_cap = cap;
+    }
+    next += std::chrono::duration_cast<clock::duration>(period);
+    const auto coarse = next - std::chrono::microseconds(500);
+    if (coarse > clock::now()) std::this_thread::sleep_until(coarse);
+    while (clock::now() < next) YieldProcessor();
+}
+
 #if defined(MGPU_HAVE_IMGUI)
 // The panel. Drawn into the BRIDGE runtime's overlay - press Home over the
 // bridge window to open it.
@@ -1002,6 +1103,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
 
+    if (mgpu::t119::panel_stats())   // T1.17 (PanelStats=1): measured from game-swapchain present events
+    {
+        ImGui::SeparatorText("GAME PRESENT (live)");
+        if (g_t117_present_samples.load(std::memory_order_relaxed))
+            ImGui::Text("%.1f FPS | %.2f ms/present", g_t117_present_fps.load(std::memory_order_relaxed), g_t117_present_ms.load(std::memory_order_relaxed));
+        else
+            ImGui::TextDisabled("Waiting for game presents (about 1 second)...");
+        ImGui::TextDisabled("CPU present cadence; not GPU execution time or input latency.");
+    }
+
     // One status line, not three. It changes rather than accumulating.
     if (!st.armed)
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
@@ -1037,7 +1148,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // scale controls got "hidden", and why the log box that briefly filled this space was
     // the only thing visible in it). Take the region that is actually available, minus the
     // room the Probe section and the warning lines need underneath the boxes.
-    const float col_h   = st.nrs_on ? (ImGui::GetContentRegionAvail().y - 130.0f) : 560.0f;   // R299: main's 560 unless NRScale is set
+    float col_h   = st.nrs_on ? (ImGui::GetContentRegionAvail().y - 130.0f) : 560.0f;   // R299: main's 560 unless NRScale is set
+    // T1.19 UI4K1 (Dom; PanelAutoHeight=1 only, and not when R299 already sized it): the two boxes take the
+    // height ReShade gives the add-on, keeping 170 px for the section below, with 560 px as the floor. It
+    // does not resize ReShade's own window. Key absent: main's 560.
+    if (!st.nrs_on && mgpu::t119::panel_auto_height())
+    {
+        const float avail_h = ImGui::GetContentRegionAvail().y;
+        const float reserve_below = 170.0f;
+        if (avail_h > 560.0f + reserve_below) col_h = avail_h - reserve_below;
+    }
 
     ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
     ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
@@ -1346,6 +1466,30 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Split: input left of the seam, output right, same frame.");
     ImGui::TextDisabled("CTRL+ALT+LEFT/RIGHT move it with no overlay open (SHIFT = coarse).");
 
+    // ---- T1.1 Frame pacing (Dom; only when the ini has a FrameCap line) ----
+    if (mgpu::t119::frame_cap_present())
+    {
+        ImGui::SeparatorText("Frame pacing");
+        int frame_cap = mgpu::t119::frame_cap();
+        bool cap_on = frame_cap >= 20;
+        if (ImGui::Checkbox("synchronized FPS cap", &cap_on))
+        {
+            frame_cap = cap_on ? (frame_cap >= 20 ? frame_cap : 80) : 0;
+            mgpu::t119::set_frame_cap(frame_cap);
+            mgpu::gpu1::ui_ini_write("FrameCap", frame_cap);
+        }
+        if (cap_on)
+        {
+            if (frame_cap < 20) frame_cap = 80;
+            if (ImGui::SliderInt("target FPS", &frame_cap, 30, 240))
+            {
+                mgpu::t119::set_frame_cap(frame_cap);
+                mgpu::gpu1::ui_ini_write("FrameCap", frame_cap);
+            }
+            ImGui::TextDisabled("Caps the GAME present and MGPU production together; it never caps GPU 1 alone.");
+        }
+    }
+
     // ---- Counters ----
     if (st.armed)
     {
@@ -1385,6 +1529,31 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             snprintf(lv, sizeof lv, "game render %.1f   GPU 1 finished %.1f   (neither is what you see)",
                      st.fps_produced, st.fps_consumed);
             ImGui::TextDisabled(lv);
+        }
+        if (mgpu::t119::panel_stats())   // T1.17 (PanelStats=1): derived, not measured
+        {
+            snprintf(lv, sizeof lv, "frame interval (derived)   game %.2f ms   GPU 1 %.2f ms",
+                     st.fps_produced > 0.0 ? 1000.0 / st.fps_produced : 0.0,
+                     st.fps_consumed > 0.0 ? 1000.0 / st.fps_consumed : 0.0);
+            ImGui::TextUnformatted(lv);
+            ImGui::TextDisabled("Derived from sealed/consumed rates; not actual Present frametime.");
+            snprintf(lv, sizeof lv, "transport payload  requested %.2f GiB/s   consumed-equivalent %.2f GiB/s",
+                     st.bus_requested_mib_s / 1024.0, st.bus_consumed_mib_s / 1024.0);
+            ImGui::TextUnformatted(lv);
+            ImGui::TextDisabled("Derived from slot bytes x frame rate; NOT a hardware PCIe throughput counter.");
+            unsigned long long mvn = 0;
+            for (unsigned q = 0; q < 8; ++q) mvn += st.mv_age[q];
+            if (mvn != 0)
+            {
+                const double a1 = 100.0 * (double)st.mv_age[0] / (double)mvn;
+                const double a2 = 100.0 * (double)st.mv_age[1] / (double)mvn;
+                unsigned long long a3n = 0; for (unsigned q = 2; q < 8; ++q) a3n += st.mv_age[q];
+                const double a3 = 100.0 * (double)a3n / (double)mvn;
+                snprintf(lv, sizeof lv, "MV frame age  1: %.1f%%   2: %.1f%%   3+: %.1f%%   worst %llu",
+                         a1, a2, a3, st.mv_age_worst);
+                if (a1 < 90.0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", lv);
+                else ImGui::TextUnformatted(lv);
+            }
         }
         if (st.fps_consumed + 1.0 < st.fps_produced)
             ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
@@ -2858,6 +3027,8 @@ static void on_present(reshade::api::command_queue *queue,
         mgpu::own_reflex::on_present(
             reinterpret_cast<void *>(static_cast<uintptr_t>(swapchain->get_native())));
     if (queue == nullptr) return;
+    if (mgpu::t119::panel_stats()) t117_count_game_present(swapchain);   // T1.17 (PanelStats=1)
+    if (mgpu::t119::frame_cap() != 0) mgpu_frame_cap_tick(swapchain);    // T1.1 (FrameCap=20..500)
     {
         mgpu::stallwatch::scope sw(mgpu::stallwatch::S_STREAM);
         mgpu::gpu1::stream_on_present(
@@ -3206,10 +3377,35 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     // Calib=0 is the off switch: no calibrator, no table, no
                     // override, and this build behaves exactly like R99.
                     {
-                        mgpu::calibrator::table ct;
-                        if (mgpu::calibrator::read(ct) &&
-                            (ct.have & mgpu::calibrator::KEY_MVEC) != 0u)
-                            mgpu::probe::set_mvec_override(ct.mvec);
+                        // R300c (Dom's R220; SLTagsMvec=1 only, needs SLTags). Streamline's own ResourceTag
+                        // declaration outranks the calibrator table and the lateral ranking when SLT1 has
+                        // one. This changes RESOURCE IDENTITY only; the barrier / R118 triggers still decide
+                        // WHEN a copy is made. Key absent, or no tag seen yet: the live R103 path below.
+                        const unsigned long long tagged_mv =
+                            mgpu::t119::sltags_mvec() ? mgpu::sltags::mvec_handle() : 0ull;
+                        if (tagged_mv != 0ull)
+                        {
+                            mgpu::probe::set_mvec_override(tagged_mv);
+                            static unsigned long long r308_said = 0ull;
+                            if (r308_said != tagged_mv)
+                            {
+                                r308_said = tagged_mv;
+                                char r308[512];
+                                snprintf(r308, sizeof r308,
+                                    "[MGPU][R300c] TAGGED MVEC SOURCE ACTIVE: Streamline declared 0x%llx; this "
+                                    "handle now overrides the calibrator / ranked source selection "
+                                    "(SLTagsMvec=1). Copy timing is unchanged (barrier / R118).",
+                                    tagged_mv);
+                                mgpu::diag::info(r308);
+                            }
+                        }
+                        else
+                        {
+                            mgpu::calibrator::table ct;
+                            if (mgpu::calibrator::read(ct) &&
+                                (ct.have & mgpu::calibrator::KEY_MVEC) != 0u)
+                                mgpu::probe::set_mvec_override(ct.mvec);
+                        }
                     }
                 }
             }
@@ -3438,7 +3634,13 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     // mgpu_mvec_transport_hook above; all this handle does is let the arm size
     // the slot's MVec region from the real resource. Zero until the probe has
     // published one, which holds the arm - see stream_on_finish_effects.
-    const unsigned long long mvec_h = rt_is_game ? mgpu::probe::mvec_source() : 0ull;
+    // R300c (SLTagsMvec=1 only): size the slot's MVec region from the Streamline-declared resource once
+    // SLT1 has seen it. Key absent: the probe / calibrator source exactly as live.
+    const unsigned long long tagged_mvec_h =
+        (rt_is_game && mgpu::t119::sltags_mvec()) ? mgpu::sltags::mvec_handle() : 0ull;
+    const unsigned long long mvec_h = rt_is_game
+        ? (tagged_mvec_h != 0ull ? tagged_mvec_h : mgpu::probe::mvec_source())
+        : 0ull;
 
     // R277: the D3D12 tap, off unless MVecTap=1/2 (read once at the game chain's
     // init). Copies the census candidate here when no barrier delivered it this

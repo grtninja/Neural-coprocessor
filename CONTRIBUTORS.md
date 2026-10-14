@@ -1,6 +1,7 @@
 # Contributors
 
 Code contributed by people other than the primary author, and what it covers.
+Every key they added is listed in [`docs/CONTRIBUTED_KEYS.md`](docs/CONTRIBUTED_KEYS.md).
 
 ## [NO1950](https://github.com/NO1950)
 
@@ -85,3 +86,25 @@ a guarded shape, under his name:
   on a wait no shipped build had executed.
 
 Thank you for both, and for the disassembly in particular.
+
+## [lordzaxxon555-art](https://github.com/lordzaxxon555-art)
+
+His test system for this work: RTX 4080 SUPER (game) and RTX 5060 Ti (DLSS-NR), 3840x2160, Starfield.
+
+Work from an iterative Starfield development branch (T1.1 to T1.19), merged as one revision, R300
+(`docs/R300_T119.md`). Every part is behind its own `mgpu.ini` key and off by default:
+
+- **The scene-feature filter (R300b, `SceneHandleSet`).** Starfield creates and releases several DLSS
+  features while it runs. The calibrator's evaluate filter only accepted the newest one, so when the game
+  kept evaluating an older feature the vector table and the evaluate-route copy froze and frames were sealed
+  without vectors. He found it in his own logs and fixed it: any latched scene feature is accepted, and the
+  handle is moved to a live feature when its own is released.
+- **Instruments, in their own files with unit tests.** Per-evaluate temporal record and slot-stamped jitter
+  (`TemporalDiag`), GPU 1 job timing with the copy-queue split (`Perf11`), the producer's cost on GPU 0 with
+  GPU timestamps (`ProducerDiag`, `Gpu0Timers`), and a detector for a game that stops evaluating its scene
+  feature, with every DLSS create and release logged (`FeatureDiag`).
+- **Experimental, for testing:** Streamline-tagged vectors as the source and a copy at the tag call
+  (`SLTagsMvec`, `SLTagsCapture`), a scheduling experiment (`PerfPrefetch`), a BetterConsole crash guard
+  (`BetterConsoleGuard`), and panel additions (`PanelAutoHeight`, `PanelStats`, `PanelPersist`, `FrameCap`).
+
+Thank you - in particular for R300b, which corrected a filter the add-on's own comment said was already right.

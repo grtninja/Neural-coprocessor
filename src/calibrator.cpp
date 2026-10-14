@@ -42,6 +42,7 @@
 #include "calibrator.hpp"
 #include "diag.hpp"
 #include "fg_map.hpp"   // D2.0 NR step one (NRFrameFilter=1), read only; off = one load per call site
+#include "t119_keys.hpp"   // R300 (T1.19, Dom): R300b SceneHandleSet, R300f2 FeatureDiag - absent = off
 
 #include <tlhelp32.h>
 #include <intrin.h>   // R245: _ReturnAddress for the nvapi trace
@@ -230,6 +231,54 @@ unsigned long long g_eval_last_frame = 0xFFFFFFFFFFFFFFFFull;
 // fall back to accepting any handle and SAY SO in the log rather than
 // pretending we filtered.
 std::atomic<unsigned long long> g_sr_handle{0};
+// ---- R300b / T1.10 MVEC COVERAGE (Dom; SceneHandleSet=1 only) ----
+// Measured on Starfield (his run C): the game creates and releases DLSS features while running
+// (creates=1..7). g_sr_handle is set at CREATE and never moved at RELEASE, so when the feature the game
+// keeps evaluating is not the newest one created, every evaluate fails `h == g_sr_handle`: the table and
+// the R106 copy freeze while evaluates climb (~600 frames per episode), and every frame in that window
+// is sealed without vectors. The latch set already knew every live scene feature (R135); the outer test
+// never asked it. With the key: take any LATCHED scene handle as well, count per handle, and re-point
+// g_sr_handle at a live scene feature when its own is released. Key absent: none of this runs.
+// D3D12 hook only, as in T1.19; the D3D11 hook keeps the single-handle test.
+struct hstat
+{
+    std::atomic<unsigned long long> h{0}, evals{0}, taken{0}, copies{0};
+    std::atomic<unsigned int> w{0}, hh{0};
+};
+hstat g_hs[4];
+// Totals of handles that were released, so a freed slot can be reused without losing what it measured.
+std::atomic<unsigned long long> g_hs_ret_n{0}, g_hs_ret_evals{0}, g_hs_ret_taken{0}, g_hs_ret_copies{0};
+void hs_release(unsigned long long hv)
+{
+    if (hv == 0ull) return;
+    for (int i = 0; i < 4; ++i)
+        if (g_hs[i].h.load(std::memory_order_relaxed) == hv)
+        {
+            g_hs_ret_n.fetch_add(1, std::memory_order_relaxed);
+            g_hs_ret_evals.fetch_add(g_hs[i].evals.exchange(0ull, std::memory_order_relaxed), std::memory_order_relaxed);
+            g_hs_ret_taken.fetch_add(g_hs[i].taken.exchange(0ull, std::memory_order_relaxed), std::memory_order_relaxed);
+            g_hs_ret_copies.fetch_add(g_hs[i].copies.exchange(0ull, std::memory_order_relaxed), std::memory_order_relaxed);
+            g_hs[i].w.store(0u, std::memory_order_relaxed);
+            g_hs[i].hh.store(0u, std::memory_order_relaxed);
+            g_hs[i].h.store(0ull, std::memory_order_relaxed);   // free LAST: hs_slot may claim it from here on
+            return;
+        }
+}
+int hs_slot(unsigned long long hv)
+{
+    if (hv == 0ull) return -1;
+    for (int i = 0; i < 4; ++i)
+    {
+        unsigned long long cur = g_hs[i].h.load(std::memory_order_relaxed);
+        if (cur == hv) return i;
+        if (cur == 0ull)
+        {
+            unsigned long long z = 0ull;
+            if (g_hs[i].h.compare_exchange_strong(z, hv, std::memory_order_relaxed) || z == hv) return i;
+        }
+    }
+    return -1;                                    // a fifth distinct handle is not tracked, not an error
+}
 std::atomic<bool> g_handle_known{false};
 
 // ---- R135: A SET OF SCENE FEATURES, NOT ONE ----
@@ -637,9 +686,17 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
         // feature is visible in the diff against Dragon Sword, whereas taking
         // nothing teaches us nothing at all.
         bool take = true;
+        // R300b (SceneHandleSet=1 only): count per handle, and accept any LATCHED scene handle as well as the
+        // newest. Key absent: hsi stays -1 and the test below is the live one.
+        const bool r307_on = mgpu::t119::scene_handle_set();
+        const unsigned long long hvv = (unsigned long long)(uintptr_t)h;
+        int hsi = -1;
+        if (r307_on) { hsi = hs_slot(hvv); if (hsi >= 0) g_hs[hsi].evals.fetch_add(1, std::memory_order_relaxed); }
         if (g_handle_known.load(std::memory_order_relaxed))
             take = ((unsigned long long)(uintptr_t)h ==
-                    g_sr_handle.load(std::memory_order_relaxed));
+                    g_sr_handle.load(std::memory_order_relaxed)) ||
+                   (r307_on && is_latched_scene_handle(hvv));   // R300b
+        if (take && hsi >= 0) g_hs[hsi].taken.fetch_add(1, std::memory_order_relaxed);
 
         // Latch mode stops reading once it has a table with the fields that
         // matter. Live mode never stops, which is the whole point: a
@@ -724,6 +781,12 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
                     cl->ResourceBarrier(1, &b);
 
                     g_eval_copies.fetch_add(1, std::memory_order_relaxed);
+                    if (hsi >= 0)   // R300b
+                    {
+                        g_hs[hsi].copies.fetch_add(1, std::memory_order_relaxed);
+                        g_hs[hsi].w.store(et.sub_w, std::memory_order_relaxed);
+                        g_hs[hsi].hh.store(et.sub_h, std::memory_order_relaxed);
+                    }
                 }
                 }
             }
@@ -766,7 +829,42 @@ NVSDK_NGX_Result NVSDK_CONV hook_release(NVSDK_NGX_Handle *h)
     // R180. BEFORE the real release, while the handle value is still the one
     // the evaluate filter is comparing against. Afterwards the pointer may be
     // reused by the next create and unlatching it would free the wrong slot.
+    if (mgpu::t119::feature_diag())
+    {   // R300f2 (T1.15, FeatureDiag=1 only): every release, with whether it was a latched scene feature.
+        static std::atomic<unsigned int> rel_budget{400};
+        if (rel_budget.load(std::memory_order_relaxed) > 0u)
+        {
+            rel_budget.fetch_sub(1u, std::memory_order_relaxed);
+            const unsigned long long hv0 = (unsigned long long)(uintptr_t)h;
+            char rv[300];
+            snprintf(rv, sizeof rv,
+                     "[MGPU][R300f2] FEATURE RELEASE handle=%p was_latched_scene=%d | creates=%llu releases=%llu (this one included)",
+                     (void *)(uintptr_t)hv0, is_latched_scene_handle(hv0) ? 1 : 0,
+                     (unsigned long long)g_creates.load(std::memory_order_relaxed),
+                     (unsigned long long)g_releases.load(std::memory_order_relaxed));
+            mgpu::diag::info(rv);
+        }
+    }
     unlatch_scene_handle((unsigned long long)(uintptr_t)h);
+
+    // R300b (SceneHandleSet=1 only): g_sr_handle must not outlive its feature. If the one just released was
+    // it, move it to a scene feature that is still live (0 if none), never left on a dead handle.
+    if (mgpu::t119::scene_handle_set())
+    {
+        const unsigned long long hv = (unsigned long long)(uintptr_t)h;
+        hs_release(hv);
+        if (g_sr_handle.load(std::memory_order_relaxed) == hv)
+        {
+            unsigned long long next = 0ull;
+            const unsigned int n = g_scene_handle_n.load(std::memory_order_acquire);
+            for (unsigned int i = 0; i < n && i < SCENE_FEATURE_SLOTS; ++i)
+            {
+                const unsigned long long c = g_scene_handles[i].load(std::memory_order_relaxed);
+                if (c != 0ull && c != hv) { next = c; break; }
+            }
+            g_sr_handle.store(next, std::memory_order_relaxed);   // the next CreateFeature fills it as before
+        }
+    }
 
     if (g_real_release == nullptr)
     {
@@ -792,6 +890,32 @@ NVSDK_NGX_Result NVSDK_CONV hook_release(NVSDK_NGX_Handle *h)
 static void after_create(NVSDK_NGX_Feature id, NVSDK_NGX_Parameter *p,
                          NVSDK_NGX_Handle **out, NVSDK_NGX_Result r)
 {
+    // ---- R300f2 (T1.15, FeatureDiag=1 only): EVERY CREATE, WITH ITS PARAMETERS ----
+    // R134 below names an id the FIRST time only. Measured (Dom, Starfield): the game creates and releases
+    // DLSS features repeatedly, and after one burst it stopped calling Evaluate for minutes. One line per
+    // create, up to 400 events; reading parameters changes nothing. Here in after_create, so D3D11 too.
+    if (mgpu::t119::feature_diag())
+    {
+        static std::atomic<unsigned int> ev_budget{400};
+        if (ev_budget.load(std::memory_order_relaxed) > 0u)
+        {
+            ev_budget.fetch_sub(1u, std::memory_order_relaxed);
+            unsigned int w = 0u, hh = 0u, ow = 0u, oh = 0u, q = 0u, fl = 0u;
+            const bool hw = get_u(p, K_W, w), hhh = get_u(p, K_H, hh), how = get_u(p, K_OW, ow), hoh = get_u(p, K_OH, oh);
+            const bool hq = get_u(p, K_QUAL, q), hf = get_u(p, K_FLAGS, fl);
+            char ev[460];
+            snprintf(ev, sizeof ev,
+                     "[MGPU][R300f2] FEATURE CREATE id=%u result=0x%08X handle=%p scene=%d | creates=%llu releases=%llu | "
+                     "in=%d x %d out=%d x %d quality=%d createflags=0x%X",
+                     (unsigned int)id, (unsigned)r, (out != nullptr) ? (void *)*out : nullptr,
+                     is_scene_feature((unsigned int)id) ? 1 : 0,
+                     (unsigned long long)g_creates.load(std::memory_order_relaxed),
+                     (unsigned long long)g_releases.load(std::memory_order_relaxed),
+                     hw ? (int)w : -1, hhh ? (int)hh : -1, how ? (int)ow : -1, hoh ? (int)oh : -1, hq ? (int)q : -1,
+                     hf ? fl : 0u);
+            mgpu::diag::info(ev);
+        }
+    }
 
     // D2.0 NR step one: learn which handle is frame generation. Off: one load.
     if (mgpu::fgmap::on() && r == NVSDK_NGX_Result_Success && out != nullptr && *out != nullptr)
@@ -2083,6 +2207,21 @@ void override_scale(float &sx, float &sy)
     sy = t.mv_scale_y;
 }
 
+// T1.19 (Dom, T1.11 audit; JitterFallback=sync|zero only): bring R104's previous-jitter state up to date
+// when the slot path applied the offset for this evaluate instead.
+void sync_jitter_state()
+{
+    table t;
+    if (!read(t)) return;
+    if ((t.have & KEY_JITTER) == 0u || t.mv_jittered != 0u) return;   // same gates as apply_jitter_offset
+    g_jpx = t.jitter_x;
+    g_jpy = t.jitter_y;
+}
+
+unsigned long long feature_creates()   { return g_creates.load(std::memory_order_relaxed); }
+unsigned long long feature_releases()  { return g_releases.load(std::memory_order_relaxed); }
+unsigned long long feature_evaluates() { return g_evals.load(std::memory_order_relaxed); }   // T1.16: ALL handles
+
 void set_jitter_mode(int mode)
 {
     g_jmode.store(mode, std::memory_order_relaxed);
@@ -2502,6 +2641,35 @@ void log_summary()
             "scale is the shape that makes reprojection look almost right.");
     }
     mgpu::diag::info(line);
+
+    if (mgpu::t119::scene_handle_set())
+    {   // R300b: who evaluates, who is taken, who is copied. The line that says whether coverage is fixed.
+        char hl[900]; int hw = std::snprintf(hl, sizeof hl,
+            "[MGPU][R300b] SCENE HANDLES SceneHandleSet=1 (evals = every NGX evaluate seen; taken = passed the filter; "
+            "copies = a vector was recorded):");
+        for (int i = 0; i < 4 && hw > 0 && (size_t)hw < sizeof hl; ++i)
+        {
+            const unsigned long long hv = g_hs[i].h.load(std::memory_order_relaxed);
+            if (hv == 0ull) continue;
+            hw += std::snprintf(hl + hw, sizeof hl - (size_t)hw,
+                " | h=%p evals=%llu taken=%llu copies=%llu extent=%ux%u latched=%d sr=%d",
+                (void *)(uintptr_t)hv,
+                (unsigned long long)g_hs[i].evals.load(std::memory_order_relaxed),
+                (unsigned long long)g_hs[i].taken.load(std::memory_order_relaxed),
+                (unsigned long long)g_hs[i].copies.load(std::memory_order_relaxed),
+                g_hs[i].w.load(std::memory_order_relaxed), g_hs[i].hh.load(std::memory_order_relaxed),
+                is_latched_scene_handle(hv) ? 1 : 0,
+                g_sr_handle.load(std::memory_order_relaxed) == hv ? 1 : 0);
+        }
+        if (hw > 0 && (size_t)hw < sizeof hl)
+            hw += std::snprintf(hl + hw, sizeof hl - (size_t)hw,
+                " || retired handles=%llu evals=%llu taken=%llu copies=%llu",
+                (unsigned long long)g_hs_ret_n.load(std::memory_order_relaxed),
+                (unsigned long long)g_hs_ret_evals.load(std::memory_order_relaxed),
+                (unsigned long long)g_hs_ret_taken.load(std::memory_order_relaxed),
+                (unsigned long long)g_hs_ret_copies.load(std::memory_order_relaxed));
+        mgpu::diag::info(hl);
+    }
 }
 
 } // namespace calibrator

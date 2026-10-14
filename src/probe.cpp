@@ -38,6 +38,7 @@
 #include "probe.hpp"
 #include "sl_probe.hpp"   // SL1
 #include "sl_tags.hpp"    // SLT1
+#include "t119_keys.hpp"   // R300 (T1.19): Dom's keys, parsed from this same buffer
 
 namespace mgpu
 {
@@ -3074,6 +3075,8 @@ mode mode_from_ini()
         }
         return get_mode();
     }
+
+    mgpu::t119::load(buf, strlen(buf));   // T1.19: every key absent = off; logs [R300] only if one is set
 
     {
         const char *dk = mgpu::config::find(buf, strlen(buf), "DepthCompare");
