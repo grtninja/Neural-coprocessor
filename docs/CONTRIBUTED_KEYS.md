@@ -37,6 +37,10 @@ of these keys set, `ReShade.log` has one `[R300]` line at start listing which ar
 | `PanelStats` | `1` | Game present cadence, derived interval, payload, vector age in the panel | Panel only |
 | `PanelPersist` | `1` | Panel and hotkey changes are written back to `mgpu.ini` | Panel only |
 | `FrameCap` | `0`, `20`-`500` | Caps the game's present. The panel section shows only when the line exists | Caps fps |
+| `NRScaleResolveDepth` | `0` (absent or `1`: unchanged) | With `NRScale`, the residual composite runs without its depth guard while DLSS-NR keeps depth. Fixes stripes and a dark veil on shadowed faces (Starfield, `Depth=1`) | Yes: removes those artefacts |
+
+With `PerfPrefetch=1`, the present gate waits for the frame the copy queue armed instead of `consumed+1`. Before,
+the bridge thread spun on a frame that had already arrived. No new key: it is part of `PerfPrefetch`.
 
 ## NO1950
 

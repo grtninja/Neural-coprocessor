@@ -900,7 +900,31 @@ namespace
                         // Runs whatever the NGX probe reported - the two
                         // are independent questions, and a run that
                         // answers only one of them is still worth having.
-                        (void)mgpu::gpu1::transit_probe();
+                        //
+                        // R302: the startup run is now behind TransitProbes=1
+                        // (its own key, off by default). Before R302 it ran on
+                        // every launch with no key to stop it. Far Cry 6 left
+                        // the process 245-295 ms after the last queued P1.3
+                        // line (A'.3b, heap desc), twice, with no crash dump -
+                        // and this probe works on the GAME's own device
+                        // (D3D12CreateDevice returns the existing device for an
+                        // adapter). P1.3 is a closed question and nothing
+                        // downstream reads its result. The same key gates the
+                        // P1.4 block inside ngx_probe (gpu1_context.cpp), the
+                        // other startup code that works on the game's device.
+                        // Not the hotkey: with Probes=1 the hotkey still runs
+                        // P1.3, because pressing it is already an explicit ask.
+                        // Side effect: transit_probe alternates A/A' by
+                        // invocation count, so with the startup run skipped the
+                        // first hotkey run takes A'.
+                        if (mgpu::gpu1::transit_probes_enabled())
+                            (void)mgpu::gpu1::transit_probe();
+                        else
+                            mgpu::diag::info("[MGPU][R302] P1.3 startup transit probe NOT RUN: mgpu.ini "
+                                             "TransitProbes is not 1 (the default). Nothing is placed "
+                                             "on either GPU at startup and no A./A'. lines follow. "
+                                             "TransitProbes=1 runs it here as before R302. This is a "
+                                             "setting, not a fault.");
                     }
                     else
                         mgpu::diag::error("[MGPU][T5] no present chain on this cycle - the window "
@@ -1162,8 +1186,10 @@ namespace
                 // R246: the deferred startup probe. Runs once, here, on the
                 // bridge thread, the first iteration after the game's first
                 // finish_effects (or at the bound). It stalls this loop for
-                // the probe's duration exactly as the hotkey probe chain does;
-                // the game is not touched.
+                // the probe's duration exactly as the hotkey probe chain does.
+                // R302: "the game is not touched" was wrong - its P1.4 block
+                // works on the game's own device. That block now needs
+                // TransitProbes=1; the rest of the NGX probe is unchanged.
                 if (ngx_probe_pending)
                 {
                     const unsigned long long gf = mgpu::gpu1::game_effects_frames();

@@ -234,11 +234,18 @@ namespace mgpu::gpu1
     // belongs to the synthetic path.
     bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext = nullptr);
 
-// P1.3: does a buffer cross between the two adapters intact? Creates its
-// OWN device on the game's adapter - the game's device is never touched -
-// tries a shared cross-adapter buffer first and a host-pinned heap second,
-// and verifies the payload byte for byte. Bridge thread only; safe to
-// ignore the return value, the probe logs its own verdict.
+// P1.3: does a buffer cross between the two adapters intact? Calls
+// D3D12CreateDevice on the game's adapter, tries a shared cross-adapter
+// buffer first and a host-pinned heap second, and verifies the payload byte
+// for byte. Bridge thread only; safe to ignore the return value, the probe
+// logs its own verdict.
+// R302: that device is NOT a separate one. D3D12 keeps one device per
+// adapter and D3D12CreateDevice returns the existing one, so on GPU 0 this
+// probe creates heaps, placed resources and a queue on the GAME's device
+// (ReShade logged the probe's CreateCommandQueue against the same device
+// pointer the game created its own queues on). The startup run is behind
+// TransitProbes=1 since R302 (worker.cpp); the hotkey run is behind Probes=1
+// as it always was.
 // P1.3g: `tag` names the run in every log line it produces. "startup" is the
 // automatic run that fires while shaders are still compiling; a manual run
 // triggered by the hotkey passes its own label. The same launch can therefore
@@ -328,6 +335,12 @@ void capture_poll();
 // and re-running them under a live stream can only cost. Set Probes=1 in
 // mgpu.ini to run the old chain again, with the stream deliberately not armed.
 bool probes_enabled();
+
+// R302. Any thread. True only when mgpu.ini says TransitProbes=1. Gates the
+// startup P1.3 run and the P1.4 block in ngx_probe - the two startup probes
+// that put objects on the game's own device. Separate from Probes on purpose:
+// Probes decides what the hotkey does, this decides what runs on its own.
+bool transit_probes_enabled();
 
 // ---- P7.10: two settings worker.cpp needs, read through this file's reader ----
 //
