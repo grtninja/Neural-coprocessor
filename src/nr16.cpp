@@ -166,8 +166,10 @@ bool build_kernels(ID3D12Device *dev)
     for (int i = 0; i < 2; ++i)
     {
         ID3DBlob *err = nullptr;
+        // R208a: cs_5_0 - FC6's d3dcompiler_47 rejects cs_5_1 (X3506; R316c found it). The two
+        // kernels use nothing from shader model 5.1.
         const HRESULT hr = compile(kHLSL, strlen(kHLSL), "nr16", nullptr, nullptr, entry[i],
-                                   "cs_5_1", 0, 0, &cs[i], &err);
+                                   "cs_5_0", 0, 0, &cs[i], &err);
         if (FAILED(hr) || cs[i] == nullptr)
         {
             snprintf(line, sizeof line, "[MGPU][R208] kernel '%s' failed to compile: 0x%08X %s",

@@ -58,6 +58,12 @@ or take the new file. One display (DcompOverlay=1) is the default since 0.3.0,
 also when the key is absent. An mgpu.ini that says DcompOverlay=0 keeps the
 bridge's own window.
 
+0.4.0 adds a lighter 2nd pass for x2 (ResidualPass=2, ResidualScale=0.75),
+depth at the game's render size (DepthTransport=3), a cheaper motion vector
+copy (MVecBarrierSource=2) and no history in menus (HistoryGate=1). An edited
+mgpu.ini from 0.3.x does not have these keys: take the new file. The
+launcher's Copy files can replace it for you and keeps your Dcomp settings.
+
 WHAT YOU NEED FIRST
 -------------------
 
@@ -534,14 +540,19 @@ back to deriving motion from colour, which is what 0.1.0 ran on. The [R78]
 MVEC TRANSPORT line says which it got. Whether this holds on other engines is
 not established.
 
-FRAME GENERATION IS UNTESTED. It was enabled once and that session ended
-badly, on a machine that was also failing on ordinary settings changes, so
-nothing is established either way. It is not recommended and it has not been
-characterised.
+FRAME GENERATION IS NOT RECOMMENDED. It still flickers, as in 0.3.x.
 
 Some games with frame generation on can crash at startup, when the bridge
 arms itself. Workaround: set AutoArm=0 in mgpu.ini, get into gameplay, and
 press CTRL+ALT+F10 to arm by hand.
+
+MENUS. In a game menu the game can draw hundreds of frames per second. The
+neural output slows down there and returns to normal in gameplay.
+
+DEPTHTRANSPORT. If you set DepthTransport=3 and later remove it, open
+ReShadePreset.ini in the game folder and delete the line
+PreprocessorDefinitions=MGPU_DEPTH_WIDTH=... under [mgpu_depth_tap.fx].
+Otherwise depth stays at the old size.
 
 WASHED OR FLAT COLOUR? Open the panel (Home over the bridge window) and take
 the "tone" slider down - 0.00 fixed it on the development rig, and yours may

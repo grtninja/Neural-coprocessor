@@ -55,6 +55,10 @@ add_library(mgpu_bridge SHARED
     # gpu1_context hands it D3D12 objects. OFF unless NRInput16=4 is in
     # mgpu.ini: no texture, no kernel, no extra pass.
     src/nr16.cpp
+    # R316: the residual pass module (private test). No gpu1_context type;
+    # gpu1_context hands it D3D12 objects and the NGX parameter block. OFF
+    # unless ResidualPass=1|2 is in mgpu.ini: no texture, no kernel, no extra pass.
+    src/residual.cpp
     # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in
     # mgpu.ini. Holds no ReShade type and no gpu1_context type.
     src/discovery.cpp
@@ -67,6 +71,7 @@ add_library(mgpu_bridge SHARED
     src/log_queue.cpp
     src/journal.cpp
     src/stall_watch.cpp
+    src/startup_trace.cpp         # R313: StartupTrace + the stop/death record; DcompSafeMode keys (off by default)
     src/own_reflex.cpp
     # D2.0 NR step one: read-only frame-gen vector map, OFF unless NRFrameFilter=1.
     src/fg_map.cpp

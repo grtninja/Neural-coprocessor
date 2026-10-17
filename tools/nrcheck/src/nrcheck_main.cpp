@@ -242,6 +242,7 @@ int wmain(int argc, wchar_t **argv)
         if (!wcscmp(argv[i], L"--bench"))
         {
             int n = -1, o = -1; unsigned w = 0, hh = 0, passes = 1, frames = 300;
+            float p2s = 1.0f;   // R320: --pass2-scale (1 = the native 2nd pass)
             std::wstring snip, outp = g_dir + L"nrbench_result.ini", log = g_dir + L"nrbench_log.txt";
             for (int j = 1; j + 1 < argc; ++j)
             {
@@ -250,6 +251,7 @@ int wmain(int argc, wchar_t **argv)
                 else if (!wcscmp(argv[j], L"--res")) swscanf_s(argv[++j], L"%ux%u", &w, &hh);
                 else if (!wcscmp(argv[j], L"--passes")) passes = (unsigned)_wtoi(argv[++j]);
                 else if (!wcscmp(argv[j], L"--frames")) frames = (unsigned)_wtoi(argv[++j]);
+                else if (!wcscmp(argv[j], L"--pass2-scale")) p2s = (float)_wtof(argv[++j]);
                 else if (!wcscmp(argv[j], L"--snippet")) snip = argv[++j];
                 else if (!wcscmp(argv[j], L"--out")) outp = argv[++j];
             }
@@ -260,13 +262,16 @@ int wmain(int argc, wchar_t **argv)
             }
             if (n < 0 || w == 0 || hh == 0 || snip.empty())
             {
-                printf("usage: nrcheck.exe --bench --neural <adapter index> [--other <index>] --res WxH [--passes 1|2] [--frames N] [--snippet path] [--out file]\n");
+                printf("usage: nrcheck.exe --bench --neural <adapter index> [--other <index>] --res WxH [--passes 1|2] [--pass2-scale 0.30-1.00] [--frames N] [--snippet path] [--out file]\n");
                 return 3;
             }
             DeleteFileW(log.c_str());
             HMODULE m = LoadLibraryW((g_dir + L"nvngx.dll_nrcheck.dll").c_str());
             if (m == nullptr) { printf("nvngx.dll_nrcheck.dll not found beside nrcheck.exe\n"); return 3; }
             typedef int (*bench_fn)(int, int, const wchar_t *, const wchar_t *, unsigned, unsigned, unsigned, unsigned, const wchar_t *);
+            typedef int (*bench2_fn)(int, int, const wchar_t *, const wchar_t *, unsigned, unsigned, unsigned, unsigned, const wchar_t *, float);
+            bench2_fn run2 = (bench2_fn)GetProcAddress(m, "nrbench_run2");   // R320
+            if (run2 != nullptr) return run2(n, o, snip.c_str(), log.c_str(), w, hh, passes, frames, outp.c_str(), p2s);
             bench_fn run = (bench_fn)GetProcAddress(m, "nrbench_run");
             if (run == nullptr) { printf("nrbench_run not exported\n"); return 3; }
             return run(n, o, snip.c_str(), log.c_str(), w, hh, passes, frames, outp.c_str());

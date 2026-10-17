@@ -87,7 +87,7 @@ a guarded shape, under his name:
 
 Thank you for both, and for the disassembly in particular.
 
-## [lordzaxxon555-art](https://github.com/lordzaxxon555-art)
+## Dominique Tremblay - [lordzaxxon555-art](https://github.com/lordzaxxon555-art)
 
 His test system for this work: RTX 4080 SUPER (game) and RTX 5060 Ti (DLSS-NR), 3840x2160, Starfield.
 

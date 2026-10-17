@@ -574,15 +574,33 @@ namespace
                         double mean() const { return n ? sum / n : 0.0; } };
 }
 
+// R320: pass2_scale < 1 benches pass 2 as the add-on's residual 2nd pass (R316/R319): its
+// feature created and evaluated at pass2_scale x the size (even, at least 128), reading a
+// work-sized input - what ResidualPass=2 runs. 1 (or nrbench_run) = the native 2nd pass.
+// Only the NR evaluate is timed; the add-on's downsample and resolve are not in the number.
 extern "C" __declspec(dllexport)
-int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, const wchar_t *log_path,
-                unsigned width, unsigned height, unsigned passes, unsigned frames, const wchar_t *result_path)
+int nrbench_run2(int neural_index, int other_index, const wchar_t *snippet_path, const wchar_t *log_path,
+                 unsigned width, unsigned height, unsigned passes, unsigned frames, const wchar_t *result_path,
+                 float pass2_scale)
 {
     if (log_path != nullptr && log_path[0] != L'\0') _wfopen_s(&g_out, log_path, L"a");
     if (passes < 1u) passes = 1u; if (passes > 2u) passes = 2u;
     if (frames < 20u) frames = 20u; if (frames > 5000u) frames = 5000u;
     if (width < 64u || height < 64u || width > 8192u || height > 8192u)
     { out("BENCH: resolution %ux%u refused", width, height); return 3; }
+    // R320: the residual 2nd pass's size
+    const bool rsd = (passes > 1u && pass2_scale > 0.05f && pass2_scale < 0.999f);
+    unsigned sw = width, sh = height;
+    if (rsd)
+    {
+        sw = ((unsigned)((double)width  * (double)pass2_scale + 0.5)) & ~1u;
+        sh = ((unsigned)((double)height * (double)pass2_scale + 0.5)) & ~1u;
+        if (sw < 128u) sw = 128u;
+        if (sh < 128u) sh = 128u;
+        if (sw > width)  sw = width;
+        if (sh > height) sh = height;
+        out("R320: pass 2 is the residual 2nd pass at %ux%u (scale %.2f) - only its NR evaluate is timed", sw, sh, (double)pass2_scale);
+    }
 
     out("---- BENCH on neural adapter[%d]: %ux%u, %u pass(es), %u frames ----", neural_index, width, height, passes, frames);
     ID3D12Device *other = (other_index >= 0) ? make_device((UINT)other_index, "other (the game's)") : nullptr;
@@ -612,7 +630,7 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
     {
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)&nrbench_run, &self);
+                           (LPCWSTR)&nrbench_run2, &self);   // R320: any function of this DLL names it; nrbench_run is defined below
         GetModuleFileNameW(self, n.data_path, MAX_PATH);
         wchar_t *sl = wcsrchr(n.data_path, L'\\');
         if (sl != nullptr) sl[1] = L'\0';
@@ -670,6 +688,10 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
         (passes > 1u) ? make_tex2d(dev, width, height, fmt_color, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) : nullptr };
     if (!tex_color || !tex_mvec || !tex_out[0] || (passes > 1u && !tex_out[1]) || !rb)
     { out("BENCH: SKIPPED (resources at %ux%u)", width, height); return 3; }
+    // R320: the residual pair at the work size (input filled with noise below, as tex_color)
+    ID3D12Resource *small_in  = rsd ? make_tex2d(dev, sw, sh, fmt_color, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
+    ID3D12Resource *small_out = rsd ? make_tex2d(dev, sw, sh, fmt_color, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) : nullptr;
+    if (rsd && (!small_in || !small_out)) { out("BENCH: SKIPPED (residual resources at %ux%u)", sw, sh); return 3; }
     {
         // upload: noise into colour, zeros into vectors, through one upload buffer each
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fc{}, fm{}; UINT64 szc = 0, szm = 0; UINT rows = 0; UINT64 rowb = 0;
@@ -707,6 +729,37 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
             b[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         }
         cl->ResourceBarrier(2, b);
+        ID3D12Resource *ups = nullptr;   // R320: noise into the residual input
+        if (rsd)
+        {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fs{}; UINT64 szs = 0; UINT srows = 0; UINT64 srowb = 0;
+            D3D12_RESOURCE_DESC ds = small_in->GetDesc();
+            dev->GetCopyableFootprints(&ds, 0, 1, 0, &fs, &srows, &srowb, &szs);
+            ups = make_buffer(dev, szs, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (!ups) { out("BENCH: SKIPPED (residual upload buffer)"); return 3; }
+            unsigned char *ps = nullptr;
+            if (SUCCEEDED(ups->Map(0, nullptr, (void **)&ps)) && ps)
+            {
+                unsigned s2 = 0x9E3779B9u;
+                for (UINT y = 0; y < sh; ++y)
+                {
+                    unsigned char *row = ps + fs.Offset + (UINT64)y * fs.Footprint.RowPitch;
+                    for (UINT x = 0; x < sw * 4u; ++x) { s2 = s2 * 1664525u + 1013904223u; row[x] = (unsigned char)(s2 >> 24); }
+                }
+                ups->Unmap(0, nullptr);
+            }
+            D3D12_TEXTURE_COPY_LOCATION sd{}, ss{};
+            sd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sd.pResource = small_in;
+            ss.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; ss.pResource = ups; ss.PlacedFootprint = fs;
+            cl->CopyTextureRegion(&sd, 0, 0, 0, &ss, nullptr);
+            D3D12_RESOURCE_BARRIER sb{};
+            sb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            sb.Transition.pResource = small_in;
+            sb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            sb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            sb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cl->ResourceBarrier(1, &sb);
+        }
         cl->Close();
         ID3D12CommandList *ls[1] = { cl }; q->ExecuteCommandLists(1, ls);
         q->Signal(fe, 1);
@@ -714,6 +767,7 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
         if (fe->GetCompletedValue() < 1) { fe->SetEventOnCompletion(1, ev); WaitForSingleObject(ev, 10000); }
         CloseHandle(ev);
         upc->Release(); upm->Release();
+        if (ups) ups->Release();
         al->Reset(); cl->Reset(al, nullptr);
     }
 
@@ -736,13 +790,25 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
 
     // ---- create: one handle per pass, as the add-on (P4.1) ----
     NVSDK_NGX_Handle *h[2] = {};
+    // R320: the size a pass's feature and evaluates use (the snippet re-reads Width/Height
+    // and the subrects on every call, so they are set per pass and put back)
+    auto bind_size = [&](unsigned bw, unsigned bh)
+    {
+        params->Set(NVSDK_NGX_Parameter_Width, bw); params->Set(NVSDK_NGX_Parameter_Height, bh);
+        params->Set("DLSSNR.Width", bw); params->Set("DLSSNR.Height", bh);
+        params->Set("DLSSNR.ColorSubrectWidth", bw); params->Set("DLSSNR.ColorSubrectHeight", bh);
+        params->Set("DLSSNR.OutputSubrectWidth", bw); params->Set("DLSSNR.OutputSubrectHeight", bh);
+    };
     for (unsigned p = 0; p < passes; ++p)
     {
         unsigned long seh = 0;
+        const bool small_p = (rsd && p == 1u);
+        if (small_p) { bind_size(sw, sh); params->Set("DLSSNR.Color", small_in); params->Set("DLSSNR.Output", small_out); }
         LARGE_INTEGER f{}, t0{}, t1{}; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
         r = create_guarded(n.create, cl, params, &h[p], &seh);
         QueryPerformanceCounter(&t1);
-        out("  CreateFeature(Reserved18) %ux%u pass %u: 0x%08X (%s) handle=%p elapsed=%.0fms", width, height, p + 1u,
+        if (small_p) bind_size(width, height);
+        out("  CreateFeature(Reserved18) %ux%u pass %u: 0x%08X (%s) handle=%p elapsed=%.0fms", small_p ? sw : width, small_p ? sh : height, p + 1u,
             (unsigned)r, rname(r), (void *)h[p], (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
         if ((unsigned)r == SEH_FAULT) { out("BENCH: CRASH INSIDE NGX at CreateFeature (0x%08lX)", seh); return 4; }
         if (r != NVSDK_NGX_Result_Success || h[p] == nullptr) { out("BENCH: CreateFeature failed"); return 4; }
@@ -766,13 +832,16 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
         al->Reset(); cl->Reset(al, nullptr);
         for (unsigned p = 0; p < passes; ++p)
         {
-            params->Set("DLSSNR.Color", (p == 0) ? tex_color : tex_out[p - 1]);
-            params->Set("DLSSNR.Output", tex_out[p]);
+            const bool small_p = (rsd && p == 1u);   // R320
+            if (small_p) bind_size(sw, sh);
+            params->Set("DLSSNR.Color", small_p ? small_in : ((p == 0) ? tex_color : tex_out[p - 1]));
+            params->Set("DLSSNR.Output", small_p ? small_out : tex_out[p]);
             params->Set("DLSSNR.Reset", (fr == 0) ? 1u : 0u);
             cl->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, p * 2u);
             unsigned long seh = 0;
             r = evaluate_guarded(evaluate, cl, h[p], params, &seh);
             cl->EndQuery(qh, D3D12_QUERY_TYPE_TIMESTAMP, p * 2u + 1u);
+            if (small_p) bind_size(width, height);
             if ((unsigned)r == SEH_FAULT) { out("BENCH: CRASH INSIDE NGX at EvaluateFeature frame %u pass %u (0x%08lX)", fr, p + 1u, seh); rc = 5; break; }
             if (r != NVSDK_NGX_Result_Success) { out("BENCH: EvaluateFeature frame %u pass %u: 0x%08X (%s)", fr, p + 1u, (unsigned)r, rname(r)); rc = 5; break; }
             if (p + 1u < passes)
@@ -822,7 +891,8 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
     out("");
     out("BENCH RESULT %ux%u, %u pass(es), %u frame(s) measured of %u (first %u warm-up excluded):", width, height, passes, st_frame.n, frames, warm);
     for (unsigned p = 0; p < passes; ++p)
-        out("  pass %u: mean %.3f ms  min %.3f  max %.3f  (n=%u)", p + 1u, st[p].mean(), st[p].mn, st[p].mx, st[p].n);
+        out("  pass %u: mean %.3f ms  min %.3f  max %.3f  (n=%u)%s", p + 1u, st[p].mean(), st[p].mn, st[p].mx, st[p].n,
+            (rsd && p == 1u) ? "  <- residual 2nd pass, NR evaluate only" : "");
     out("  per frame: mean %.3f ms  min %.3f  max %.3f  -> fits a %s fps budget", per_frame, st_frame.mn, st_frame.mx, budget);
     if (rc != 0) out("BENCH: ended early (code %d); the numbers above cover the frames that ran", rc);
     if (result_path != nullptr && result_path[0] != L'\0')
@@ -839,10 +909,21 @@ int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, 
             for (unsigned p = 0; p < passes; ++p)
                 fprintf(rf, "Pass%uMeanMs=%.3f\r\nPass%uMinMs=%.3f\r\nPass%uMaxMs=%.3f\r\n", p + 1u, st[p].mean(), p + 1u, st[p].mn, p + 1u, st[p].mx);
             fprintf(rf, "FrameMeanMs=%.3f\r\nFrameMinMs=%.3f\r\nFrameMaxMs=%.3f\r\nBudgetFps=%s\r\n", per_frame, st_frame.mn, st_frame.mx, budget);
+            if (passes > 1u)   // R320
+                fprintf(rf, "Pass2Mode=%s\r\nPass2Width=%u\r\nPass2Height=%u\r\n", rsd ? "residual" : "native", sw, sh);
             fclose(rf);
         }
     }
     for (unsigned p = 0; p < passes; ++p) if (h[p] && n.release) n.release(h[p]);
     (void)other;   // the game's device stays alive until the process exits, as nrcheck_run
     return rc;
+}
+
+// R320: the 0.3.x export, unchanged in behaviour (native 2nd pass).
+extern "C" __declspec(dllexport)
+int nrbench_run(int neural_index, int other_index, const wchar_t *snippet_path, const wchar_t *log_path,
+                unsigned width, unsigned height, unsigned passes, unsigned frames, const wchar_t *result_path)
+{
+    return nrbench_run2(neural_index, other_index, snippet_path, log_path, width, height, passes, frames,
+                        result_path, 1.0f);
 }

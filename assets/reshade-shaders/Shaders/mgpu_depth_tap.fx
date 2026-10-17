@@ -89,11 +89,22 @@ void MGPU_FullscreenVS(in uint id : SV_VertexID,
     position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
 
+// R312 (DepthTransport): the add-on pushes these as preprocessor definitions for
+// this effect only. Absent, the defaults are exactly the texture that shipped.
+#ifndef MGPU_DEPTH_WIDTH
+#define MGPU_DEPTH_WIDTH BUFFER_WIDTH
+#endif
+#ifndef MGPU_DEPTH_HEIGHT
+#define MGPU_DEPTH_HEIGHT BUFFER_HEIGHT
+#endif
+#ifndef MGPU_DEPTH_FORMAT
+#define MGPU_DEPTH_FORMAT R32F
+#endif
 texture MGPU_DepthOutTex
 {
-    Width  = BUFFER_WIDTH;
-    Height = BUFFER_HEIGHT;
-    Format = R32F;
+    Width  = MGPU_DEPTH_WIDTH;
+    Height = MGPU_DEPTH_HEIGHT;
+    Format = MGPU_DEPTH_FORMAT;
 };
 
 // ---- R69: THE MOTION PROBE, AND IT COSTS NOTHING ----

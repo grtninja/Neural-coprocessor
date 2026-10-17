@@ -42,6 +42,7 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "startup_trace.hpp"   // R313
 #include "worker.hpp"
 
 // T4 (brief section 00, exception 1): the add-on's own module handle,
@@ -406,6 +407,7 @@ namespace
     unsigned __stdcall bridge_main(void *arg)
     {
         (void)arg;
+        mgpu::strace::note_bridge_thread();   // R313: first thing - this thread's id (DcompSafeMode and the trace read it)
         mgpu::diag::info("[MGPU][T3] bridge thread started - owns all GPU 1 objects "
                          "(window + message pump arrive with T4)");
 
@@ -608,6 +610,7 @@ namespace
                 mgpu::gpu1::note_bridge_headless(place.outputs_attached == 0);
 
                 snprintf(pline, sizeof pline, "[MGPU][P7.10] window placement - %s", place.detail);
+                if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "window-placement", place.outputs_attached == 0 ? "bridge adapter headless" : "bridge adapter has outputs");   // R313
                 if (place.known) mgpu::diag::info(pline);
                 else             mgpu::diag::warn(pline);
 
@@ -691,6 +694,7 @@ namespace
                              (unsigned)tid);
                     mgpu::diag::info(line);
                     pump = true;
+                    if (mgpu::strace::on()) { char d[64]; snprintf(d, sizeof d, "bridge hwnd=0x%p 1280x720", (void *)hwnd); mgpu::strace::ev(mgpu::strace::R_BT, "window-created", d); }   // R313
 
                     // T5 (section 09): show the window without stealing
                     // activation.
@@ -720,12 +724,17 @@ namespace
                     // mode. Settled here, once, bounded (the V49 wait's 2 s),
                     // so the window, the hotkeys and the present chain below
                     // all read one answer - whoever asked first.
-                    if (!mgpu::gpu1::dcomp_overlay_mode_settled(2000u))
+                    const double r313_s0 = mgpu::strace::now_ms();
+                    const bool r313_mode = mgpu::gpu1::dcomp_overlay_mode_settled(2000u);
+                    if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "mode=%d, settled in %.1f ms on this thread", r313_mode ? 1 : 0, mgpu::strace::now_ms() - r313_s0); mgpu::strace::ev(mgpu::strace::R_BT, "mode-settled", d); }   // R313
+                    if (!r313_mode)
                     {
                         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "window-shown", "mode 0: ShowWindow(SW_SHOWNOACTIVATE)");
                     }
                     else
                     {
+                        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "window-never-shown", "mode 1: hidden, owns the pump only");
                         mgpu::diag::info("[MGPU][V49] the bridge window is created but NEVER "
                                          "SHOWN - it exists only to own the message pump and the "
                                          "resize path. Nothing of the bridge is in the Z-order. "
@@ -888,6 +897,7 @@ namespace
                         {
                             ngx_probe_pending = true;
                             ngx_probe_t0 = GetTickCount64();
+                            if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "ngx-probe-deferred", "R246: runs from the loop after the game's first frame");   // R313
                             mgpu::diag::info("[MGPU][R246] NGX probe DEFERRED: it runs from the present "
                                              "loop once the game has delivered its first frame "
                                              "(finish_effects), or after 15 s, whichever comes first. "
@@ -917,6 +927,7 @@ namespace
                         // Side effect: transit_probe alternates A/A' by
                         // invocation count, so with the startup run skipped the
                         // first hotkey run takes A'.
+                        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "startup-transit-probe", mgpu::gpu1::transit_probes_enabled() ? "RUNS (TransitProbes=1): objects and copies on the GAME's device" : "not run (TransitProbes absent)");   // R313
                         if (mgpu::gpu1::transit_probes_enabled())
                             (void)mgpu::gpu1::transit_probe();
                         else
@@ -961,6 +972,7 @@ namespace
         // whose present chain failed to create) keeps the T4 structure
         // exactly as it was.
         bool removed_logged = false;
+        bool r313_fallback_written = false;   // R313 DcompSafeMode=3
         unsigned long long frame = 0;   // T5: completed presents
 
         // P7.10: AutoArm. Off unless mgpu.ini says otherwise, so every
@@ -1398,6 +1410,30 @@ namespace
                 // gate returns true every time and the loop behaves exactly as
                 // T5 shipped it. The gate does the waiting itself, so a false
                 // return means "nothing new, and we have already slept".
+                // R313: the overlay thread's root request / the value-3 deferred root
+                // (two relaxed loads when nothing is pending), and the trace's per-pass
+                // sample + stop detection (one relaxed load when off).
+                mgpu::gpu1::dcomp_apply_pending();
+                mgpu::strace::bt_tick();
+                // R313 DcompSafeMode=3 fallback: the stop signature fired and the game's
+                // presents have stayed flat for DcompSafeFallbackMs -> the next launch
+                // runs the bridge's own window (DcompOverlay=0), the configuration that
+                // ran on Dlagonborn's machine. R313b: was "DcompSafeMode=2" until value 2
+                // was removed. Written once. Only value 3 ever writes this.
+                if (!r313_fallback_written && mgpu::strace::safe_mode() == 3 && mgpu::strace::stop_fired() &&
+                    mgpu::strace::game_flat_ms() >= (unsigned long long)mgpu::strace::safe_fallback_ms())
+                {
+                    r313_fallback_written = true;
+                    char fb[400];
+                    snprintf(fb, sizeof fb,
+                             "[MGPU][R313] DcompSafeMode=3 FALLBACK: the game's presents have been flat for %llu ms after the first "
+                             "neural frame with the bridge alive and the game's window up. Writing DcompOverlay=0 to mgpu.ini: "
+                             "the NEXT launch uses the bridge's own window instead of composing into the game's window. Set "
+                             "DcompOverlay=1 again to return to the composition mode.",
+                             mgpu::strace::game_flat_ms());
+                    mgpu::diag::error_direct(fb);
+                    (void)mgpu::gpu1::ui_ini_write_word("DcompOverlay", "0");
+                }
                 mgpu::gpu1::stream_poll();
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
@@ -1420,6 +1456,7 @@ namespace
                 {
                     mgpu::diag::info("[MGPU][T5] first successful present (frame 1) - the "
                                      "vsync-paced present loop is alive");
+                    mgpu::strace::note_first_present();   // R313
                 }
                 else if (frame % 600 == 0)
                 {
@@ -1451,6 +1488,7 @@ namespace
                                  (unsigned)reason, (unsigned)tid);
                         mgpu::diag::error(line);
                         removed_logged = true;
+                        if (mgpu::strace::on()) { char w[120]; snprintf(w, sizeof w, "GPU 1 device removed (poll) hr=0x%08X", (unsigned)reason); mgpu::strace::record(w, (unsigned)reason); }   // R313
                     }
                 }
                 continue;
@@ -1507,6 +1545,7 @@ namespace
                          (unsigned)reason, (unsigned)tid);
                 mgpu::diag::error(line);
                 removed_logged = true;
+                if (mgpu::strace::on()) { char w[120]; snprintf(w, sizeof w, "GPU 1 device removed (no-chain poll) hr=0x%08X", (unsigned)reason); mgpu::strace::record(w, (unsigned)reason); }   // R313
             }
         }
 
@@ -1541,6 +1580,7 @@ namespace
         mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (NGX features -> "
                          "gpu1::shutdown [present chain -> device] -> DestroyWindow -> "
                          "UnregisterClass -> adapter::shutdown)");
+        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "bridge-teardown", "ordered teardown begins");   // R313
 
         // V32. THE NGX FEATURES GO FIRST, BEFORE THE DEVICE THEY WERE CREATED
         // AGAINST. Nothing did this before: stream_release() only ran on a

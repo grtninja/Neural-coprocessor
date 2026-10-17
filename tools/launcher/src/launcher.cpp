@@ -1,4 +1,5 @@
-// MGPU Bridge Launcher - 0.3.0, released with the bridge 0.3.0 (LAUNCHER_LEDGER)
+// MGPU Bridge Launcher - 0.4.0 (R320: 2nd pass row, Diagnose benches the 2nd pass the game runs; R320a: COPY FILES replaces mgpu.ini, keeps Dcomp*, optional backup)
+// 0.3.0, released with the bridge 0.3.0 (LAUNCHER_LEDGER)
 //
 // Drawn the way the add-on's idle screen is drawn (src/screen.cpp, R108): an
 // 8% grey field, grey text with the second line at 60%, one slow sweep bar,
@@ -86,7 +87,9 @@ namespace
         ID_ADV_SRQ_Q, ID_ADV_SRQ_B, ID_ADV_SRQ_P,
         ID_ADV_PRESET_0, ID_ADV_PRESET_K, ID_ADV_PRESET_L, ID_ADV_PRESET_M,
         ID_ADV_CROP_OFF, ID_ADV_CROP_ON, ID_ADV_CROP_AUTO,
-        ID_ADV_N16_OFF, ID_ADV_N16_ON, ID_ADV_N16P_M, ID_ADV_N16P_P
+        ID_ADV_N16_OFF, ID_ADV_N16_ON, ID_ADV_N16P_M, ID_ADV_N16P_P,
+        ID_ADV_P2_MED, ID_ADV_P2_LIGHT, ID_ADV_P2_FULL,  // R320: the 2nd pass (the panel's R319 choice)
+        ID_ADV_NRS_OFF, ID_ADV_NRS_ON                    // R321: pass 1 scale (NRS, R299) - the panel's switch
     };
     const UINT_PTR TIMER_SWEEP = 1;
 
@@ -98,6 +101,7 @@ namespace
     const COLORREF C_SEL  = RGB(18, 19, 21);
     const COLORREF C_RED  = RGB(199, 87, 82);    // 0.78 0.34 0.32 - error only
     const COLORREF C_LIT  = RGB(214, 218, 226);  // the chosen display and its cable
+    const COLORREF C_GRN  = RGB(104, 176, 112);  // R329: OPTIMIZATION's state (QUALITY MAX / ON / FPS MAX)
 
     HINSTANCE g_hinst = nullptr;
     HWND g_main = nullptr, g_list = nullptr,
@@ -331,6 +335,18 @@ namespace
         { L"MULTI-DISPLAY: OFF", { L"MULTIMONITOR: N\u00C3O", L"MULTIMONITOR: NO", L"\u591A\u663E\u793A\u5668\uFF1A\u5173", L"\u30DE\u30EB\u30C1\u30C7\u30A3\u30B9\u30D7\u30EC\u30A4\uFF1A\u30AA\u30D5", L"\uB2E4\uC911 \uBAA8\uB2C8\uD130: \uB054" } },
         { L"RENAME", { L"RENOMEAR", L"RENOMBRAR", L"\u91CD\u547D\u540D", L"\u540D\u524D\u3092\u5909\u66F4", L"\uC774\uB984 \uBCC0\uACBD" } },
         { L"SAVE", { L"SALVAR", L"GUARDAR", L"\u4FDD\u5B58", L"\u4FDD\u5B58", L"\uC800\uC7A5" } },
+        // R329
+        { L"OPTIMIZATION", { L"OTIMIZA\u00C7\u00C3O", L"OPTIMIZACI\u00D3N", L"\u4F18\u5316", L"\u6700\u9069\u5316", L"\uCD5C\uC801\uD654" } },
+        { L"QUALITY MAX", { L"QUALIDADE M\u00C1XIMA", L"CALIDAD M\u00C1XIMA", L"\u753B\u8D28\u6700\u9AD8", L"\u753B\u8CEA\u6700\u5927", L"\uD654\uC9C8 \uCD5C\uB300" } },
+        { L"FPS MAX", { L"FPS M\u00C1XIMO", L"FPS M\u00C1XIMO", L"\u5E27\u7387\u6700\u9AD8", L"FPS \u6700\u5927", L"FPS \uCD5C\uB300" } },
+        // R328: dialog captions (the same words as the buttons, in sentence case).
+        { L"Copy files", { L"Copiar arquivos", L"Copiar archivos", L"\u590D\u5236\u6587\u4EF6", L"\u30D5\u30A1\u30A4\u30EB\u3092\u30B3\u30D4\u30FC", L"\uD30C\uC77C \uBCF5\uC0AC" } },
+        { L"Diagnose", { L"Diagn\u00F3stico", L"Diagn\u00F3stico", L"\u8BCA\u65AD", L"\u8A3A\u65AD", L"\uC9C4\uB2E8" } },
+        { L"Force fit", { L"Ajuste for\u00E7ado", L"Ajuste forzado", L"\u5F3A\u5236\u9002\u914D", L"\u5F37\u5236\u30D5\u30A3\u30C3\u30C8", L"\uAC15\uC81C \uB9DE\uCDA4" } },
+        { L"Launch record", { L"Registro", L"Registro", L"\u542F\u52A8\u8BB0\u5F55", L"\u8D77\u52D5\u8A18\u9332", L"\uC2E4\uD589 \uAE30\uB85D" } },
+        { L"Multi-display", { L"Multimonitor", L"Multimonitor", L"\u591A\u663E\u793A\u5668", L"\u30DE\u30EB\u30C1\u30C7\u30A3\u30B9\u30D7\u30EC\u30A4", L"\uB2E4\uC911 \uBAA8\uB2C8\uD130" } },
+        { L"Options", { L"Op\u00E7\u00F5es", L"Opciones", L"\u9009\u9879", L"\u30AA\u30D7\u30B7\u30E7\u30F3", L"\uC635\uC158" } },
+        { L"Save", { L"Salvar", L"Guardar", L"\u4FDD\u5B58", L"\u4FDD\u5B58", L"\uC800\uC7A5" } },
         { L"SAVES TO: ", { L"SALVA EM: ", L"SE GUARDA EN: ", L"\u4FDD\u5B58\u5230\uFF1A", L"\u4FDD\u5B58\u5148\uFF1A", L"\uC800\uC7A5 \uC704\uCE58: " } },
         { L"UNSAVED CHANGES", { L"ALTERA\u00C7\u00D5ES N\u00C3O SALVAS", L"CAMBIOS SIN GUARDAR", L"\u6709\u672A\u4FDD\u5B58\u7684\u66F4\u6539", L"\u672A\u4FDD\u5B58\u306E\u5909\u66F4\u3042\u308A", L"\uC800\uC7A5\uB418\uC9C0 \uC54A\uC740 \uBCC0\uACBD" } },
         { L"SAVED", { L"SALVO", L"GUARDADO", L"\u5DF2\u4FDD\u5B58", L"\u4FDD\u5B58\u6E08\u307F", L"\uC800\uC7A5\uB428" } },
@@ -340,7 +356,19 @@ namespace
         { L"The changes for %s are not saved.\n\nSave them to %s?", { L"As altera\u00E7\u00F5es de %s n\u00E3o foram salvas.\n\nSalvar em %s?", L"Los cambios de %s no se han guardado.\n\n\u00BFGuardarlos en %s?", L"%s \u7684\u66F4\u6539\u5C1A\u672A\u4FDD\u5B58\u3002\n\n\u4FDD\u5B58\u5230 %s \u5417\uFF1F", L"%s \u306E\u5909\u66F4\u306F\u4FDD\u5B58\u3055\u308C\u3066\u3044\u307E\u305B\u3093\u3002\n\n%s \u306B\u4FDD\u5B58\u3057\u307E\u3059\u304B\uFF1F", L"%s\uC758 \uBCC0\uACBD \uC0AC\uD56D\uC774 \uC800\uC7A5\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4.\n\n%s\uC5D0 \uC800\uC7A5\uD560\uAE4C\uC694?" } },
         { L"THE ADD-ON DECIDES - MAIN DISPLAY: ", { L"O ADD-ON DECIDE - MONITOR PRINCIPAL: ", L"EL ADD-ON DECIDE - MONITOR PRINCIPAL: ", L"\u7531\u63D2\u4EF6\u51B3\u5B9A - \u4E3B\u663E\u793A\u5668\uFF1A", L"\u30A2\u30C9\u30AA\u30F3\u304C\u6C7A\u5B9A - \u30E1\u30A4\u30F3\u30C7\u30A3\u30B9\u30D7\u30EC\u30A4\uFF1A", L"\uC560\uB4DC\uC628\uC774 \uACB0\uC815 - \uAE30\uBCF8 \uBAA8\uB2C8\uD130: " } },
         { L"THE ADD-ON DECIDES - MAIN DISPLAY NOT FOUND", { L"O ADD-ON DECIDE - SEM MONITOR PRINCIPAL", L"EL ADD-ON DECIDE - SIN MONITOR PRINCIPAL", L"\u7531\u63D2\u4EF6\u51B3\u5B9A - \u672A\u627E\u5230\u4E3B\u663E\u793A\u5668", L"\u30A2\u30C9\u30AA\u30F3\u304C\u6C7A\u5B9A - \u30E1\u30A4\u30F3\u30C7\u30A3\u30B9\u30D7\u30EC\u30A4\u304C\u898B\u3064\u304B\u308A\u307E\u305B\u3093", L"\uC560\uB4DC\uC628\uC774 \uACB0\uC815 - \uAE30\uBCF8 \uBAA8\uB2C8\uD130\uB97C \uCC3E\uC744 \uC218 \uC5C6\uC74C" } },
-        { L"OLD DISPLAY= LINE IN MGPU.INI - SAVE REMOVES IT", { L"DISPLAY= ANTIGO NO MGPU.INI - SALVAR REMOVE", L"DISPLAY= ANTIGUO EN MGPU.INI - GUARDAR LO QUITA", L"MGPU.INI \u4E2D\u6709\u65E7\u7684 DISPLAY= \u884C - \u4FDD\u5B58\u65F6\u5220\u9664", L"MGPU.INI \u306B\u53E4\u3044 DISPLAY= \u884C\u3042\u308A - \u4FDD\u5B58\u3067\u524A\u9664", L"MGPU.INI\uC5D0 \uC774\uC804 DISPLAY= \uC904 \uC788\uC74C - \uC800\uC7A5\uD558\uBA74 \uC0AD\uC81C" } }
+        { L"OLD DISPLAY= LINE IN MGPU.INI - SAVE REMOVES IT", { L"DISPLAY= ANTIGO NO MGPU.INI - SALVAR REMOVE", L"DISPLAY= ANTIGUO EN MGPU.INI - GUARDAR LO QUITA", L"MGPU.INI \u4E2D\u6709\u65E7\u7684 DISPLAY= \u884C - \u4FDD\u5B58\u65F6\u5220\u9664", L"MGPU.INI \u306B\u53E4\u3044 DISPLAY= \u884C\u3042\u308A - \u4FDD\u5B58\u3067\u524A\u9664", L"MGPU.INI\uC5D0 \uC774\uC804 DISPLAY= \uC904 \uC788\uC74C - \uC800\uC7A5\uD558\uBA74 \uC0AD\uC81C" } },
+        // R320
+        { L"2ND PASS", { L"2\u00AA PASSAGEM", L"2\u00AA PASADA", L"\u7B2C\u4E8C\u904D", L"\u7B2C2\u30D1\u30B9", L"2\uCC28 \uD328\uC2A4" } },
+        { L"MEDIUM", { L"M\u00C9DIO", L"MEDIO", L"\u4E2D", L"\u4E2D", L"\uC911\uAC04" } },
+        { L"LIGHT", { L"LEVE", L"LIGERO", L"\u8F7B", L"\u8EFD", L"\uAC00\uBCBC\uC6C0" } },
+        { L"FULL", { L"COMPLETO", L"COMPLETO", L"\u5B8C\u6574", L"\u30D5\u30EB", L"\uC804\uCCB4" } },
+        { L"PASS 1 SCALE (NRS)", { L"ESCALA DA 1\u00AA PASSAGEM (NRS)", L"ESCALA DE LA 1\u00AA PASADA (NRS)", L"\u7B2C\u4E00\u904D\u7F29\u653E (NRS)", L"\u7B2C1\u30D1\u30B9\u306E\u30B9\u30B1\u30FC\u30EB (NRS)", L"1\uCC28 \uD328\uC2A4 \uBC30\uC728 (NRS)" } },
+        { L"This game already has an mgpu.ini. Replace it with the one in this release? Your Dcomp settings are kept.\n\nYes: replace it and keep a backup of the old file.\nNo: replace it with no backup.\nCancel: keep the current mgpu.ini.", { L"Este jogo j\u00E1 tem um mgpu.ini. Substituir pelo desta vers\u00E3o? Suas configura\u00E7\u00F5es Dcomp s\u00E3o mantidas.\n\nSim: substituir e guardar uma c\u00F3pia do arquivo antigo.\nN\u00E3o: substituir sem c\u00F3pia.\nCancelar: manter o mgpu.ini atual.", L"Este juego ya tiene un mgpu.ini. \u00BFReemplazarlo por el de esta versi\u00F3n? Tus ajustes Dcomp se conservan.\n\nS\u00ED: reemplazarlo y guardar una copia del archivo anterior.\nNo: reemplazarlo sin copia.\nCancelar: mantener el mgpu.ini actual.", L"\u6B64\u6E38\u620F\u5DF2\u6709 mgpu.ini\u3002\u8981\u7528\u672C\u7248\u672C\u7684\u6587\u4EF6\u66FF\u6362\u5417\uFF1F\u60A8\u7684 Dcomp \u8BBE\u7F6E\u4F1A\u4FDD\u7559\u3002\n\n\u662F\uFF1A\u66FF\u6362\u5E76\u5907\u4EFD\u65E7\u6587\u4EF6\u3002\n\u5426\uFF1A\u66FF\u6362\uFF0C\u4E0D\u5907\u4EFD\u3002\n\u53D6\u6D88\uFF1A\u4FDD\u7559\u5F53\u524D\u7684 mgpu.ini\u3002", L"\u3053\u306E\u30B2\u30FC\u30E0\u306B\u306F\u3059\u3067\u306B mgpu.ini \u304C\u3042\u308A\u307E\u3059\u3002\u3053\u306E\u30EA\u30EA\u30FC\u30B9\u306E\u3082\u306E\u306B\u7F6E\u304D\u63DB\u3048\u307E\u3059\u304B\uFF1FDcomp \u306E\u8A2D\u5B9A\u306F\u4FDD\u6301\u3055\u308C\u307E\u3059\u3002\n\n\u306F\u3044\uFF1A\u7F6E\u304D\u63DB\u3048\u3066\u53E4\u3044\u30D5\u30A1\u30A4\u30EB\u3092\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u3002\n\u3044\u3044\u3048\uFF1A\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u306A\u3057\u3067\u7F6E\u304D\u63DB\u3048\u3002\n\u30AD\u30E3\u30F3\u30BB\u30EB\uFF1A\u73FE\u5728\u306E mgpu.ini \u3092\u305D\u306E\u307E\u307E\u4F7F\u3046\u3002", L"\uC774 \uAC8C\uC784\uC5D0\uB294 \uC774\uBBF8 mgpu.ini\uAC00 \uC788\uC2B5\uB2C8\uB2E4. \uC774 \uBC84\uC804\uC758 \uD30C\uC77C\uB85C \uBC14\uAFB8\uC2DC\uACA0\uC2B5\uB2C8\uAE4C? Dcomp \uC124\uC815\uC740 \uC720\uC9C0\uB429\uB2C8\uB2E4.\n\n\uC608: \uBC14\uAFB8\uACE0 \uC774\uC804 \uD30C\uC77C\uC744 \uBC31\uC5C5\uD569\uB2C8\uB2E4.\n\uC544\uB2C8\uC694: \uBC31\uC5C5 \uC5C6\uC774 \uBC14\uAFC9\uB2C8\uB2E4.\n\uCDE8\uC18C: \uD604\uC7AC mgpu.ini\uB97C \uADF8\uB300\uB85C \uB461\uB2C8\uB2E4." } },
+        { L"Backup of the old mgpu.ini: ", { L"C\u00F3pia do mgpu.ini antigo: ", L"Copia del mgpu.ini anterior: ", L"\u65E7 mgpu.ini \u7684\u5907\u4EFD\uFF1A", L"\u53E4\u3044 mgpu.ini \u306E\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\uFF1A", L"\uC774\uC804 mgpu.ini \uBC31\uC5C5: " } },
+        { L"The backup could not be written - mgpu.ini was not replaced.", { L"N\u00E3o foi poss\u00EDvel gravar a c\u00F3pia - o mgpu.ini n\u00E3o foi substitu\u00EDdo.", L"No se pudo escribir la copia - mgpu.ini no se reemplaz\u00F3.", L"\u65E0\u6CD5\u5199\u5165\u5907\u4EFD - mgpu.ini \u672A\u88AB\u66FF\u6362\u3002", L"\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u3092\u66F8\u304D\u8FBC\u3081\u307E\u305B\u3093\u3067\u3057\u305F - mgpu.ini \u306F\u7F6E\u304D\u63DB\u3048\u3089\u308C\u3066\u3044\u307E\u305B\u3093\u3002", L"\uBC31\uC5C5\uC744 \uC4F8 \uC218 \uC5C6\uC5B4 mgpu.ini\uB97C \uBC14\uAFB8\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4." } },
+        { L"mgpu.ini replaced with the release's.", { L"mgpu.ini substitu\u00EDdo pelo desta vers\u00E3o.", L"mgpu.ini reemplazado por el de esta versi\u00F3n.", L"mgpu.ini \u5DF2\u66FF\u6362\u4E3A\u672C\u7248\u672C\u7684\u6587\u4EF6\u3002", L"mgpu.ini \u3092\u3053\u306E\u30EA\u30EA\u30FC\u30B9\u306E\u3082\u306E\u306B\u7F6E\u304D\u63DB\u3048\u307E\u3057\u305F\u3002", L"mgpu.ini\uB97C \uC774 \uBC84\uC804\uC758 \uD30C\uC77C\uB85C \uBC14\uAFE8\uC2B5\uB2C8\uB2E4." } },
+        { L"Kept: ", { L"Mantido: ", L"Conservado: ", L"\u4FDD\u7559\uFF1A", L"\u4FDD\u6301\uFF1A", L"\uC720\uC9C0: " } },
+        { L" (2ND PASS ", { L" (2\u00AA PASSAGEM ", L" (2\u00AA PASADA ", L" (\u7B2C\u4E8C\u904D ", L" (\u7B2C2\u30D1\u30B9 ", L" (2\uCC28 \uD328\uC2A4 " } },
     };
     const wchar_t *tr_lookup(const wchar_t *s)
     {
@@ -1186,6 +1214,8 @@ namespace
         bool sr = false; bool sr_native = true; int sr_mode = 2; int sr_preset = 0;
         int crop = 0;               // 0 off, 1 on, 2 auto
         bool n16 = false; double n16_power = 2.2;
+        int pass2 = 2;              // R320: 0 Medium, 1 Light, 2 Full (no ResidualPass=2 line)
+        bool nrs = false;           // R321: NRScale present and above 0.05 (R299's own test)
     };
     adv_view g_adv;
 
@@ -1216,6 +1246,9 @@ namespace
         }
         a.n16 = gi("NRInput16", 0) != 0;
         a.n16_power = gf("NRInput16Power", 2.2);
+        // R320: read the way the panel reads it (R319)
+        a.pass2 = (gi("ResidualPass", -1) == 2) ? ((gi("ResidualRender", 0) == 1) ? 1 : 0) : 2;
+        a.nrs = gf("NRScale", 0.0) > 0.05;   // R321
         g_adv = a;
     }
 
@@ -1286,10 +1319,10 @@ namespace
         case ID_ADV_FG_THIN: kv.push_back({ "NRFrameFilter", "3" }); break;
         case ID_ADV_KEEP_M: kv.push_back({ "NRFrameKeep", std::to_string(a.keep > 2 ? a.keep - 1 : 2) }); break;
         case ID_ADV_KEEP_P: kv.push_back({ "NRFrameKeep", std::to_string(a.keep < 8 ? a.keep + 1 : 8) }); break;
-        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); break;
+        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); kv.push_back({ "NRScale", "0" }); break;   // R329: OPTIMIZATION off
         case ID_ADV_SR_ON:  kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, a.sr_native); break;
-        case ID_ADV_SR_NATIVE: adv_sr_mode_pairs(kv, a.sr_mode, true); break;
-        case ID_ADV_SR_EXP:    adv_sr_mode_pairs(kv, a.sr_mode, false); break;
+        case ID_ADV_SR_NATIVE: kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, true);  kv.push_back({ "NRScale", "0" }); break;   // R329
+        case ID_ADV_SR_EXP:    kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, false); kv.push_back({ "NRScale", "0" }); break;   // R329
         case ID_ADV_SRQ_Q: adv_sr_mode_pairs(kv, 2, a.sr_native); break;
         case ID_ADV_SRQ_B: adv_sr_mode_pairs(kv, 1, a.sr_native); break;
         case ID_ADV_SRQ_P: adv_sr_mode_pairs(kv, 0, a.sr_native); break;
@@ -1304,6 +1337,13 @@ namespace
         case ID_ADV_N16_ON:  kv.push_back({ "NRInput16", "4" }); break;
         case ID_ADV_N16P_M: kv.push_back({ "NRInput16Power", f2(step(a.n16_power, -0.1, 1, 3)) }); break;
         case ID_ADV_N16P_P: kv.push_back({ "NRInput16Power", f2(step(a.n16_power, +0.1, 1, 3)) }); break;
+        // R320: the same keys the panel's "2nd pass (x2)" writes (R319)
+        case ID_ADV_P2_MED:   kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "0" }); break;
+        case ID_ADV_P2_LIGHT: kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "1" }); break;
+        case ID_ADV_P2_FULL:  kv.push_back({ "ResidualPass", "0" }); break;
+        // R321: the panel's "Pass 1 scale (NRS)" switch, same keys
+        case ID_ADV_NRS_ON:  kv.push_back({ "NRScale", "0.75" }); kv.push_back({ "NRScaleResolveDepth", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R329: one at a time
+        case ID_ADV_NRS_OFF: kv.push_back({ "NRScale", "0" }); break;
         default: return;
         }
         adv_write(kv);
@@ -1373,8 +1413,11 @@ namespace
                 else
                 {
                     v.diag_short = short_card(v.diag_card) + L" " + g("Width") + L"X" + g("Height") + L" " + g("Passes") + L"P " + fmt1(g("FrameMeanMs")) + L" MS/FRAME";
+                    // R320: a residual 2nd pass says its size
+                    const std::wstring p2 = (g("Pass2Mode") == L"residual") ? tr(L" (2ND PASS ") + g("Pass2Width") + L"X" + g("Pass2Height") + L")" : L"";
+                    v.diag_short += p2;
                     v.diag = { tr(L"SYNTHETIC: ") + short_card(v.diag_card) + L"  " + g("Width") + L"X" + g("Height") + L"  " + g("Passes") + (g("Passes") == L"1" ? tr(L" PASS  ") : tr(L" PASSES  "))
-                               + fmt1(g("FrameMeanMs")) + tr(L" MS/FRAME  FITS ") + g("BudgetFps") + L" FPS", C_FG };
+                               + fmt1(g("FrameMeanMs")) + tr(L" MS/FRAME  FITS ") + g("BudgetFps") + L" FPS" + p2, C_FG };
                 }
             }
             view_layout(ini, v);
@@ -1558,6 +1601,61 @@ namespace
             if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) ++copied;
             else { report += tr(L"could not copy: ") + f.rel + L"\r\n"; ++missing; }
         }
+        // R320a (Marcelo 2026-10-16 15:14): an existing mgpu.ini is REPLACED by the release's,
+        // so an upgrade gets every 0.4.0 default. The only lines carried over are the Dcomp*
+        // keys - the display/composition preference the person chose. Before replacing, the
+        // person is asked: Yes = replace and keep a backup (mgpu.ini.bak_<date>_<time>),
+        // No = replace with no backup, Cancel = keep the current mgpu.ini as it is.
+        {
+            const std::wstring gi_path = join(game, L"mgpu.ini");
+            const std::string pay = read_file(join(payload, L"mgpu.ini"));
+            const std::string cur = read_file(gi_path);
+            if (!pay.empty() && !cur.empty() && pay != cur)
+            {
+                const int ans = tr_box(g_main, L"This game already has an mgpu.ini. Replace it with the one in this release? Your Dcomp settings are kept.\n\nYes: replace it and keep a backup of the old file.\nNo: replace it with no backup.\nCancel: keep the current mgpu.ini.",
+                                       L"Copy files", MB_YESNOCANCEL | MB_ICONQUESTION);
+                if (ans == IDYES || ans == IDNO)
+                {
+                    bool ok = true;
+                    if (ans == IDYES)
+                    {
+                        SYSTEMTIME t{}; GetLocalTime(&t);
+                        wchar_t bn[64];
+                        swprintf_s(bn, L"mgpu.ini.bak_%04u%02u%02u_%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                        if (CopyFileW(gi_path.c_str(), join(game, bn).c_str(), TRUE)) report += tr(L"Backup of the old mgpu.ini: ") + bn + L"\r\n";
+                        else { report += tr(L"The backup could not be written - mgpu.ini was not replaced.") + L"\r\n"; ++missing; ok = false; }
+                    }
+                    if (ok)
+                    {
+                        // carry the Dcomp* lines (active ones only) into the release's file
+                        std::string out = pay, kept_keys;
+                        size_t pos = 0;
+                        while (pos < cur.size())
+                        {
+                            size_t eol = cur.find('\n', pos);
+                            if (eol == std::string::npos) eol = cur.size();
+                            std::string ln = cur.substr(pos, eol - pos);
+                            if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+                            const size_t eq = ln.find('=');
+                            if (ln.compare(0, 5, "Dcomp") == 0 && eq != std::string::npos && eq > 5)
+                            {
+                                const std::string k = ln.substr(0, eq), v = ln.substr(eq + 1);
+                                out = ini_set(out, k.c_str(), v);
+                                kept_keys += (kept_keys.empty() ? "" : ", ") + k + "=" + v;
+                            }
+                            pos = eol + 1;
+                        }
+                        if (write_file(gi_path, out))
+                        {
+                            report += tr(L"mgpu.ini replaced with the release's.") + L"\r\n";
+                            if (!kept_keys.empty()) report += tr(L"Kept: ") + utf8_to_w(kept_keys) + L"\r\n";
+                            if (kept > 0) --kept;   // counted as kept in the loop above
+                        }
+                        else { report += tr(L"mgpu.ini could not be written.") + L"\r\n"; ++missing; }
+                    }
+                }
+            }
+        }
         std::wstring after;
         bool warn = missing != 0;
         if (!file_exists(join(game, L"mgpu\\nvngx_dlssnr.dll")))
@@ -1697,6 +1795,12 @@ namespace
             return;
         }
         const std::wstring exe = join(game, L"nrcheck.exe"), dll = join(game, L"nvngx.dll_nrcheck.dll");
+        // R320: the payload's copy wins whenever it is there, so the game folder never keeps
+        // an older nrcheck that does not know --pass2-scale (it would bench the native pass).
+        {
+            const std::wstring pe = join(g_exe_dir, L"payload\\tools\\nrcheck.exe"), pd = join(g_exe_dir, L"payload\\tools\\nvngx.dll_nrcheck.dll");
+            if (file_exists(pe) && file_exists(pd)) { CopyFileW(pe.c_str(), exe.c_str(), FALSE); CopyFileW(pd.c_str(), dll.c_str(), FALSE); }
+        }
         if (!file_exists(exe) || !file_exists(dll))
         {
             const std::wstring pe = join(g_exe_dir, L"payload\\tools\\nrcheck.exe"), pd = join(g_exe_dir, L"payload\\tools\\nvngx.dll_nrcheck.dll");
@@ -1715,6 +1819,16 @@ namespace
         }
         wchar_t cmd[1024];
         swprintf_s(cmd, L"\"%s\" --bench --neural %d --other -1 --res %s --passes %d --frames 300", exe.c_str(), idx, k_res[g_res_idx], g_passes);
+        // R320: the 2nd pass the game would run. Medium and Light both bench at ResidualScale:
+        // with no game there is no DLSS mode, so Light has no render size to follow - the
+        // add-on does the same when the game has no DLSS table.
+        if (g_passes == 2 && g_adv.pass2 != 2 && !g_adv.nrs)   // R321: with NRS on pass 1 the residual 2nd pass is off
+        {
+            double p2 = atof(ini_get(g_work_ini, "ResidualScale").c_str());
+            if (p2 < 0.30 || p2 > 1.00) p2 = 0.75;
+            wchar_t extra[64]; swprintf_s(extra, L" --pass2-scale %.2f", p2);
+            wcscat_s(cmd, extra);
+        }
         std::wstring msg;
         {
             wchar_t mb[1200];
@@ -1869,8 +1983,11 @@ namespace
     const adv_row_def k_adv_rows[] = {
         { L"TUNING", 2, AV_TEXT },     { L"MODEL STYLE", 3, AV_NONE },   { L"TONE", 2, AV_NUM },
         { L"STRUCTURE", 2, AV_NUM },   { L"SKIN", 2, AV_NUM },           { L"AUTO MASK", 2, AV_NONE },
-        { L"INTENSITY", 2, AV_NUM },   { L"PASSES", 2, AV_NONE },        { L"FRAME GENERATION", 4, AV_NONE },
-        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"DLSS ON GPU 1", 2, AV_NONE },  { L"UPSCALING", 2, AV_NONE },
+        { L"INTENSITY", 2, AV_NUM },   { L"PASSES", 2, AV_NONE },
+        { L"FRAME GENERATION", 4, AV_NONE },
+        // R329: the 2nd pass choice is the panel's Experimental setting only; NRS joins the
+        // upscaling choices in one row (one of them at a time), which replaces DLSS ON GPU 1.
+        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"OPTIMIZATION", 4, AV_NONE },
         { L"DLSS MODE", 3, AV_NONE },  { L"DLSS PRESET", 4, AV_NONE },   { L"CROP", 3, AV_NONE },
         { L"16-BIT COLOUR", 2, AV_NONE }, { L"16-BIT POWER", 2, AV_NUM },
     };
@@ -1890,8 +2007,8 @@ namespace
         case 3:  return { wf2(a.structure), a.tuning ? C_FG : C_DIM };
         case 4:  return { wf2(a.skin), a.tuning ? C_FG : C_DIM };
         case 6:  return { wf2(a.intensity), C_FG };
-        case 9:  return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };
-        case 16: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };
+        case 9:  return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };   // R329: rows renumbered
+        case 15: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };
         default: return { L"", C_DIM };
         }
     }
@@ -1908,7 +2025,16 @@ namespace
         int y = g_adv_end + 6;
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION NEEDS MVEC=3 (THE GAME'S OWN VECTORS).", C_DIM);
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION SETTINGS MAY CRASH THE GAME AT STARTUP.", C_RED);
-        guide_para(dc, PX, y, PW, L"DLSS ON GPU 1: OFF IS THE BETTER PICTURE, ON IS CHEAPER.", C_DIM);
+        {   // R329: OPTIMIZATION's state in words and colour: OFF (red) QUALITY MAX (green), or ON FPS MAX (green)
+            const bool on = g_view.have_game && (g_adv.nrs || g_adv.sr);
+            const bool lit = g_view.have_game;
+            const std::wstring w0 = L"OPTIMIZATION", w1 = on ? L"ON" : L"OFF", w2 = on ? L"FPS MAX" : L"QUALITY MAX";
+            const int gap = 12;
+            int x = PX;
+            textf(dc, x, y + 4, PW, w0, 2, C_DIM);                                 x += text_w(w0, 2) + gap;
+            textf(dc, x, y + 4, PW - (x - PX), w1, 2, !lit ? C_DIM : on ? C_GRN : C_RED); x += text_w(w1, 2) + gap;
+            textf(dc, x, y + 4, PW - (x - PX), w2, 2, lit ? C_GRN : C_DIM);
+        }
     }
 
     // ---- the INSTALL page (the install guide; ID_TAB_GUIDE). Readable
@@ -1984,7 +2110,7 @@ namespace
         text(dc, PX, 18, L"MGPU BRIDGE", 4, C_FG);
         {
             const int x = PX + text_w(L"MGPU BRIDGE", 4) + 24;
-            textf(dc, x, 28, g_tabs_x - 10 - x, L"LAUNCHER 0.3.0", 2, C_DIM);
+            textf(dc, x, 28, g_tabs_x - 10 - x, L"LAUNCHER 0.4.0", 2, C_DIM);
         }
         if (g_tab == 2) { paint_guide(dc); paint_sweep(dc); return; }
         if (!v.have_game)
@@ -2397,8 +2523,7 @@ namespace
             grp({ { L"1", ID_ADV_PASSES_1 }, { L"2", ID_ADV_PASSES_2 } }, ADV_VX);
             grp({ { L"OFF", ID_ADV_FG_OFF }, { L"MAP ONLY", ID_ADV_FG_MAP }, { L"FIX VECTORS", ID_ADV_FG_FIX }, { L"FIX + THIN", ID_ADV_FG_THIN } }, ADV_VX);
             pm(ID_ADV_KEEP_M, ID_ADV_KEEP_P);
-            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"ON", ID_ADV_SR_ON } }, ADV_VX);
-            grp({ { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);
+            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"PASS 1 SCALE (NRS)", ID_ADV_NRS_ON }, { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);   // R329
             grp({ { L"QUALITY", ID_ADV_SRQ_Q }, { L"BALANCED", ID_ADV_SRQ_B }, { L"PERFORMANCE", ID_ADV_SRQ_P } }, ADV_VX);
             grp({ { L"TITLE DEFAULT", ID_ADV_PRESET_0 }, { L"K", ID_ADV_PRESET_K }, { L"L", ID_ADV_PRESET_L }, { L"M", ID_ADV_PRESET_M } }, ADV_VX);
             grp({ { L"OFF", ID_ADV_CROP_OFF }, { L"ON", ID_ADV_CROP_ON }, { L"AUTO CROP", ID_ADV_CROP_AUTO } }, ADV_VX);
@@ -2454,8 +2579,8 @@ namespace
             g_active_ids.push_back(a.mask ? ID_ADV_MASK_ON : ID_ADV_MASK_OFF);
             g_active_ids.push_back(a.passes == 2 ? ID_ADV_PASSES_2 : ID_ADV_PASSES_1);
             g_active_ids.push_back(a.fg == 0 ? ID_ADV_FG_OFF : a.fg == 1 ? ID_ADV_FG_MAP : a.fg == 2 ? ID_ADV_FG_FIX : ID_ADV_FG_THIN);
-            g_active_ids.push_back(a.sr ? ID_ADV_SR_ON : ID_ADV_SR_OFF);
-            g_active_ids.push_back(a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);
+            // R329: one choice in OPTIMIZATION - NRS, an upscaling option, or off
+            g_active_ids.push_back(a.nrs ? ID_ADV_NRS_ON : !a.sr ? ID_ADV_SR_OFF : a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);
             g_active_ids.push_back(a.sr_mode == 2 ? ID_ADV_SRQ_Q : a.sr_mode == 1 ? ID_ADV_SRQ_B : ID_ADV_SRQ_P);
             g_active_ids.push_back(a.sr_preset == 11 ? ID_ADV_PRESET_K : a.sr_preset == 12 ? ID_ADV_PRESET_L : a.sr_preset == 13 ? ID_ADV_PRESET_M : ID_ADV_PRESET_0);
             g_active_ids.push_back(a.crop == 0 ? ID_ADV_CROP_OFF : a.crop == 1 ? ID_ADV_CROP_ON : ID_ADV_CROP_AUTO);
@@ -2611,7 +2736,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int)
     RECT r{ 0, 0, WIN_W, WIN_H };
     const DWORD ws = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     AdjustWindowRect(&r, ws, FALSE);
-    g_main = CreateWindowExW(0, wc.lpszClassName, L"MGPU Bridge Launcher 0.3.0", ws,
+    g_main = CreateWindowExW(0, wc.lpszClassName, L"MGPU Bridge Launcher 0.4.0", ws,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, hinst, nullptr);
     dark_titlebar(g_main);
     {   // the whole window on the screen it opens on: CW_USEDEFAULT can place it

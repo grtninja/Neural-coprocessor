@@ -28,6 +28,26 @@ The Super Resolution options in the panel reduce that cost. They create a second
 
 Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu.ini` files [here](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - [DLSS Quality](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuQUALITY.ini) and [DLSS Performance](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuPERFORMANCE.ini).
 
+**Pass 1 scale (NRS)** also reduces the cost, under Experimental settings in the panel, or set `NRScale=0.75` and `NRScaleResolveDepth=0` in `mgpu.ini`. Useful at 3440x1440 or 3840x2160.
+
+* * *
+
+## New in 0.4.0
+
+**Refactors and improvements.** Better performance and image stability in games that run DLSS. Less data goes to the second card, and the gain grows with resolution, so 4K should see the biggest gains. No more trailing after menus and loading screens.
+
+**Reworked 2nd pass.** Better performance and better utilization of the second card. The 2nd pass now works on a smaller copy of the picture and adds its changes back at full size, so the fine detail it adds is a little softer. The old 2nd pass is still there as Full, under Experimental settings.
+
+**Pass 1 scale (NRS)**, by N01950, is now a switch under Experimental settings. It reduces the cost of the first pass. It is an alternative to running an upscaling pass on the neural output. Test which one you like best against the upscaling options.
+
+**A safe mode for DcompOverlay=1.** If you run into a DWM or driver issue with one display, such as a game that freezes or stops presenting, set `DcompSafeMode=3` in `mgpu.ini`. If that does not fix it, set `StartupTrace=1` and send me the log, so I can fix the problem quickly.
+
+**Games without DLSS.** The first launch finds the right motion vectors faster and more reliably.
+
+**Launcher.** A new Optimization row on the Options page: NRS, Native upscaling or Experimental upscaling, to compare against Off. Copy files replaces an old `mgpu.ini`, keeps your Dcomp settings, and can keep a backup.
+
+Take the new `mgpu.ini`.
+
 * * *
 
 ## New in 0.3.0
@@ -87,6 +107,8 @@ Also in 0.2.0:
 
 **0.3.1** - improves the input vector selector to support more setups and systems. Improves image stability and reduces flicker on those setups.
 
+**0.4.0** - better performance and image stability in games that run DLSS, a reworked 2nd pass, NRS as a switch, a safe mode and a start-up log for one-display problems, and the launcher updated to match. See New in 0.4.0.
+
 * * *
 
 ## Performance Results
@@ -120,6 +142,18 @@ Also in 0.2.0:
 **Key Finding:** Moving neural post-processing to a second GPU restores 86% of available performance gains from upscaling, compared to 39% when running on the render card.
 
 * * *
+
+## Titles run on 0.4.0
+
+The logs are at [docs/0.4.0](https://github.com/maohgad-web/Neural-coprocessor/tree/main/docs/0.4.0).
+
+| Title | API |
+| --- | --- |
+| Cyberpunk 2077 | DirectX 12 |
+| Kingdom Come: Deliverance II | DirectX 12 |
+| Rise of the Tomb Raider | DirectX 12 |
+| The Blood of Dawnwalker | DirectX 12 |
+| DragonSword Awakening | DirectX 12 |
 
 ## Titles run on 0.3.0
 
@@ -328,7 +362,7 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 - **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6 (0.2.2): 96-98% of frames with DLSS or DLAA, none with TAA. Since 0.3.0 the add-on also finds the game's own motion vectors on games without DLSS, tested on Resident Evil 4 (2023).
 - **DLAA sends more data than DLSS.** It renders at native, so depth and motion vectors cross the link at full resolution.
 - **No resolution/DLSS changes while armed** (requires swapchain rebuild)
-- **Frame generation:** Untested and not recommended. Some games with frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
+- **Frame generation:** Not recommended. It still flickers, as in 0.3.x. Some games with frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
 - **No Vulkan support.** DirectX 12 and DirectX 11 only. Some Unity titles can be forced to D3D12, optional since 0.3.0 - see Forcing D3D12 on Unity titles

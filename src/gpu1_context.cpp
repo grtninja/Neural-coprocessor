@@ -49,12 +49,14 @@
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "t119_keys.hpp"         // R300 (T1.19): Dom's keys, every one absent = off
+#include "startup_trace.hpp" // R313: trace points + DcompSafeMode
 #include "temporal_diag.hpp"     // R300a1 (Dom, T1.9)
 #include "perf_diag.hpp"         // R300e1 (Dom, T1.11)
 #include "feature_diag.hpp"      // R300f1 (Dom, T1.15)
 #include "producer_diag.hpp"     // R300g1 (Dom, T1.16)
 #include "producer_gpu_timers.hpp"   // R300h (Dom, T1.16)
 #include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
+#include "residual.hpp"   // R316: the residual pass module (own keys, ResidualPass=1|2). Off unless set
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
@@ -300,6 +302,7 @@ bool create_device(const adapter::selection_result &sel)
              "second adapter; game rendering unaffected",
              (unsigned)luid.HighPart, (unsigned)luid.LowPart);
     mgpu::diag::info(line);
+    if (mgpu::strace::on()) { char d[64]; snprintf(d, sizeof d, "GPU 1 luid=0x%08X-0x%08X", (unsigned)luid.HighPart, (unsigned)luid.LowPart); mgpu::strace::ev(mgpu::strace::R_BT, "create-device", d); }   // R313
 
     // SL1. The device exists and nothing has been built on it yet, which
     // is the only moment where the answer is still free. If sl.interposer
@@ -384,7 +387,7 @@ static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
 // launch, at the site that already resizes and commits the chain
 // (present_resize): no file write, no new lock use, no next-launch marker.
 static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
-namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
+namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); int ini_read_depth_transport(); }   // unnamed-namespace readers, defined below (R312 added)
 // R278: how many velocity candidates the census found eligible (probe.cpp), handed
 // over by dllmain each frame - this file names no probe type.
 std::atomic<unsigned> g_mvec_elig_n{0};
@@ -393,6 +396,74 @@ void set_mvec_eligible_count(unsigned n) { g_mvec_elig_n.store(n, std::memory_or
 // units are uv by construction and the warp test writes nothing: every launch is the same launch.
 std::atomic<bool> g_mvec_x_active{false};
 void set_mvec_extract_active(bool on) { g_mvec_x_active.store(on, std::memory_order_relaxed); }
+// R311d: the judge stepped aside while R280's target was the bound vectors - R280 stands down for the
+// session (mvec_extract reads this every 30 frames and runs its inert path). A title whose extract
+// carries no motion (Far Cry 6) then runs as it did before R307 compiled the extract there: no
+// per-frame dispatch and no staging copies on the game's queue, the zero field bound, the tap learning
+// on the game's own targets as before. RE4 never steps aside; contract titles never arm R280.
+std::atomic<bool> g_mvec_x_stand_down{false};
+bool mvec_extract_stand_down() { return g_mvec_x_stand_down.load(std::memory_order_relaxed); }
+// R307: the sweep (mvec_extract, MVecSweep=1). On: the R258 warp test scores each setting
+// the module puts in force (by its number) and changes nothing - no live scale, no edge
+// choice, no verdict. The scores are logged when the setting changes, with the best so far.
+std::atomic<bool> g_sweep_on{false};
+std::atomic<unsigned> g_sweep_id{0};
+void set_mvec_sweep(bool on) { g_sweep_on.store(on, std::memory_order_relaxed); }
+void set_mvec_sweep_combo(unsigned id) { g_sweep_id.store(id, std::memory_order_relaxed); }
+namespace
+{
+    // Bridge thread only (the R258 block runs there, under s.cs).
+    struct sweep_score { unsigned id = 0, probes = 0, motion = 0, decisive = 0, worse = 0; double ratio_sum = 0.0; unsigned win[13] = {}; };
+    sweep_score g_sw_cur;
+    sweep_score g_sw_done[160]; unsigned g_sw_done_n = 0;
+    const char *const kSweepCand[13] = { "none", "+W,+H", "+W,-H", "-W,+H", "-W,-H", "+W/2,+H/2", "+W/2,-H/2", "-W/2,+H/2", "-W/2,-H/2",
+                                         "+px,+px", "+px,-px", "-px,+px", "-px,-px" };
+    void sweep_close()
+    {
+        if (g_sw_cur.id == 0) return;
+        const sweep_score &c = g_sw_cur;
+        int top = 0; for (int i = 1; i < 13; ++i) if (c.win[i] > c.win[top]) top = i;
+        char l[520];
+        snprintf(l, sizeof l, "[MGPU][R307] SWEEP result #%u: probes=%u, with motion=%u | best/none over the motion probes=%.3f (lower = these vectors explain the motion; 1.0 = no better than none) | decisive=%u (most: %s) | worse than none=%u",
+                 c.id, c.probes, c.motion, c.motion ? c.ratio_sum / c.motion : 0.0, c.decisive, c.decisive ? kSweepCand[top] : "-", c.worse);
+        mgpu::diag::info(l);
+        if (g_sw_done_n < 160u) g_sw_done[g_sw_done_n++] = c;
+        // the three best so far (at least 3 motion probes)
+        int b[3] = { -1, -1, -1 };
+        for (unsigned i = 0; i < g_sw_done_n; ++i)
+        {
+            const sweep_score &d = g_sw_done[i];
+            if (d.motion < 3u) continue;
+            const double r = d.ratio_sum / d.motion;
+            for (int j = 0; j < 3; ++j)
+            {
+                if (b[j] < 0 || r < g_sw_done[b[j]].ratio_sum / g_sw_done[b[j]].motion)
+                { for (int m = 2; m > j; --m) b[m] = b[m - 1]; b[j] = (int)i; break; }
+            }
+        }
+        int at = snprintf(l, sizeof l, "[MGPU][R307] SWEEP best so far (setting #, best/none, decisive):");
+        for (int j = 0; j < 3 && b[j] >= 0 && at > 0 && at < (int)sizeof l - 48; ++j)
+            at += snprintf(l + at, sizeof l - (size_t)at, " #%u %.3f %u", g_sw_done[b[j]].id, g_sw_done[b[j]].ratio_sum / g_sw_done[b[j]].motion, g_sw_done[b[j]].decisive);
+        if (b[0] < 0) snprintf(l + at, sizeof l - (size_t)at, " none yet with 3 motion probes (the score needs camera motion; CTRL+ALT+END marks what your eye sees - R308)");
+        mgpu::diag::info(l);
+        g_sw_cur = sweep_score{};
+    }
+    void sweep_note(unsigned rec_id, double e0, double eb, bool decisive, int bestc, unsigned long long cnt0, unsigned colour_fmt)
+    {
+        const unsigned now = g_sweep_id.load(std::memory_order_relaxed);
+        if (now != g_sw_cur.id) { sweep_close(); g_sw_cur.id = now; }
+        if (rec_id != now) return;   // recorded under another setting: not scored
+        ++g_sw_cur.probes;
+        const double still = (colour_fmt == 10u) ? 0.02 : 2.0;   // RGBA16F luminance sums are ~100x smaller than 8-bit ones
+        if (cnt0 > 1000ull && e0 >= still)
+        {
+            ++g_sw_cur.motion;
+            g_sw_cur.ratio_sum += (e0 > 0.0) ? eb / e0 : 1.0;
+            if (eb > e0 * 1.10) ++g_sw_cur.worse;
+        }
+        if (decisive) { ++g_sw_cur.decisive; if (bestc >= 0 && bestc < 13) ++g_sw_cur.win[bestc]; }
+    }
+}
 // R280e: the judge's choice of write edge (0 last, 1 first) and the module's report of
 // how many write edges the last frame had. The judge alternates while undecided.
 std::atomic<int> g_mvec_x_edge_req{0};
@@ -404,6 +475,48 @@ std::atomic<bool> g_mvec_x_deciding{false};   // R280j
 // concurrently on another thread is never mistaken for the tap's.
 static thread_local bool t_tap_copy_scope = false;
 void tap_copy_scope(bool on) { t_tap_copy_scope = on; }
+// R312 (DepthTransport >= 2). The geometry dllmain pushed into the tap's .fx; the arm holds
+// for depth until the tap's resource matches it (the push reloads the effect, and the old
+// resource is what the arm would otherwise size from). Key absent: never set, the hold
+// below never engages. Written on the game's finish_effects thread, read on the same.
+static std::atomic<unsigned> g_r312_w{0}, g_r312_h{0}, g_r312_fmt{0};
+static std::atomic<bool> g_r312_set{false};
+int depth_transport() { return ini_read_depth_transport(); }
+// R315 (MVecBarrierSource=1). dllmain hands the probe's key and fire count over each game frame
+// (this file does not include the probe's header - the acquisition layer stays independent).
+static std::atomic<int> g_r315_on{0};
+static std::atomic<unsigned long long> g_r315_fires{0};
+void r315_note(int on, unsigned long long fires)
+{
+    g_r315_on.store(on, std::memory_order_relaxed); g_r315_fires.store(fires, std::memory_order_relaxed);
+}
+// R315b (MVecBarrierSource=2). The judge's phase, read on the game's thread every frame and
+// written on the bridge thread at a decision. WINDOW: the transition copy delivers (region 1)
+// and the tail copy lands beside it (region 2) for the compare. TAIL: the transition match is
+// off and the tail copy delivers. TRANSITION: as value 1. The tail scope marks the tail copy
+// inside stream_mvec_copy, like the tap's scope.
+// R315b fix 3: the REFERENCE in the window is the evaluate copy (the bytes DLSS consumed), not the
+// transition copy - run 3 showed a fixed 76-texel patch between the two and neither side of that
+// pair is known right. The fallback verdict is therefore the evaluate route (today's path).
+enum { R315_WINDOW = 0, R315_TAIL = 1, R315_EVALUATE = 2 };
+static std::atomic<int> g_r315_phase{R315_WINDOW};
+// R323 (HistoryGate=1): dllmain's per-game-frame fact - did the game's own DLSS evaluate for this
+// frame (1), not (0), or is there no table on this title to tell (-1). Stamped on the seal's slot by
+// the producer; the consumer sends DLSSNR.Reset=1 on every pass for a frame without, and once more on
+// the first frame with it again. A menu, a video or a loading screen builds no history at any fps.
+// Key absent: g_hist_gate is 0, the stamp is never read, nothing else runs.
+static std::atomic<int> g_game_dlss{-1};
+static std::atomic<int> g_hist_gate{0};
+void note_game_dlss(int evaluated) { g_game_dlss.store(evaluated, std::memory_order_relaxed); }
+int  history_gate() { return g_hist_gate.load(std::memory_order_relaxed); }
+static thread_local bool t_r315_tail = false;
+int  r315_phase() { return g_r315_phase.load(std::memory_order_relaxed); }
+void r315_tail_scope(bool on) { t_r315_tail = on; }
+void r312_set_target(unsigned w, unsigned h, unsigned fmt)
+{
+    g_r312_w.store(w, std::memory_order_relaxed); g_r312_h.store(h, std::memory_order_relaxed);
+    g_r312_fmt.store(fmt, std::memory_order_relaxed); g_r312_set.store(true, std::memory_order_release);
+}
 // T1.19 R300d (his R221; SLTagsCapture only). Set by stream_mvec_copy_tagged around its call and read by
 // stream_mvec_copy right around the copy, so the transition to COPY_SOURCE is recorded ONLY when the copy
 // itself is - after every guard in stream_mvec_copy has passed. Key absent: never set, one TLS load per copy.
@@ -414,6 +527,20 @@ bool game_contract_seen()   // R280k
     if (mgpu::calibrator::game_ngx_init_seen()) return true;
     mgpu::calibrator::table ct;
     return mgpu::calibrator::read(ct) && ct.have != 0u;
+}
+// R311. MVecSource: 0 (absent) the path as before; 1 R280's extract, 2 the velocity tap,
+// 3 the zero field - each ALSO on a title with an NGX contract (that is what the key is
+// for: the tap / R280 path can be run and judged on a title whose own vectors are known
+// good, and a title on a non-NVIDIA game card can be told which rung to take). Stored
+// from the file read at the hold (r309::read_keys) and at R280's arm (mvec_source_mode),
+// whichever comes first. vectors_contract() is game_contract_seen() for the VECTOR path
+// only: with the key absent it returns exactly what game_contract_seen() returns. Depth,
+// the calibrator and every other reader keep calling game_contract_seen() directly.
+std::atomic<int> g_r311_src{0};
+int mvec_source_in_force() { return g_r311_src.load(std::memory_order_relaxed); }
+bool vectors_contract()
+{
+    return game_contract_seen() && g_r311_src.load(std::memory_order_relaxed) == 0;
 }
 void set_mvec_extract_deciding(bool on) { g_mvec_x_deciding.store(on, std::memory_order_relaxed); }
 // R278b: the tap the learning turned on for this session (0 = none). dllmain reads it each frame.
@@ -533,8 +660,24 @@ static bool dcomp_set_rooted(bool want, const char *why)
     IDCompositionVisual *visual = (IDCompositionVisual *)g_dcomp_visual;
     IDCompositionDevice *dcomp  = (IDCompositionDevice *)g_dcomp_device;
 
+    // R313: which thread is committing, and how long DWM took. One relaxed load when off.
+    const bool r313 = mgpu::strace::on();
+    const double r313_t0 = r313 ? mgpu::strace::now_ms() : 0.0;
+    const mgpu::strace::role r313_role = mgpu::strace::is_bridge_thread() ? mgpu::strace::R_BT : mgpu::strace::R_GT_OVERLAY;
     HRESULT hr = target->SetRoot(want ? visual : nullptr);
     if (SUCCEEDED(hr)) hr = dcomp->Commit();
+    // R313 DcompSafeMode=3: serialized with DWM - the call returns only when the
+    // compositor has the tree. Key absent: the Commit stays asynchronous as shipped.
+    HRESULT r313_wait = S_OK;
+    if (SUCCEEDED(hr) && mgpu::strace::safe_mode() == 3)
+        r313_wait = dcomp->WaitForCommitCompletion();
+    if (r313)
+    {
+        char d[96];
+        snprintf(d, sizeof d, "%s -> %s: SetRoot+Commit %.2f ms%s", why, want ? "ROOT" : "UNROOT", mgpu::strace::now_ms() - r313_t0,
+                 mgpu::strace::safe_mode() == 3 ? " (waited for DWM)" : "");
+        mgpu::strace::ev(r313_role, "set-root", d, (unsigned)(FAILED(hr) ? hr : r313_wait));
+    }
     if (FAILED(hr))
     {
         char e[320];
@@ -563,9 +706,49 @@ static bool dcomp_set_rooted(bool want, const char *why)
 
 // V53. Called on the FIRST frame that carries neural output, from the same
 // one-shot the P5.0 line uses. Before this the operator sees the game.
+// R313 DcompSafeMode: the overlay thread's request and the value-3 deferred
+// root, both applied by the bridge thread in dcomp_apply_pending() (called
+// every loop pass from worker.cpp; two relaxed loads when nothing is pending).
+static std::atomic<int> g_r313_root_req{-1};      // -1 none, 0 unroot, 1 root (DcompSafeMode>=1: the overlay thread asks, BT does)
+static std::atomic<int> g_r313_root_deferred{0};  // 1 = root once the game's chain has been quiet (DcompSafeMode=3)
+static bool r313_quiet_enough()
+{
+    return mgpu::adapter::ms_since_last_swapchain_event() >= (unsigned long long)mgpu::strace::safe_quiet_ms();
+}
 void dcomp_root_on_first_neural_frame()
 {
+    if (mgpu::strace::safe_mode() == 3 && !r313_quiet_enough())
+    {
+        g_r313_root_deferred.store(1, std::memory_order_relaxed);
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][R313] DcompSafeMode=3: first neural frame, but the game's chain had a swap-chain event %llu ms ago "
+                 "(< DcompSafeQuietMs=%u). The visual stays UNROOTED until the chain has been quiet that long; you see the game.",
+                 mgpu::adapter::ms_since_last_swapchain_event(), mgpu::strace::safe_quiet_ms());
+        mgpu::diag::info(l);
+        return;
+    }
     (void)dcomp_set_rooted(true, "first neural frame");
+}
+void dcomp_apply_pending()
+{
+    const int req = g_r313_root_req.load(std::memory_order_relaxed);
+    if (req != -1)
+    {
+        g_r313_root_req.store(-1, std::memory_order_relaxed);
+        if (req == 0) g_r313_root_deferred.store(0, std::memory_order_relaxed);   // overlay open: a deferred root must not cover it
+        if (req == 1 && mgpu::strace::safe_mode() == 3 && !r313_quiet_enough())
+            g_r313_root_deferred.store(1, std::memory_order_relaxed);
+        else
+            dcomp_set_visible(req == 1);
+    }
+    if (g_r313_root_deferred.load(std::memory_order_relaxed) != 0 && r313_quiet_enough())
+    {
+        g_r313_root_deferred.store(0, std::memory_order_relaxed);
+        bool shown = false;
+        { auto &S = st(); std::lock_guard<std::mutex> lk(S.cs); shown = S.neural_shown; }
+        if (shown) (void)dcomp_set_rooted(true, "root after a quiet game chain (DcompSafeMode=3)");
+    }
 }
 
 // V65. Overlay opens, the visual unroots and you get the GAME's overlay: real
@@ -575,6 +758,14 @@ void dcomp_root_on_first_neural_frame()
 // header at the top of this file for what was tried instead.
 void dcomp_set_visible(bool on)
 {
+    // R313 DcompSafeMode>=1: never from a game thread. The overlay handler
+    // leaves a request; the bridge thread applies it on its next loop pass
+    // (dcomp_apply_pending). Key absent: this call runs here as shipped.
+    if (mgpu::strace::safe_mode() >= 1 && !mgpu::strace::is_bridge_thread())
+    {
+        g_r313_root_req.store(on ? 1 : 0, std::memory_order_relaxed);
+        return;
+    }
     // R241a. Before the first neural frame there is nothing of ours worth
     // covering the game with: an overlay-closed before the arm rooted the
     // present chain's stale content over the game (Rise, the 'stuck logo
@@ -745,9 +936,17 @@ bool create_present_chain(HWND hwnd)
                  "releasing everything created, returning false",
                  call, (unsigned)hr, (void *)hwnd, width, height);
         mgpu::diag::error(line);
+        if (mgpu::strace::on())   // R313: the record at an existing failure site
+        {
+            char w[200];
+            snprintf(w, sizeof w, "create_present_chain failed at %s hr=0x%08X", call, (unsigned)hr);
+            mgpu::strace::ev(mgpu::strace::R_BT, "chain-failed", w, (unsigned)hr);
+            mgpu::strace::record(w, 0u);
+        }
         release_all();
         return false;
     };
+    if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "create-present-chain-enter", nullptr);
 
     // 1. Command queue (DIRECT). The swapchain created against it lands
     // on this queue's adapter - the T3 device's adapter (GPU 1).
@@ -843,8 +1042,16 @@ bool create_present_chain(HWND hwnd)
         // there for the case where the HWND genuinely never arrives.
         if (dcomp_overlay_mode())
         {
+            const double r313_w0 = mgpu::strace::now_ms();
+            unsigned r313_i = 0;
             for (unsigned i = 0; i < 200u && g_game_hwnd == nullptr; ++i)
-                Sleep(10);   // up to 2 s
+            { Sleep(10); r313_i = i + 1u; }   // up to 2 s
+            if (mgpu::strace::on())
+            {
+                char d[96];
+                snprintf(d, sizeof d, "game hwnd %s after %u x 10 ms (%.1f ms)", g_game_hwnd ? "seen" : "NEVER SEEN", r313_i, mgpu::strace::now_ms() - r313_w0);
+                mgpu::strace::ev(mgpu::strace::R_BT, "game-hwnd-wait", d);
+            }
         }
 
         bool want_dcomp = dcomp_overlay_mode() && g_game_hwnd != nullptr;
@@ -869,6 +1076,7 @@ bool create_present_chain(HWND hwnd)
         {
             swapchain_hr = factory->CreateSwapChainForComposition(
                 static_cast<IUnknown *>(queue), &scd, nullptr, &sc1);
+            if (mgpu::strace::on()) { mgpu::strace::note_chain_kind(true); mgpu::strace::ev(mgpu::strace::R_BT, "CreateSwapChainForComposition", "GPU 1 queue", (unsigned)swapchain_hr); }
             if (FAILED(swapchain_hr))
                 return fail("CreateSwapChainForComposition", swapchain_hr);
 
@@ -902,6 +1110,7 @@ bool create_present_chain(HWND hwnd)
                                                &d11, &got, nullptr);
                     gpu1_adapter->Release();
                 }
+                if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "D3D11CreateDevice", "on GPU 1 (composition rendering device)", (unsigned)d11_hr);
                 if (SUCCEEDED(d11_hr) && d11 != nullptr)
                 {
                     IDXGIDevice *d11_dxgi = nullptr;
@@ -913,6 +1122,7 @@ bool create_present_chain(HWND hwnd)
                                                       reinterpret_cast<void **>(&dcomp));
                         d11_dxgi->Release();
                         on_gpu1 = SUCCEEDED(hr) && dcomp != nullptr;
+                        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "DCompositionCreateDevice", nullptr, (unsigned)hr);
                     }
                 }
                 // ---- V71: NEVER FALL BACK INTO THE BLACK CONFIGURATION ----
@@ -1000,6 +1210,12 @@ bool create_present_chain(HWND hwnd)
             // exist per window, one topmost and one not.
             IDCompositionTarget *target = nullptr;
             hr = dcomp->CreateTargetForHwnd(g_game_hwnd, TRUE, &target);
+            if (mgpu::strace::on())
+            {
+                char d[96];
+                snprintf(d, sizeof d, "game hwnd=0x%p topmost=TRUE", (void *)g_game_hwnd);
+                mgpu::strace::ev(mgpu::strace::R_BT, "CreateTargetForHwnd", d, (unsigned)hr);
+            }
             if (FAILED(hr))
             {
                 char v49e[720];
@@ -1020,7 +1236,9 @@ bool create_present_chain(HWND hwnd)
             if (SUCCEEDED(hr)) hr = visual->SetContent(sc1);
             // V53: the root is NOT set here. The tree is built and committed
             // empty, and the visual is rooted on the first neural frame.
+            const double r313_c0 = mgpu::strace::now_ms();
             if (SUCCEEDED(hr)) hr = dcomp->Commit();
+            if (mgpu::strace::on()) { char d[64]; snprintf(d, sizeof d, "empty tree, %.2f ms", mgpu::strace::now_ms() - r313_c0); mgpu::strace::ev(mgpu::strace::R_BT, "Commit", d, (unsigned)hr); }
             if (FAILED(hr))
             {
                 if (visual != nullptr) visual->Release();
@@ -1033,9 +1251,12 @@ bool create_present_chain(HWND hwnd)
             // compositor has not looked at yet. These two are the only
             // questions DirectComposition will answer about a tree it has
             // already accepted.
+            const double r313_w0 = mgpu::strace::now_ms();
             const HRESULT wait_hr = dcomp->WaitForCommitCompletion();
+            if (mgpu::strace::on()) { char d[64]; snprintf(d, sizeof d, "%.2f ms inside", mgpu::strace::now_ms() - r313_w0); mgpu::strace::ev(mgpu::strace::R_BT, "WaitForCommitCompletion", d, (unsigned)wait_hr); }
             BOOL dev_ok = FALSE;
             const HRESULT state_hr = dcomp->CheckDeviceState(&dev_ok);
+            if (mgpu::strace::on()) { mgpu::strace::ev(mgpu::strace::R_BT, "CheckDeviceState", dev_ok ? "usable" : "NOT usable", (unsigned)state_hr); }
             {
                 char v51c[560];
                 snprintf(v51c, sizeof v51c,
@@ -1083,6 +1304,7 @@ bool create_present_chain(HWND hwnd)
                              "(stack: ReShade dxgi -> sl.interposer -> BetterConsole -> abort).");
         swapchain_hr = factory->CreateSwapChainForHwnd(
             static_cast<IUnknown *>(queue), hwnd, &scd, nullptr, nullptr, &sc1);
+        if (mgpu::strace::on()) { mgpu::strace::note_chain_kind(false); mgpu::strace::ev(mgpu::strace::R_BT, "CreateSwapChainForHwnd", "bridge window", (unsigned)swapchain_hr); }
         if (FAILED(swapchain_hr))
             return fail("CreateSwapChainForHwnd", swapchain_hr);
         }
@@ -1254,6 +1476,7 @@ bool create_present_chain(HWND hwnd)
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
              width, height, (unsigned)swapchain_hr, (void *)hwnd);
     mgpu::diag::info(line);
+    if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "create-present-chain-exit", "published", (unsigned)swapchain_hr);
     return true;
 }
 
@@ -1437,6 +1660,12 @@ bool present_frame(float r, float g, float b)
                      "GetDeviceRemovedReason=0x%08X - the loop stops presenting",
                      step, hr, (unsigned)reason);
             mgpu::diag::error(line);
+            if (mgpu::strace::on())   // R313: the record at the existing failure site
+            {
+                char w[200];
+                snprintf(w, sizeof w, "bridge present failed at %s hr=0x%08X (GPU 1 removed reason 0x%08X)", step, hr, (unsigned)reason);
+                mgpu::strace::record(w, (unsigned)reason != 0u ? (unsigned)reason : 0u);
+            }
         }
         return false;
     };
@@ -1768,6 +1997,7 @@ bool present_frame(float r, float g, float b)
             cl->ResourceBarrier(1, &lb);
         }
 
+
         if (lsrc != nullptr)
         {
             // The seam, drawn last. Without it a viewer has to guess where the
@@ -1808,6 +2038,7 @@ bool present_frame(float r, float g, float b)
             // first moment the bridge has anything worth covering the game
             // with. No-op in mode 0, where there is no visual.
             dcomp_root_on_first_neural_frame();
+            if (mgpu::strace::on()) mgpu::strace::note_first_neural_frame(g_dcomp_rooted.load(std::memory_order_relaxed));   // R313
             snprintf(line, sizeof line,
                      "[MGPU][P5.0] the bridge window is now showing the %s - %s of the %ux%u "
                      "frame at %ux%u, one CopyTextureRegion, no resampling in this add-on. The "
@@ -1939,7 +2170,9 @@ bool present_frame(float r, float g, float b)
     // PresentVsync=0 asks for the immediate present. Expect tearing - that is
     // the trade, and it is the user's to make, not ours to make silently.
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
+    const double r313_p0 = mgpu::strace::now_ms();   // R313: 0.0 when off
     hr = sc->Present(pi_interval, 0);
+    if (mgpu::strace::on()) mgpu::strace::note_bridge_present((unsigned)hr, mgpu::strace::now_ms() - r313_p0);   // R313
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
 
@@ -2019,9 +2252,11 @@ bool has_present_chain()
 // exactly as T3 did it. The chain goes first because the swapchain holds
 // a reference to the window it was created against: in T4's order
 // (DestroyWindow first) it would outlive the window.
+namespace r309 { namespace r311c { void stop_thread(); } }   // R311c: defined with the rest of r309 below
 void shutdown()
 {
     auto &S = st();
+    r309::r311c::stop_thread();   // R311c: the probe thread, if it was ever started
 
     // Detach the chain under the lock, release it outside: the lock is
     // never held across the fence wait below, and the raw pointers never
@@ -2623,22 +2858,85 @@ namespace
         else { unsigned u = ((e + 112u) << 23) | (m << 13); memcpy(&v, &u, 4); }
         return s ? -v : v;
     }
-    struct vec_probe_result { unsigned long long n, zeros; double mean_ax, mean_ay, max_ax, max_ay, pos_x, pos_y; const char *verdict; };
+    // R305: ONE decoder for the vector pair, shared by R257 and R258 so the two
+    // can never read the same bytes two ways again. R257 read only R16G16_FLOAT
+    // and R32G32_FLOAT; on Far Cry 6 the candidate was R16G16_UNORM (35) and
+    // R257 said "not sampled" on every probe. The decode is the one R258 had
+    // since R280o (the way DLSS reads the slot): FLOAT and TYPELESS as halves /
+    // floats, UNORM / SNORM normalised, SINT as integers. The integer and R8G8
+    // rows are decode-ready only: is_mvec_format (probe.cpp) does not admit them,
+    // deliberately, so no slot of those formats is ever made today.
+    // Runs on the bridge thread over GPU 1 readbacks - nothing here touches the
+    // game's device or its threads.
+    unsigned mv_texel_bytes(unsigned fmt)
+    {
+        if (fmt >= 15u && fmt <= 18u) return 8u;    // R32G32 TYPELESS FLOAT UINT SINT
+        if (fmt >= 33u && fmt <= 38u) return 4u;    // R16G16 TYPELESS FLOAT UNORM UINT SNORM SINT
+        if (fmt >= 48u && fmt <= 52u) return 2u;    // R8G8   TYPELESS UNORM UINT SNORM SINT
+        return 0u;
+    }
+    bool mv_read(unsigned fmt, const unsigned char *px, float &vx, float &vy)
+    {
+        switch (fmt)
+        {
+        case 33: case 34: { const unsigned short *q = (const unsigned short *)px; vx = half_to_float(q[0]); vy = half_to_float(q[1]); return true; }
+        case 35: { const unsigned short *q = (const unsigned short *)px; vx = (float)q[0] / 65535.0f; vy = (float)q[1] / 65535.0f; return true; }
+        case 36: { const unsigned short *q = (const unsigned short *)px; vx = (float)q[0]; vy = (float)q[1]; return true; }
+        case 37: { const short *q = (const short *)px;
+                   vx = (q[0] <= -32767) ? -1.0f : (float)q[0] / 32767.0f; vy = (q[1] <= -32767) ? -1.0f : (float)q[1] / 32767.0f; return true; }
+        case 38: { const short *q = (const short *)px; vx = (float)q[0]; vy = (float)q[1]; return true; }
+        case 15: case 16: { const float *q = (const float *)px; vx = q[0]; vy = q[1]; return true; }
+        case 17: { const unsigned *q = (const unsigned *)px; vx = (float)q[0]; vy = (float)q[1]; return true; }
+        case 18: { const int *q = (const int *)px; vx = (float)q[0]; vy = (float)q[1]; return true; }
+        case 48: case 49: vx = (float)px[0] / 255.0f; vy = (float)px[1] / 255.0f; return true;
+        case 50: vx = (float)px[0]; vy = (float)px[1]; return true;
+        case 51: { const signed char *q = (const signed char *)px;
+                   vx = (q[0] <= -127) ? -1.0f : (float)q[0] / 127.0f; vy = (q[1] <= -127) ? -1.0f : (float)q[1] / 127.0f; return true; }
+        case 52: { const signed char *q = (const signed char *)px; vx = (float)q[0]; vy = (float)q[1]; return true; }
+        default: return false;
+        }
+    }
+    // R305: a vector field that holds ONE value everywhere and is not the format's
+    // "no motion" encoding (all bytes zero, or UNORM channels at the 0.5 centre).
+    bool mv_is_zero_encoding(unsigned fmt, const unsigned char *raw)
+    {
+        const unsigned b = mv_texel_bytes(fmt);
+        bool allz = true; for (unsigned i = 0; i < b; ++i) if (raw[i] != 0) { allz = false; break; }
+        if (allz) return true;
+        if (fmt == 33u || fmt == 34u) { const unsigned short *q = (const unsigned short *)raw;   // +-0.0 halves
+                                        return (q[0] & 0x7FFFu) == 0u && (q[1] & 0x7FFFu) == 0u; }
+        if (fmt == 15u || fmt == 16u) { const unsigned *q = (const unsigned *)raw;               // +-0.0 floats
+                                        return (q[0] & 0x7FFFFFFFu) == 0u && (q[1] & 0x7FFFFFFFu) == 0u; }
+        if (fmt == 35u) { const unsigned short *q = (const unsigned short *)raw;
+                          auto c = [](unsigned short v) { return v >= 0x7FFEu && v <= 0x8001u; }; return c(q[0]) && c(q[1]); }
+        if (fmt == 49u) { auto c = [](unsigned char v) { return v >= 0x7Fu && v <= 0x80u; }; return c(raw[0]) && c(raw[1]); }
+        return false;
+    }
+    void mv_hex(const unsigned char *raw, unsigned b, char *out, size_t cap)
+    {
+        size_t at = 0; if (cap) out[0] = 0;
+        for (unsigned i = 0; i < b && at + 3 < cap; ++i) at += (size_t)snprintf(out + at, cap - at, "%02X", raw[i]);
+    }
+
+    struct vec_probe_result { unsigned long long n, zeros; double mean_ax, mean_ay, max_ax, max_ay, pos_x, pos_y; const char *verdict;
+                              unsigned long long same_as_first; unsigned char first_raw[8]; unsigned texel_bytes; };   // R305
     vec_probe_result vec_probe_eval(const unsigned char *base, unsigned w, unsigned h, unsigned pitch, unsigned fmt)
     {
         vec_probe_result r{}; r.verdict = "UNDECIDED";
-        const bool f16 = (fmt == (unsigned)DXGI_FORMAT_R16G16_FLOAT);
-        const bool f32 = (fmt == (unsigned)DXGI_FORMAT_R32G32_FLOAT);
-        if (!f16 && !f32) { r.verdict = "format not R16G16_FLOAT / R32G32_FLOAT - not sampled"; return r; }
+        const unsigned tb = mv_texel_bytes(fmt);   // R305
+        r.texel_bytes = tb;
+        if (tb == 0u) { r.verdict = "format is not a two-channel vector format - not sampled"; return r; }
         double sax = 0, say = 0; unsigned long long px = 0, py = 0;
         for (unsigned y = 0; y < h; y += 2)
         {
             const unsigned char *row = base + (size_t)y * pitch;
             for (unsigned x = 0; x < w; x += 4)
             {
-                float vx, vy;
-                if (f16) { const unsigned short *p = (const unsigned short *)(row + (size_t)x * 4); vx = half_to_float(p[0]); vy = half_to_float(p[1]); }
-                else     { const float *p = (const float *)(row + (size_t)x * 8); vx = p[0]; vy = p[1]; }
+                float vx = 0.0f, vy = 0.0f;
+                const unsigned char *t = row + (size_t)x * tb;   // R305
+                (void)mv_read(fmt, t, vx, vy);
+                if (r.n == 0) memcpy(r.first_raw, t, tb);
+                if (memcmp(t, r.first_raw, tb) == 0) ++r.same_as_first;
                 ++r.n;
                 const double ax = (vx < 0) ? -(double)vx : (double)vx, ay = (vy < 0) ? -(double)vy : (double)vy;
                 if (ax < 1e-6 && ay < 1e-6) { ++r.zeros; continue; }
@@ -2651,7 +2949,14 @@ namespace
         const unsigned long long nz = r.n - r.zeros;
         if (nz != 0) { r.mean_ax = sax / (double)nz; r.mean_ay = say / (double)nz; r.pos_x = (double)px / (double)nz; r.pos_y = (double)py / (double)nz; }
         if (r.n == 0) return r;
-        if (r.zeros * 100ull >= r.n * 95ull) r.verdict = "STILL (>=95% zero): no motion in this frame, or not the per-frame velocity target";
+        // R305: checked first - a field of one value says nothing about units.
+        if (r.same_as_first == r.n && !mv_is_zero_encoding(fmt, r.first_raw))
+            r.verdict = "CONSTANT: every sampled texel holds the same bytes, and they are not a no-motion value - this region is not a motion field";
+        // R306: Far Cry 6 read 99.6% one value (0000803F) and fell through to the
+        // units verdict below, which read as an endorsement. Log text only.
+        else if (r.same_as_first * 100ull >= r.n * 99ull && !mv_is_zero_encoding(fmt, r.first_raw))
+            r.verdict = "NEARLY CONSTANT: 99% or more of the sampled texels hold the same bytes, and they are not a no-motion value - units not judged";
+        else if (r.zeros * 100ull >= r.n * 95ull) r.verdict = "STILL (>=95% zero): no motion in this frame, or not the per-frame velocity target";
         else if (r.max_ax <= 4.0 && r.max_ay <= 4.0) r.verdict = "SCREEN-FRACTION units (UV/NDC): MVecScaleX/Y should be the frame size in pixels (sign to settle)";
         else r.verdict = "PIXEL units: scale 1, only the sign to settle";
         return r;
@@ -9470,6 +9775,9 @@ namespace
         unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
         float nrs_sharpness = 0.50f;         // RCAS, matched to the proxys ini (Sharpness=0.50)
         float nrs_color_strength = 0.90f;    // matched to the proxys ini (ColorStrength=0.90)
+        // NRScaleResolveDepth=0 (Dom / lordzaxxon555-art): the resolve's silhouette guard runs
+        // without depth (has_depth=0) while NGX keeps it. Absent or 1 = unchanged.
+        bool  nrs_res_depth = true;
         unsigned nrs_w = 0u, nrs_h = 0u;
         UINT  nrs_inc = 0u;
         ID3D12RootSignature *nrs_rs_down = nullptr;
@@ -9890,6 +10198,33 @@ namespace
         unsigned long long depth_contract = 0;
         unsigned long long depth_seen_valid = 0, depth_seen_invalid = 0;
         unsigned long long depth_report_at = 0;
+        bool r312_hold_said = false;            // R312
+        unsigned long long r312_report_at = 0;  // R312
+        // R315b (MVecBarrierSource=2): the second vector region (the tail copy during the judge
+        // window), the readback for the compare, and the judge's bookkeeping. Key absent / 1:
+        // mvec2_off stays 0 and none of it is touched.
+        UINT64 mvec2_off = 0;
+        std::atomic<unsigned char> r315_both[RING] = {};   // slot holds both copies of one frame
+        // R323 (HistoryGate=1): per slot, the game's DLSS evaluated for the sealed frame (1 / 0 / -1 unknown).
+        std::atomic<signed char> slot_dlss[RING] = {};
+        bool     gate_break = false;        // the last evaluated frame had no DLSS: the next one with it resets once
+        unsigned gate_stretches = 0;        // stretches without DLSS seen (the first 3 are logged)
+        unsigned long long gate_since = 0;  // consumed frame the current stretch began at
+        ID3D12Resource *r315_rb = nullptr;                   // READBACK, 2 x mvec_bytes2
+        bool r315_rb_pending = false;
+        unsigned r315_judged = 0, r315_same = 0;             // frames judged / frames byte-identical (sampled)
+        unsigned long long r315_window_at = 0;               // sealed frame the window opened at
+        unsigned long long r315_judge_handle = 0;            // the published handle the verdict was for
+        unsigned long long r315_recheck_at = 0;              // periodic re-open (sealed frame)
+        unsigned long long r315_tail_delivered = 0;          // copies the tail delivered (TAIL phase)
+        unsigned r315_decisions = 0;
+        bool r315_fmt_said = false;
+        // R315b fix 4: the differing sample set of the previous judged frame (bit per sampled texel), to
+        // tell a FIXED patch (the same texels every frame: a deterministic write after DLSS, e.g. a HUD
+        // mask) from CHANGING content (stale motion). 1 bit per sample; 128 KB covers 1M samples.
+        std::vector<unsigned char> r315_prev_bits;
+        unsigned long long r315_prev_diff = 0;
+        unsigned r315_flat = 0;                              // R326: frames skipped in this window (no motion in the field)
 
         // ---- T1b: the GPU 1 side ----
         //
@@ -9917,6 +10252,13 @@ namespace
         unsigned cp_n = 0;                      // probes evaluated
         unsigned cp_worse = 0;                  // R278: probes where the warp was WORSE than no warp
         unsigned cp_win_n = 0;                  // R278f: probes on the current candidate
+        unsigned sw_rec_id = 0, sw_seen_id = 0; // R307: sweep setting at stage 1, and the last one seen
+        unsigned long long sw_seen_f = 0;       // R307: frame it was first seen (the transport needs a few frames to carry it)
+        // R305: the constant-vector judge (see the R305 block after the worse-count).
+        unsigned cp_const_run = 0;              // probes running whose region was one value, the same one
+        unsigned char cp_const_raw[8] = {};     // that value's bytes
+        double   cp_const_e0_min = 0.0, cp_const_e0_max = 0.0;   // the picture's no-motion error over the run
+        bool     cp_const_counted = false;      // counted once per candidate
         bool     learn_write = false;           // R278f-r: verdicts may write (learning, or MVecTap key) - decided at arm, no file read under the lock
         // R280e: the open judge on the virtual-target path. Edge scores: mean of
         // best/none over windows with motion, per edge (0 last, 1 first).
@@ -9927,7 +10269,34 @@ namespace
         bool     x_edge_fixed = false;          // chosen; alternation stopped
         unsigned x_edge_bad = 0;                // chosen edge's consecutive worse windows (3 reopens)
         unsigned x_verdicts = 0;                // scale applications so far (0 = still at + / +)
+        unsigned x_still_motion = 0;            // R311e: R258 probes running where the picture moved and R280's field was >= 95% zeros
         int      x_kx = 0, x_ky = 0;            // the applied candidates, in W/H units
+        // R309 (MVecStepAside=1, off by default): the step-aside judge and its instrument.
+        // Written under s.cs only: the key at the hold (game thread), the rest on the bridge thread.
+        bool     r309_on = false, r309_l99 = false;     // the key, and MVecLearned=99, read once at the hold
+        int      r311_src = 0;                          // R311: MVecSource 0..3, read once at the hold
+        unsigned long long r311_dropped = 0;            // R311: copies from the game's own routes dropped under MVecSource (mvec_cs)
+        bool     r311_drop_said = false;
+        bool     r309_aside = false;                     // the zero field is bound in place of the vectors
+        bool     r309_zero_ready = false;                // tex_mvec holds zeros and is in a read state
+        bool     r309_probe_own = false;                 // the probe in flight was started by R309 alone
+        int      r309_ring[6] = {0,0,0,0,0,0};          // last 6 judged probes: -1 worse, +1 better, 0 neither
+        unsigned r309_ri = 0, r309_rn = 0, r309_brun = 0, r309_own_judged = 0;
+        unsigned r309_phase = 0, r309_windows = 0, r309_switches = 0;   // 0 waiting for gameplay, 1 window, 2 asleep
+        unsigned r309_wj = 0, r309_ww = 0, r309_wb = 0;  // this window: judged, worse, better
+        int      r309_cand_seen = -1;
+        unsigned long long r309_gp_run = 0, r309_t_end = 0, r309_t_wake = 0;
+        unsigned long long r309_own_n = 0, r309_own_us = 0, r309_own_max = 0;     // R309's probes: bridge time with s.cs held
+        unsigned long long r309_base_n = 0, r309_base_us = 0, r309_base_max = 0;  // R258's other probes, timed while the key is on
+        unsigned long long r309_bytes = 0;                                       // GPU 1 readback bytes R309's probes added
+        int      r309_mode = 0;                          // MVecStepAside: 0 absent or 0 | 1 forced zero field | 2 auto (the judge)
+        bool     r310_cost = false, r310_offlock = false; // R310: ProbeCost=1, ProbeOffLock=1 (read once at the hold)
+        bool     r311c_thread = false;                    // R311c: ProbeOffLock=2 - the probe's loops run on the probe thread
+        unsigned long long r311b_last_ms = 0;             // R311b: last GPU 1 fence-timeout line (rate limit)
+        unsigned r310_test_ms = 0;                       // R310: ProbeOffLockTestMs (0..20), only with ProbeOffLock=1
+        unsigned long long r310_next_ms = 0;             // R310: ProbeCost without the judge - a COST line every 5 minutes
+        unsigned long long r310_own_off_us = 0, r310_base_off_us = 0;   // R310: probe time spent with s.cs RELEASED
+        unsigned r310_dropped = 0;                       // R310: probes whose stream was released while they scored off the lock
         bool     learn_on = false;              // R278: MVecTap on and MVecLearned absent
         bool     learn_decided = false;         // R278d: the first-launch decision, made once at the hold
         int      learn_cand = 0;                // R278: MVecCandidate this launch tests
@@ -10809,6 +11178,26 @@ namespace
         return (v >= 0 && v <= 2) ? v : 0;
     }
 
+    // R312. DepthTransport: 1 (absent) output-size R32F, as today; 2 output-size 16-bit;
+    // 3 render-size R32F; 4 render-size 16-bit. The tap's .fx takes the format and size
+    // as preprocessor definitions (MGPU_DEPTH_FORMAT / _WIDTH / _HEIGHT, dllmain pushes
+    // them once per launch); the lane itself is generic from the arm on and needs no
+    // change. Read once; any other value reads as 1.
+    int ini_read_depth_transport()
+    {
+        static int cached = 0;
+        if (cached != 0) return cached;
+        char buf[INI_BYTES];
+        int v = 1;
+        if (ini_slurp(buf, sizeof buf))
+        {
+            const char *k = ini_find(buf, "DepthTransport");
+            if (k != nullptr) { v = atoi(k); if (v < 1 || v > 4) v = 1; }
+        }
+        cached = v;
+        return v;
+    }
+
     int ini_read_depth_inverted()
     {
         char buf[INI_BYTES];
@@ -11172,9 +11561,14 @@ namespace
         if (i == 0) snprintf(out, n, "none");
     }
 
+    void stream_release();
+}   // R311c: forward declaration for stream_release's drain call (r309 is defined after it)
+namespace r309 { namespace r311c { void drain(stream_state &s); } }
+namespace {
     void stream_release()
     {
         stream_state &s = str();
+        r309::r311c::drain(s);   // R311c: a probe scoring on the probe thread must leave the readbacks before they are released
 
         // ---- R26: DRAIN THE COPY QUEUE BEFORE ANYTHING IT REFERENCES IS
         // FREED ----
@@ -11264,6 +11658,7 @@ namespace
         if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
         if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
         mgpu::nr16::release();   // R208: same point, same reason
+        mgpu::residual::release();   // R316: same point, same reason
         // R216: same point, same reason.
         if (s.vr_pso_g != nullptr) { s.vr_pso_g->Release(); s.vr_pso_g = nullptr; }
         if (s.vr_pso   != nullptr) { s.vr_pso->Release();   s.vr_pso   = nullptr; }
@@ -11355,11 +11750,21 @@ namespace
         if (s.nseal != nullptr) { s.nseal->Release(); s.nseal = nullptr; }
         for (int i = 0; i < 2; ++i) if (s.cp_rb[i] != nullptr) { s.cp_rb[i]->Release(); s.cp_rb[i] = nullptr; }   // R258
         s.cp_stage = 0; s.cp_n = 0; s.cp_written = false; s.cp_worse = 0; s.learn_on = false; s.learn_decided = false; s.cp_win_n = 0;   // R278
-        s.x_edge_used = 0; s.x_edges_rec = 0; s.x_edge_sum[0] = s.x_edge_sum[1] = 0.0; s.x_edge_n[0] = s.x_edge_n[1] = 0; s.x_edge_fixed = false; s.x_edge_bad = 0; s.x_verdicts = 0; s.x_kx = s.x_ky = 0;   // R280e
+        s.cp_const_run = 0; s.cp_const_counted = false; s.cp_const_e0_min = s.cp_const_e0_max = 0.0;   // R305
+        s.x_edge_used = 0; s.x_edges_rec = 0; s.x_edge_sum[0] = s.x_edge_sum[1] = 0.0; s.x_edge_n[0] = s.x_edge_n[1] = 0; s.x_edge_fixed = false; s.x_edge_bad = 0; s.x_verdicts = 0; s.x_kx = s.x_ky = 0; s.x_still_motion = 0;   // R280e, R311e
+        // R309: everything but the key, which the hold reads again (learn_decided is reset above).
+        s.r309_aside = false; s.r309_zero_ready = false; s.r309_probe_own = false;
+        for (int i = 0; i < 6; ++i) s.r309_ring[i] = 0;
+        s.r309_ri = s.r309_rn = s.r309_brun = s.r309_own_judged = 0; s.r309_phase = 0; s.r309_wj = s.r309_ww = s.r309_wb = 0;
+        s.r309_cand_seen = -1; s.r309_gp_run = s.r309_t_end = s.r309_t_wake = 0;
+        s.r310_next_ms = 0; s.r310_dropped = 0;   // R310
         g_mvec_x_edge_req.store(0, std::memory_order_relaxed);
         g_mv_cand_req.store(-1, std::memory_order_relaxed);   // R278f
         for (int i = 0; i < 4; ++i) { s.cp_kx_votes[i] = 0; s.cp_ky_votes[i] = 0; }   // R278b: 4 buckets
         if (s.vp_rb != nullptr) { s.vp_rb->Release(); s.vp_rb = nullptr; }   // R257
+        if (s.r315_rb != nullptr) { s.r315_rb->Release(); s.r315_rb = nullptr; }   // R315b
+        s.r315_rb_pending = false; s.mvec2_off = 0;
+        g_r315_phase.store(R315_WINDOW, std::memory_order_relaxed);
         s.vp_pending = false; s.vp_n = 0;
         if (s.dp_rb != nullptr) { s.dp_rb->Release(); s.dp_rb = nullptr; }   // R244
         s.dp_pending = false; s.dp_n = 0; s.dp_agree = s.dp_disagree = 0; s.dp_written = false;
@@ -12731,7 +13136,7 @@ namespace
         {
             vr_block(s, ndev, p, s.tex_in[p], nullptr, s.vr_small, nullptr);
             vr_block(s, ndev, 4u + p,
-                     (s.depth_mode != 0) ? s.tex_depth[p] : nullptr,
+                     (s.depth_mode != 0 && s.depth_w == s.width && s.depth_h == s.height) ? s.tex_depth[p] : nullptr,   // R312: see sr_write_descriptors
                      (s.vr_mv != nullptr) ? s.tex_mvec_r[p] : nullptr,
                      s.vr_depth, s.vr_mv);
         }
@@ -13786,6 +14191,8 @@ namespace
             s.nrs_mode      = (unsigned)ini_read_float("NRMode", 1.0f);
             s.nrs_sharpness = ini_read_float("NRSharpness", 0.50f);
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
+            s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
+                              ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -14262,6 +14669,35 @@ namespace
         // R208: the FP16 input path. Reads NRInput16 itself; a failure here
         // leaves it off and never fails the arm.
         if (SUCCEEDED(h)) { (void)mgpu::nr16::arm(ndev, s.width, s.height); s.n16_ini_ok = true; }
+        // R316: the residual pass module. Reads its own keys (ResidualPass=1|2 ...); absent =
+        // nothing built. Handed R299's verdict so one residual path runs at a time (theirs
+        // wins), and the table's render size for ResidualRender=1 (R318). Never fails the arm.
+        if (SUCCEEDED(h))
+        {
+            unsigned rsd_rw = 0u, rsd_rh = 0u;
+            mgpu::calibrator::table rsd_ct;
+            if (mgpu::calibrator::read(rsd_ct) && (rsd_ct.have & mgpu::calibrator::KEY_RENDER_EXT) != 0u)
+            {
+                rsd_rw = rsd_ct.render_w; rsd_rh = rsd_ct.render_h;
+                // R327 (E13): swapped Width/Height vs OutWidth/OutHeight (KCD2) - the subrect is the render size.
+                if (rsd_ct.display_w != 0u && rsd_ct.display_h != 0u && rsd_rw > rsd_ct.display_w && rsd_rh > rsd_ct.display_h &&
+                    rsd_ct.sub_w != 0u && rsd_ct.sub_h != 0u && rsd_ct.sub_w <= rsd_ct.display_w && rsd_ct.sub_h <= rsd_ct.display_h)
+                { rsd_rw = rsd_ct.sub_w; rsd_rh = rsd_ct.sub_h; }
+            }
+            // R316a: settings that change the frame's shape, all fixed by this point of the arm
+            // (the R216 list plus the region keys). The first one found is named in the OFF line.
+            const char *rsd_why = nullptr;
+            if (s.sr_on != 0u)                 rsd_why = "SRUpscale is on";
+            else if (s.subrect_pct != 100u)    rsd_why = "Subrect is below 100";
+            else if (s.cc_on != 0u)            rsd_why = "CostCurve=1 is set";
+            else if (s.vr_mode != 0u)          rsd_why = "ScaleMode is set";
+            else if (s.p1f_mode != 0u)         rsd_why = "Pass1Fovea is set";
+            else if (s.p2r_on || s.p2f_mode != 0u) rsd_why = "Pass2Region / Pass2Fovea is set";
+            // R319: MAX_PASSES, not s.passes - the panel switches x1 / x2 live, so the carrying
+            // pass's feature is built at the work extent whichever one the session starts on.
+            (void)mgpu::residual::arm(ndev, s.width, s.height, nrfmt, stream_state::MAX_PASSES,
+                                      s.nrs_on, rsd_rw, rsd_rh, rsd_why, ini_read_srgb_input());
+        }
 
         // P8.0. Always created, like tex_pong and for the same reason: the mode
         // is live, so "will it be used" is not knowable at arm time and a lazy
@@ -14416,7 +14852,7 @@ namespace
                      "field - two of the four buffers Streamline registers as required. Grep "
                      "P9.0 across titles for the format table.",
                      exe, s.width, s.height, (int)s.format, (int)nrfmt, (int)infmt, bits,
-                     (s.mvec_mode == 0) ? "no" : "synthetic");
+                     (s.mvec_mode == 0) ? "no" : (s.mvec_mode == 3 ? "real (mode 3, the game's or the tap's, as transported)" : "synthetic"));   // R311: mode 3 said 'synthetic' (MVEC ledger 2.3)
             mgpu::diag::info(line);
         }
         if (FAILED(h))
@@ -14509,6 +14945,7 @@ namespace
                 mgpu::diag::info("[MGPU][OURS][NRS] create-time block: Color/Output on the work scratch, "
                                  "subrects at the work extent (step 2)");
             }
+            mgpu::residual::bind_create(s.nr_params);   // R316: no-op unless the module is on
             arm_sentinel_set();
             for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
             {
@@ -14519,8 +14956,12 @@ namespace
                 // point of the port. Pass 2's region feature keeps its own size.
                 const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
                 const bool nrs1 = s.nrs_on && i == 0u;
-                const UINT cw  = nrs1 ? s.nrs_cap_w : (p2f ? s.p2r_w : s.width);
-                const UINT chh = nrs1 ? s.nrs_cap_h : (p2f ? s.p2r_h : s.height);
+                UINT cw  = nrs1 ? s.nrs_cap_w : (p2f ? s.p2r_w : s.width);
+                UINT chh = nrs1 ? s.nrs_cap_h : (p2f ? s.p2r_h : s.height);
+                // R316: the residual pass's feature at the work extent (the module is off
+                // whenever nrs1 can be true, so the two never meet). Off: cw/chh as above.
+                if (mgpu::residual::active() && i == mgpu::residual::pass())
+                    mgpu::residual::work_extent(cw, chh);
                 s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
                 s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
@@ -14850,6 +15291,17 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
                      "NOT paused, so expect one burst of DROPPED / REORDERED / STALE seals across "
                      "the next few frames. That is this resize, not the transport; frames after it "
                      "return to gap=1 OK.");
+    const double r313_r0 = mgpu::strace::now_ms();
+    if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u -> %ux%u mode=%d", cur_w, cur_h, src_w, src_h, mode); mgpu::strace::ev(mgpu::strace::R_BT, "present-resize-enter", d); }
+    // R313 DcompSafeMode=3: the composition chain is resized UNROOTED, so DWM
+    // never composes a chain that is changing size; rooted again (through the
+    // quiet gate) once the new size is committed. Key absent: nothing here.
+    bool r313_reroot = false;
+    if (mgpu::strace::safe_mode() == 3 && g_dcomp_device != nullptr && g_dcomp_rooted.load(std::memory_order_relaxed))
+    {
+        r313_reroot = true;
+        (void)dcomp_set_rooted(false, "resize (DcompSafeMode=3: unrooted while the chain changes size)");
+    }
 
     // GPU idle first. ResizeBuffers requires every backbuffer reference
     // released, and releasing a resource the GPU is still reading is the P1.0
@@ -14889,7 +15341,9 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     }
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
+    const double r313_rb0 = mgpu::strace::now_ms();
     const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, 0);
+    if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u fmt=%d, %.2f ms", buf_w, buf_h, (int)want_fmt, mgpu::strace::now_ms() - r313_rb0); mgpu::strace::ev(mgpu::strace::R_BT, "ResizeBuffers", d, (unsigned)rb); }
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
     //
@@ -14910,7 +15364,11 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     {
         dcomp_fit_apply(buf_w, buf_h, "present_resize");   // R271: no-op unless DcompFit=1
         IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
+        const double r313_c0 = mgpu::strace::now_ms();
         const HRESULT ch = dc->Commit();
+        HRESULT r313_wait = S_OK;
+        if (SUCCEEDED(ch) && mgpu::strace::safe_mode() == 3) r313_wait = dc->WaitForCommitCompletion();   // R313 value 3: serialized
+        if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "after ResizeBuffers (V69), %.2f ms%s", mgpu::strace::now_ms() - r313_c0, mgpu::strace::safe_mode() == 3 ? " (waited for DWM)" : ""); mgpu::strace::ev(mgpu::strace::R_BT, "Commit", d, (unsigned)(FAILED(ch) ? ch : r313_wait)); }
         if (FAILED(ch))
         {
             char v69[300];
@@ -14965,8 +15423,12 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
                  "path only. Set Window=crop in mgpu.ini to get the P5 1280x720 window back.",
                  (unsigned)rb, buf_w, buf_h);
         mgpu::diag::error(l);
+        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "present-resize-exit", "RESIZE FAILED", (unsigned)rb);
+        if (r313_reroot) g_r313_root_deferred.store(1, std::memory_order_relaxed);   // R313 value 3: back on screen through the gate
         return false;
     }
+    if (mgpu::strace::on()) { char d[64]; snprintf(d, sizeof d, "ok, %.1f ms in all", mgpu::strace::now_ms() - r313_r0); mgpu::strace::ev(mgpu::strace::R_BT, "present-resize-exit", d); }
+    if (r313_reroot) g_r313_root_deferred.store(1, std::memory_order_relaxed);   // R313 value 3: rooted again once the game's chain is quiet
 
     snprintf(l, sizeof l,
              "[MGPU][P7.3] present chain resized: mode=%s source=%ux%u fmt=%d -> window %ux%u at "
@@ -15167,6 +15629,489 @@ namespace sfdiag
         }
     }
 }
+// =====================================================================
+// R309 (MVecStepAside=1, off by default; absent or 0 and nothing below runs).
+//
+// Far Cry 6, 2026-10-15: no buffer the tap, R280 or the R307/R308 sweep could
+// reach carries the camera's motion. The picture that did not strobe was the
+// ZERO field. Two things kept the add-on from landing there by itself:
+//   1. R258 rejects a candidate only when its BEST of 12 unit readings is worse
+//      than no motion. Colour, a constant 1.0, a G-buffer channel all read as
+//      PIXELS shift by under a pixel and score like no motion - never rejected -
+//      while the add-on binds them as UV, ~770 px of shift.
+//   2. MVecLearned=99 left MVec=3 armed on the probe's own pick with no copy
+//      route, so every evaluate ran with MVec UNSET - more strobe than zeros.
+// R309 scores the vectors AS BOUND (MVecScale in force) against no motion on
+// R258's own readbacks. 5 of the last 6 probes worse and none better (R311; 4 in R309): the
+// zero field is bound in place of the vectors, live; the copies and the judge
+// carry on, and 2 probes running that line up better step back. 99 binds the
+// zero field from the arm. A contract title is never touched.
+// COST, by construction and MEASURED by the lines below: probes run only in a
+// WINDOW - opened by gameplay (300 seals running with fresh vectors and valid
+// depth), 180 s of probes every 100 frames, then none for 20 minutes. Each
+// probe: three GPU 1 readback copies and a CPU loop on the bridge thread WITH
+// s.cs HELD - which is the lock the game's render thread takes every frame.
+// So the instrument times both sides: the bridge's hold per probe, and the
+// game thread's WAIT for s.cs (R168 times its hold, never its wait), inside
+// and outside the windows. QPC wall clock: not a GPU timing (P2.2).
+// =====================================================================
+namespace r309
+{
+    // R310 (ProbeCost=1): the game thread's wait for s.cs. One relaxed load a frame when off.
+    std::atomic<bool> time_game{false};
+    std::atomic<unsigned long long> gw_n{0}, gw_us_sum{0}, gw_us_max{0};
+
+    inline unsigned long long us_since(LONGLONG t0)
+    {
+        return (unsigned long long)(sfdiag::ms(t0, sfdiag::qpc()) * 1000.0);
+    }
+
+    inline void note_game_wait(LONGLONG t0)
+    {
+        const unsigned long long us = us_since(t0);
+        gw_n.fetch_add(1, std::memory_order_relaxed);
+        gw_us_sum.fetch_add(us, std::memory_order_relaxed);
+        unsigned long long m = gw_us_max.load(std::memory_order_relaxed);
+        while (us > m && !gw_us_max.compare_exchange_weak(m, us, std::memory_order_relaxed)) { }
+    }
+
+    // R309/R310: the keys, read from the file itself (ini_slurp + ini_find), never through
+    // ui_ini_read - its 12-slot mirror caches the first keys asked for, and a key of ours
+    // taking a slot would push a panel key out of the cache. Once per arm, and once per
+    // R280 init for MVecStepAside. A stack buffer, as the arm's own reads use.
+    struct keys { int step_aside; bool cost; bool offlock; unsigned test_ms; int learned; int source; bool thread; };   // R311: source; R311c: thread (ProbeOffLock=2)
+    keys read_keys()
+    {
+        keys k{ 0, false, false, 0u, -1, 0, false };
+        char vb[INI_BYTES];
+        if (!ini_slurp(vb, sizeof vb)) return k;
+        const char *v = ini_find(vb, "MVecStepAside");
+        if (v != nullptr)
+        {
+            if (_strnicmp(v, "auto", 4) == 0 || *v == '2') k.step_aside = 2;
+            else if (*v == '1') k.step_aside = 1;
+        }
+        // R311: MVecSource 0..3. MVecStepAside=1 (R309's forced zero field) is kept as the alias of
+        // MVecSource=3, so what was written down for it stays true; MVecSource wins when both are set.
+        v = ini_find(vb, "MVecSource");
+        if (v != nullptr && *v >= '0' && *v <= '3') k.source = *v - '0';
+        if (k.source == 0 && k.step_aside == 1) k.source = 3;
+        v = ini_find(vb, "ProbeCost");    k.cost = (v != nullptr && *v == '1');
+        v = ini_find(vb, "ProbeOffLock"); k.offlock = (v != nullptr && (*v == '1' || *v == '2')); k.thread = (v != nullptr && *v == '2');   // R311c: 2 = the loops on the probe thread
+        v = ini_find(vb, "ProbeOffLockTestMs");
+        if (v != nullptr) { int t = atoi(v); if (t < 0) t = 0; if (t > 20) t = 20; k.test_ms = (unsigned)t; }
+        v = ini_find(vb, "MVecLearned");
+        if (v != nullptr && *v >= '0' && *v <= '9') k.learned = atoi(v);
+        return k;
+    }
+
+    // R310: a probe's bridge time. HELD = total minus the time it ran with s.cs released.
+    inline void note_hold(stream_state &s, LONGLONG t0, bool own, unsigned long long off_us)
+    {
+        const unsigned long long tot = us_since(t0);
+        const unsigned long long held = (tot > off_us) ? tot - off_us : 0ull;
+        if (own) { ++s.r309_own_n;  s.r309_own_us  += held; if (held > s.r309_own_max)  s.r309_own_max  = held; s.r310_own_off_us  += off_us; }
+        else     { ++s.r309_base_n; s.r309_base_us += held; if (held > s.r309_base_max) s.r309_base_max = held; s.r310_base_off_us += off_us; }
+    }
+
+    // R310 (ProbeCost=1): the cost since the last call, then the counters start again.
+    void cost_line(stream_state &s, const char *what)
+    {
+        if (!s.r310_cost) return;
+        const unsigned long long gn = gw_n.exchange(0, std::memory_order_relaxed);
+        const unsigned long long gs = gw_us_sum.exchange(0, std::memory_order_relaxed);
+        const unsigned long long gm = gw_us_max.exchange(0, std::memory_order_relaxed);
+        char l[900];
+        snprintf(l, sizeof l,
+                 "[MGPU][R310] COST %s: R309's own probes %llu - bridge time per probe WITH s.cs HELD mean %.3f max %.3f ms, "
+                 "with s.cs released mean %.3f ms, %.1f MB of GPU 1 readback copies | R258's probes %llu - held mean %.3f max %.3f ms, "
+                 "released mean %.3f ms | GAME render thread waiting to take s.cs: %llu frames, mean %.4f max %.3f ms | "
+                 "ProbeOffLock=%d, %u probe(s) dropped by a release. QPC wall clock, not a GPU timing. A game-side max near "
+                 "a probe's held max means that probe stalled a game frame by about that much.",
+                 what,
+                 s.r309_own_n, s.r309_own_n ? (double)s.r309_own_us / 1000.0 / (double)s.r309_own_n : 0.0, (double)s.r309_own_max / 1000.0,
+                 s.r309_own_n ? (double)s.r310_own_off_us / 1000.0 / (double)s.r309_own_n : 0.0, (double)s.r309_bytes / 1048576.0,
+                 s.r309_base_n, s.r309_base_n ? (double)s.r309_base_us / 1000.0 / (double)s.r309_base_n : 0.0, (double)s.r309_base_max / 1000.0,
+                 s.r309_base_n ? (double)s.r310_base_off_us / 1000.0 / (double)s.r309_base_n : 0.0,
+                 gn, gn ? (double)gs / 1000.0 / (double)gn : 0.0, (double)gm / 1000.0,
+                 s.r310_offlock ? 1 : 0, s.r310_dropped);
+        mgpu::diag::info(l);
+        s.r309_own_n = s.r309_own_us = s.r309_own_max = 0; s.r309_base_n = s.r309_base_us = s.r309_base_max = 0;
+        s.r310_own_off_us = s.r310_base_off_us = 0; s.r309_bytes = 0;
+    }
+
+    // R310 (ProbeOffLock=1): s.cs released around a probe's pixel loops. Between off_begin and
+    // off_end the loops read only the three mapped readbacks - AddRef'd here, so a release on
+    // another thread (the NGX shutdown takes s.cs, then stream_release) cannot free them under
+    // the loop - and stream fields that nothing writes while the stream is armed: the arm writes
+    // them before s.armed, stream_release never writes them, the R280 verdict writes the scale
+    // on THIS thread. See the R310 section of the ledger for the review.
+    inline LONGLONG off_begin(stream_state &s, std::unique_lock<std::mutex> &lk, ID3D12Resource *ref[3])
+    {
+        ref[0] = s.cp_rb[0]; ref[1] = s.cp_rb[1]; ref[2] = s.vp_rb;
+        for (int i = 0; i < 3; ++i) if (ref[i] != nullptr) ref[i]->AddRef();
+        const unsigned ms = s.r310_test_ms;   // read before the unlock
+        const LONGLONG t0 = sfdiag::qpc();
+        lk.unlock();
+        if (ms != 0u) Sleep(ms);   // ProbeOffLockTestMs: widens the window ON PURPOSE, for the teardown test
+        return t0;
+    }
+    // Relocks. False when the stream was released meanwhile: the caller calls off_drop and returns.
+    inline bool off_end(stream_state &s, std::unique_lock<std::mutex> &lk, LONGLONG t0, unsigned long long &off_us)
+    {
+        lk.lock();
+        off_us += us_since(t0);
+        return s.armed && !s.ngx_shut_done;
+    }
+    void off_drop(stream_state &s, ID3D12Resource *ref[3], bool ok0, bool ok1, bool okm)
+    {
+        D3D12_RANGE none{ 0, 0 };
+        if (ok0 && ref[0] != nullptr) ref[0]->Unmap(0, &none);
+        if (ok1 && ref[1] != nullptr) ref[1]->Unmap(0, &none);
+        if (okm && ref[2] != nullptr) ref[2]->Unmap(0, &none);
+        for (int i = 0; i < 3; ++i) if (ref[i] != nullptr) { ref[i]->Release(); ref[i] = nullptr; }
+        ++s.r310_dropped;
+        mgpu::diag::warn("[MGPU][R310] the stream was released while a probe scored with s.cs released (ProbeOffLock=1): "
+                         "its results are dropped, the readbacks it held are unmapped and released, and this poll ends here. "
+                         "This is the teardown case the key's design covers - expected only when the game quits mid-probe.");
+    }
+
+    // =====================================================================
+    // R311c (ProbeOffLock=2): THE PROBE'S PIXEL LOOPS ON A THREAD OF THEIR OWN.
+    // R310 moved the loops off s.cs but left them on the bridge thread: at Far
+    // Cry 6's 250 fps the 16-17 ms of scoring held the consumer 4-7 frames and
+    // the ring dropped seals at every probe ([SEAL] DROPPED gap=7 on R258 probe
+    // frames in F0 / F0-PC and the R308-R310 runs with ProbeOffLock=1, never
+    // with 0). The loops read three mapped readbacks and locals only, so they
+    // do not need the bridge thread at all: the bridge thread maps, hands the
+    // pointers over, continues with the next seal, and on a later poll - with
+    // s.cs held as always - takes the result and runs the SAME decision code
+    // (votes, R278, R305, R309's judge, the lines) that it ran inline before.
+    // Nothing of the decision moved; only where the arithmetic runs.
+    // The compute functions below are the loops of the inline block, moved
+    // verbatim into functions so the inline path (ProbeOffLock=0/1) and the
+    // thread run one copy of them.
+    // While a job runs: no new probe is recorded (the readbacks are in use);
+    // teardown waits for the job (the loops check 'cancel' once per row).
+    // =====================================================================
+    namespace r311c
+    {
+        struct in
+        {
+            const unsigned char *c0, *c1, *mv;
+            unsigned W, H, P, fmt, bpp, MP, mfmt, mv_tb; size_t mv_bpp;
+            unsigned mvec_w, mvec_h, width, height;
+            float sx, sy;          // MVecScale in force when the probe was taken (ui_set_mvec_value writes it live under s.cs)
+            bool own, r309_b;
+        };
+        struct out
+        {
+            std::vector<double> ca, cb, ra, rb;
+            double svx, svy; unsigned long long nv, zeros;   // R311e: zeros = samples that decode as no motion
+            unsigned char cfirst[8]; bool cconst, chave;
+            double err[13]; unsigned long long cnt[13];
+            double r309_eb; unsigned long long r309_nb;
+            double e0s, ebs; unsigned long long n0, nb;   // own probes
+        };
+        // R309's own probe: the bound reading and no motion only (the inline loop, verbatim).
+        inline void compute_own(const in &i, out &o, const std::atomic<bool> *cancel)
+        {
+            const double sxm = (double)i.W / (double)i.mvec_w, sym = (double)i.H / (double)i.mvec_h;
+            const double bsx = (double)i.sx * (double)i.W / (double)i.width, bsy = (double)i.sy * (double)i.H / (double)i.height;
+            o.e0s = 0.0; o.ebs = 0.0; o.n0 = 0; o.nb = 0; o.zeros = 0; o.nv = 0;
+            for (unsigned y = i.H / 4; y < 3 * i.H / 4; y += 4)
+            {
+                if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) return;
+                const unsigned my = (unsigned)((double)y / sym); if (my >= i.mvec_h) continue;
+                const unsigned char *mrow = i.mv + (size_t)my * i.MP;
+                const unsigned char *r1 = i.c1 + (size_t)y * i.P, *r0 = i.c0 + (size_t)y * i.P;
+                for (unsigned x = i.W / 4; x < 3 * i.W / 4; x += 4)
+                {
+                    const unsigned mxx = (unsigned)((double)x / sxm); if (mxx >= i.mvec_w) continue;
+                    float vx, vy;
+                    const unsigned char *pv = mrow + (size_t)mxx * i.mv_bpp;
+                    if (!mv_read(i.mfmt, pv, vx, vy)) { const float *q = (const float *)pv; vx = q[0]; vy = q[1]; }
+                    const double l2 = lum_at(r1 + (size_t)x * i.bpp, i.fmt), l1 = lum_at(r0 + (size_t)x * i.bpp, i.fmt);
+                    o.e0s += (l1 > l2 ? l1 - l2 : l2 - l1); ++o.n0;
+                    const double px = (double)x + bsx * (double)vx + 0.5, py = (double)y + bsy * (double)vy + 0.5;   // nearest pixel
+                    if (px < 0 || py < 0 || px >= (double)i.W - 1 || py >= (double)i.H - 1) continue;
+                    const double lb = lum_at(i.c0 + (size_t)(unsigned)py * i.P + (size_t)(unsigned)px * i.bpp, i.fmt);
+                    o.ebs += (lb > l2 ? lb - l2 : l2 - lb); ++o.nb;
+                }
+            }
+        }
+        // R258's probe: the profile, the mean vector + R305 constant check, the 12-candidate warp
+        // test and R309's bound reading (the inline loops, verbatim; ax/ay are derived by the caller).
+        inline void compute_base(const in &i, out &o, const std::atomic<bool> *cancel)
+        {
+            const unsigned W = i.W, H = i.H, P = i.P, fmt = i.fmt, bpp = i.bpp, MP = i.MP, mfmt = i.mfmt, mv_tb = i.mv_tb;
+            const size_t mv_bpp = i.mv_bpp;
+            const unsigned x0 = W / 4, x1 = 3 * W / 4, y0 = H / 4, y1 = 3 * H / 4;
+            o.ca.assign(W, 0.0); o.cb.assign(W, 0.0); o.ra.assign(H, 0.0); o.rb.assign(H, 0.0);
+            for (unsigned y = y0; y < y1; y += 2)
+            {
+                if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) return;
+                const unsigned char *r0 = i.c0 + (size_t)y * P, *r1 = i.c1 + (size_t)y * P;
+                for (unsigned x = x0; x < x1; x += 2)
+                {
+                    const double l0 = lum_at(r0 + (size_t)x * bpp, fmt), l1 = lum_at(r1 + (size_t)x * bpp, fmt);
+                    o.ca[x] += l0; o.cb[x] += l1; o.ra[y] += l0; o.rb[y] += l1;
+                }
+            }
+            o.svx = 0; o.svy = 0; o.nv = 0; o.zeros = 0;
+            auto read_mv = [mfmt](const unsigned char *px, float &vx, float &vy)
+            {
+                if (!mv_read(mfmt, px, vx, vy)) { const float *q = (const float *)px; vx = q[0]; vy = q[1]; }
+            };
+            memset(o.cfirst, 0, sizeof o.cfirst); o.cconst = true; o.chave = false;
+            const unsigned mx0 = i.mvec_w / 4, mx1 = 3 * i.mvec_w / 4, my0 = i.mvec_h / 4, my1 = 3 * i.mvec_h / 4;
+            for (unsigned y = my0; y < my1; y += 2)
+            {
+                if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) return;
+                const unsigned char *row = i.mv + (size_t)y * MP;
+                for (unsigned x = mx0; x < mx1; x += 4)
+                {
+                    float vx, vy;
+                    read_mv(row + (size_t)x * mv_bpp, vx, vy);   // R280o
+                    o.svx += vx; o.svy += vy; ++o.nv;
+                    if (mv_tb != 0u && mv_is_zero_encoding(mfmt, row + (size_t)x * mv_bpp)) ++o.zeros;   // R311e
+                    if (mv_tb != 0u)   // R305
+                    {
+                        const unsigned char *t = row + (size_t)x * mv_bpp;
+                        if (!o.chave) { memcpy(o.cfirst, t, mv_tb); o.chave = true; }
+                        else if (o.cconst && memcmp(t, o.cfirst, mv_tb) != 0) o.cconst = false;
+                    }
+                }
+            }
+            for (int c = 0; c < 13; ++c) { o.err[c] = 0.0; o.cnt[c] = 0; }
+            const double KX[4] = { (double)W, -(double)W, (double)W * 0.5, -(double)W * 0.5 };
+            const double KY[4] = { (double)H, -(double)H, (double)H * 0.5, -(double)H * 0.5 };
+            const double sxm = (double)W / (double)i.mvec_w, sym = (double)H / (double)i.mvec_h;   // vector grid -> colour grid
+            const double sxv[12] = { KX[0], KX[0], KX[1], KX[1], KX[2], KX[2], KX[3], KX[3],  sxm,  sxm, -sxm, -sxm };
+            const double syv[12] = { KY[0], KY[1], KY[0], KY[1], KY[2], KY[3], KY[2], KY[3],  sym, -sym,  sym, -sym };
+            const bool r309_b = i.r309_b;
+            const double r309_bsx = (double)i.sx * (double)W / (double)i.width, r309_bsy = (double)i.sy * (double)H / (double)i.height;
+            o.r309_eb = 0.0; o.r309_nb = 0;
+            for (unsigned y = y0; y < y1; y += 4)
+            {
+                if (cancel != nullptr && cancel->load(std::memory_order_relaxed)) return;
+                const unsigned char *r1 = i.c1 + (size_t)y * P;
+                const unsigned my = (unsigned)((double)y / sym); if (my >= i.mvec_h) continue;
+                const unsigned char *mrow = i.mv + (size_t)my * MP;
+                for (unsigned x = x0; x < x1; x += 4)
+                {
+                    const unsigned mxx = (unsigned)((double)x / sxm); if (mxx >= i.mvec_w) continue;
+                    float vx, vy;
+                    read_mv(mrow + (size_t)mxx * mv_bpp, vx, vy);   // R280o
+                    const double l2 = lum_at(r1 + (size_t)x * bpp, fmt);
+                    // baseline
+                    { const double l1 = lum_at(i.c0 + (size_t)y * P + (size_t)x * bpp, fmt); o.err[0] += (l1 > l2 ? l1 - l2 : l2 - l1); ++o.cnt[0]; }
+                    for (int c = 0; c < 12; ++c)
+                    {
+                        const double px = (double)x + sxv[c] * (double)vx, py = (double)y + syv[c] * (double)vy;
+                        if (px < 0 || py < 0 || px >= (double)W - 1 || py >= (double)H - 1) continue;
+                        const double l1 = lum_at(i.c0 + (size_t)(unsigned)py * P + (size_t)(unsigned)px * bpp, fmt);
+                        o.err[1 + c] += (l1 > l2 ? l1 - l2 : l2 - l1); ++o.cnt[1 + c];
+                    }
+                    if (r309_b)   // R309
+                    {
+                        const double bx = (double)x + r309_bsx * (double)vx + 0.5, by = (double)y + r309_bsy * (double)vy + 0.5;   // nearest pixel
+                        if (bx >= 0 && by >= 0 && bx < (double)W - 1 && by < (double)H - 1)
+                        {
+                            const double lb = lum_at(i.c0 + (size_t)(unsigned)by * P + (size_t)(unsigned)bx * bpp, fmt);
+                            o.r309_eb += (lb > l2 ? lb - l2 : l2 - lb); ++o.r309_nb;
+                        }
+                    }
+                }
+            }
+        }
+
+        // The one job. state: 0 idle, 1 running, 2 done (result waiting for the bridge thread).
+        struct job
+        {
+            in i; out o;
+            bool ok0, ok1, okm; ID3D12Resource *ref[3];
+            unsigned long long f;      // the probe's seal, for the lines and the judge
+            LONGLONG t0;               // launch time; us = the thread's compute time
+            unsigned long long us;
+            bool own;
+        };
+        job g_job{};
+        std::atomic<int> g_state{0};
+        std::atomic<bool> g_cancel{false}, g_quit{false};
+        HANDLE g_ev = nullptr, g_th = nullptr;
+
+        DWORD WINAPI run(void *)
+        {
+            for (;;)
+            {
+                WaitForSingleObject(g_ev, 250);
+                if (g_quit.load(std::memory_order_relaxed)) return 0;
+                if (g_state.load(std::memory_order_acquire) != 1) continue;
+                const LONGLONG t0 = sfdiag::qpc();
+                if (g_job.own) compute_own(g_job.i, g_job.o, &g_cancel);
+                else           compute_base(g_job.i, g_job.o, &g_cancel);
+                g_job.us = us_since(t0);
+                g_state.store(2, std::memory_order_release);
+            }
+        }
+        inline bool idle() { return g_state.load(std::memory_order_acquire) == 0; }
+        inline bool done() { return g_state.load(std::memory_order_acquire) == 2; }
+        // Bridge thread, s.cs held: hand the mapped readbacks over. The refs are AddRef'd like off_begin.
+        bool launch(stream_state &s, const in &i, bool ok0, bool ok1, bool okm, unsigned long long f, bool own)
+        {
+            if (g_th == nullptr)
+            {
+                g_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (g_ev == nullptr) return false;
+                g_th = CreateThread(nullptr, 0, &run, nullptr, 0, nullptr);
+                if (g_th == nullptr) { CloseHandle(g_ev); g_ev = nullptr; return false; }
+            }
+            if (!idle()) return false;
+            g_job.i = i; g_job.ok0 = ok0; g_job.ok1 = ok1; g_job.okm = okm; g_job.f = f; g_job.own = own; g_job.us = 0;
+            g_job.ref[0] = s.cp_rb[0]; g_job.ref[1] = s.cp_rb[1]; g_job.ref[2] = s.vp_rb;
+            for (int k = 0; k < 3; ++k) if (g_job.ref[k] != nullptr) g_job.ref[k]->AddRef();
+            g_job.t0 = sfdiag::qpc();
+            g_cancel.store(false, std::memory_order_relaxed);
+            g_state.store(1, std::memory_order_release);
+            SetEvent(g_ev);
+            return true;
+        }
+        // Bridge thread: the result was taken; unmap through the held refs and release them.
+        void finish()
+        {
+            D3D12_RANGE none{ 0, 0 };
+            if (g_job.ok0 && g_job.ref[0] != nullptr) g_job.ref[0]->Unmap(0, &none);
+            if (g_job.ok1 && g_job.ref[1] != nullptr) g_job.ref[1]->Unmap(0, &none);
+            if (g_job.okm && g_job.ref[2] != nullptr) g_job.ref[2]->Unmap(0, &none);
+            for (int k = 0; k < 3; ++k) if (g_job.ref[k] != nullptr) { g_job.ref[k]->Release(); g_job.ref[k] = nullptr; }
+            g_state.store(0, std::memory_order_release);
+        }
+        // Teardown (stream_release): cancel a running job, wait for the thread to leave the loops, drop the result.
+        void drain(stream_state &s)
+        {
+            if (idle()) return;
+            g_cancel.store(true, std::memory_order_relaxed);
+            for (int w = 0; w < 200 && g_state.load(std::memory_order_acquire) == 1; ++w) Sleep(5);   // the loops check cancel per row
+            if (g_state.load(std::memory_order_acquire) == 1) return;   // still inside a row after 1 s: leave the refs held (a leak, not a free under a reader)
+            finish();
+            ++s.r310_dropped;
+            mgpu::diag::warn("[MGPU][R311c] the stream was released while a probe scored on the probe thread (ProbeOffLock=2): "
+                             "its result is dropped, the readbacks it held are unmapped and released.");
+        }
+        void stop_thread()
+        {
+            if (g_th == nullptr) return;
+            g_quit.store(true, std::memory_order_relaxed);
+            if (g_ev != nullptr) SetEvent(g_ev);
+            WaitForSingleObject(g_th, 2000);
+            CloseHandle(g_th); g_th = nullptr;
+            if (g_ev != nullptr) { CloseHandle(g_ev); g_ev = nullptr; }
+        }
+    }
+
+    // Once a poll, before the probe schedule: the gameplay gate and the window clock.
+    // True when R309 may start a probe on this seal.
+    bool window(stream_state &s, bool fresh, bool depth_ok, unsigned long long f)
+    {
+        const bool gp = fresh && depth_ok;
+        s.r309_gp_run = gp ? s.r309_gp_run + 1ull : 0ull;
+        const unsigned long long now = GetTickCount64();
+        char l[420];
+        if (s.r309_phase == 0u && s.r309_gp_run >= 300ull)
+        {
+            if (vectors_contract()) { s.r309_phase = 2u; s.r309_t_wake = ~0ull; return false; }   // a contract title: never (R311: unless MVecSource is set)
+            cost_line(s, "before this window (R258's own probes only)");
+            s.r309_phase = 1u; s.r309_t_end = now + 180000ull; ++s.r309_windows;
+            s.r309_wj = s.r309_ww = s.r309_wb = 0;
+            snprintf(l, sizeof l, "[MGPU][R309] WINDOW %u OPEN at f=%llu: gameplay seen (300 seals running with fresh vectors and valid depth). "
+                                  "Probes every 100 frames for 180 s, then none for 20 minutes. Bound field now: %s.",
+                     s.r309_windows, f, s.r309_aside ? "ZERO (stepped aside)" : "the vectors");
+            mgpu::diag::info(l);
+        }
+        else if (s.r309_phase == 1u && now >= s.r309_t_end)
+        {
+            s.r309_phase = 2u; s.r309_t_wake = now + 1200000ull;
+            char w[48]; snprintf(w, sizeof w, "window %u", s.r309_windows);
+            cost_line(s, w);
+            snprintf(l, sizeof l, "[MGPU][R309] WINDOW %u CLOSED at f=%llu: %u probes judged, %u worse than no motion, %u better. Bound field: %s. "
+                                  "Next window in 20 minutes, once gameplay is seen again. %u switch(es) this session.",
+                     s.r309_windows, f, s.r309_wj, s.r309_ww, s.r309_wb, s.r309_aside ? "ZERO (stepped aside)" : "the vectors", s.r309_switches);
+            mgpu::diag::info(l);
+        }
+        else if (s.r309_phase == 2u && now >= s.r309_t_wake) { s.r309_phase = 0u; s.r309_gp_run = 0ull; }
+        return s.r309_phase == 1u && gp;
+    }
+
+    // One judged probe: none = the no-motion error, bound = the error with the vectors
+    // followed at the scale in force. Bridge thread, s.cs held, no file I/O.
+    void judge(stream_state &s, double e0, double eb, unsigned long long n0, unsigned long long nb,
+               unsigned long long f, bool own)
+    {
+        if (n0 <= 1000ull || nb <= 1000ull) return;
+        if (e0 < 0.05) return;   // the two colour frames are the same frame: nothing to judge on
+        if (vectors_contract()) return;   // a contract title keeps its own vectors (R311: unless MVecSource is set)
+        if (s.r309_cand_seen != s.learn_cand)   // the tap moved to another candidate: fresh evidence
+        {
+            s.r309_cand_seen = s.learn_cand;
+            for (int i = 0; i < 6; ++i) s.r309_ring[i] = 0;
+            s.r309_ri = s.r309_rn = s.r309_brun = 0;
+        }
+        int o = 0;
+        if (eb > e0 * 1.10 + 0.25) o = -1;                    // worse than no motion - also with the camera still
+        else if (e0 >= 2.0 && eb < e0 * 0.90) o = +1;        // better, which needs motion
+        s.r309_ring[s.r309_ri] = o; s.r309_ri = (s.r309_ri + 1u) % 6u; if (s.r309_rn < 6u) ++s.r309_rn;
+        s.r309_brun = (o > 0) ? s.r309_brun + 1u : 0u;
+        unsigned w = 0, b = 0;
+        for (unsigned i = 0; i < s.r309_rn; ++i) { if (s.r309_ring[i] < 0) ++w; else if (s.r309_ring[i] > 0) ++b; }
+        ++s.r309_wj; if (o < 0) ++s.r309_ww; else if (o > 0) ++s.r309_wb;
+        char l[520];
+        if (!s.r309_aside && s.r309_rn >= 6u && w >= 5u && b == 0u)   // R311: 5 of 6 (was 4 of 6). Replayed on the FC6 runs 1-5, RE4 and Skyrim: FC6 still lands within one probe, RE4 keeps a margin of 2
+        {
+            s.r309_aside = true; ++s.r309_switches;
+            if (g_mvec_x_active.load(std::memory_order_relaxed))   // R311d: the bound vectors were R280's extract
+            {
+                g_mvec_x_stand_down.store(true, std::memory_order_relaxed);
+                s.r309_phase = 2u; s.r309_t_wake = ~0ull;   // the judge is final for this session: no more windows, no return
+                mgpu::diag::warn("[MGPU][R311d] the vectors the judge stepped aside from were R280's extract: R280 STANDS DOWN for this session "
+                                 "(no more extraction or staging copies on the game's queue), the zero field stays bound, and the judge closes. "
+                                 "The tap's learning continues on the game's own targets as before R280.");
+            }
+            snprintf(l, sizeof l, "[MGPU][R309] STEP ASIDE at f=%llu: %u of the last 6 probes lined up WORSE than no motion with the vectors as bound "
+                                  "(scale %.0f,%.0f), none better (last: none=%.3g bound=%.3g). The ZERO field is bound from the next evaluate; "
+                                  "the vectors keep being copied and judged, and 2 probes running that line up better bring them back.",
+                     f, w, s.mvec_scale_x, s.mvec_scale_y, e0, eb);
+            mgpu::diag::warn(l);
+            return;
+        }
+        if (s.r309_aside && s.r309_brun >= 2u)
+        {
+            s.r309_aside = false; ++s.r309_switches;
+            for (int i = 0; i < 6; ++i) s.r309_ring[i] = 0;
+            s.r309_ri = s.r309_rn = 0;
+            snprintf(l, sizeof l, "[MGPU][R309] BACK ON THE VECTORS at f=%llu: 2 probes running lined up better than no motion with the vectors as bound "
+                                  "(last: none=%.3g bound=%.3g, scale %.0f,%.0f).", f, e0, eb, s.mvec_scale_x, s.mvec_scale_y);
+            mgpu::diag::warn(l);
+            return;
+        }
+        if (!own || (++s.r309_own_judged % 30u) == 0u)
+        {
+            snprintf(l, sizeof l, "[MGPU][R309] probe at f=%llu (%s): none=%.3g bound=%.3g (scale %.0f,%.0f) -> %s | last %u: %u worse, %u better | bound field: %s",
+                     f, own ? "R309's, every 30th logged" : "R258's", e0, eb, s.mvec_scale_x, s.mvec_scale_y,
+                     o < 0 ? "WORSE than no motion" : (o > 0 ? "better" : "neither"), s.r309_rn, w, b, s.r309_aside ? "ZERO" : "the vectors");
+            mgpu::diag::info(l);
+        }
+    }
+}
+// R309: MVecStepAside for mvec_extract (R280 is not armed when it is 1). From the file, never the mirror.
+int mvec_step_aside_mode() { return r309::read_keys().step_aside; }
+// R311: MVecSource from the file (R280's arm asks before the hold has read the keys); stored for the hot paths.
+int mvec_source_mode()
+{
+    const int v = r309::read_keys().source;
+    g_r311_src.store(v, std::memory_order_relaxed);
+    return v;
+}
 bool stream_present_gate(unsigned long timeout_ms)
 {
     stream_state &s = str();
@@ -15213,6 +16158,14 @@ bool stream_present_gate(unsigned long timeout_ms)
         else
         {
             f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+            // PerfPrefetch=1 (with Perf11=1) only. The consume loop then waits for the frame the
+            // copy queue ARMED (s.cq_issued), which can be ahead of consumed+1. consumed+1 has
+            // usually arrived already, so the wait below returned at once and the bridge thread
+            // spun: 7.6 M gate calls and ~2000 [R167] lines/min in a 22-min Starfield run. Wait
+            // for the armed frame instead - the same arrival the copy queue itself waits for.
+            // PerfPrefetch absent: unchanged.
+            if (mgpu::t119::prefetch_active() && s.cq_gated && s.cq_issued > s.consumed + 1ull)
+                want = (UINT64)s.cq_issued;
             ++s.gate_idle;
         }
     }
@@ -15993,6 +16946,23 @@ bool dcomp_overlay_mode()
     const int seen = latched.load(std::memory_order_relaxed);
     if (seen >= 0) return seen != 0;
 
+    // R313 DcompSafeMode>=1: the decision runs on the BRIDGE thread only. A
+    // game-thread caller before the latch gets PENDING (the safe answer the
+    // R273b readers already handle: own window for now, R242 keeps a D3D11
+    // chain windowed), and dcomp_overlay_mode_settled() decides on BT within
+    // its bounded wait. Key absent: this block is one relaxed load.
+    if (mgpu::strace::safe_mode() >= 1 && !mgpu::strace::is_bridge_thread())
+    {
+        // R313a: the raw setting is still read here, once (the shipped path reads it
+        // on this thread too), so readers of g_dcomp_setting before the latch - R158's
+        // explicit-0 test - see the real value, not "not read yet".
+        if (g_dcomp_setting.load(std::memory_order_relaxed) == -3)
+            g_dcomp_setting.store(ini_read_dcomp_setting(), std::memory_order_relaxed);
+        g_dcomp_undecided.store(1, std::memory_order_relaxed);
+        return false;
+    }
+    const double r313_d0 = mgpu::strace::now_ms();   // R313: how long the decision takes, and where
+
     const int raw = ini_read_dcomp_setting();
     g_dcomp_setting.store(raw, std::memory_order_relaxed);
     const int want = dcomp_setting_effective(raw);   // R266: absent = 1
@@ -16171,6 +17141,15 @@ bool dcomp_overlay_mode()
     }
 
     latched.store(out, std::memory_order_relaxed);
+    // R313a: under DcompSafeMode a game thread may have set the undecided flag
+    // (the PENDING answer above); the V66 auto and explicit-0 branches never clear
+    // it, so clear it at the latch - a latched mode is decided by definition. Key
+    // absent: untouched, as shipped.
+    if (mgpu::strace::safe_mode() >= 1)
+        g_dcomp_undecided.store(0, std::memory_order_relaxed);
+    if (mgpu::strace::on())
+        mgpu::strace::note_decision(out, mgpu::strace::now_ms() - r313_d0,
+                                    mgpu::strace::is_bridge_thread() ? mgpu::strace::R_BT : mgpu::strace::R_GT_SWAP);
     return out != 0;
 }
 
@@ -16721,6 +17700,9 @@ unsigned long long own_route_copies()
 }
 int own_route_delivered()   // 0 none, 1 the evaluate route (R280o), 2 the game's own route on a contract title (R289)
 {
+    // R311: with MVecSource set, the game's own routes are dropped at stream_mvec_copy and the tap
+    // must not yield to them (the calibrator still counts its copies before the drop). Key absent: 0, as before.
+    if (g_r311_src.load(std::memory_order_relaxed) != 0) return 0;
     if (mgpu::calibrator::eval_copies() != 0ull) return 1;
     if (g_game_d3d12.load(std::memory_order_acquire) && own_route_copies() != 0ull && game_contract_seen()) return 2;
     return 0;
@@ -17053,6 +18035,14 @@ bool ui_ini_write_float(const char *key, float value)
 bool ui_ini_write_word(const char *key, const char *value)
 {
     return (key != nullptr && value != nullptr) ? ini_write_text(key, value) : false;
+}
+// R311: the word reader exported for mvec_extract (MVecPin=<fmt>,<w>,<h>,<mips>,<dec>,<chan>,<pxk>).
+// The file itself, never the 12-slot mirror. Empty when absent.
+void ui_ini_read_word(const char *key, char *out, size_t n)
+{
+    if (out == nullptr || n == 0) return;
+    if (key == nullptr) { out[0] = 0; return; }
+    ini_read_word(key, out, n);
 }
 
 // R219. The same parse as the arm's R216/R218 block, on the file as it is now.
@@ -17931,18 +18921,27 @@ void ui_set_intensity(unsigned pass_1based, float v)
     // Silently keeping the preset label over hand-edited numbers is how a run
     // gets recorded as back-loaded when it is not.
     s.preset = 0;
-    if (mgpu::t119::panel_persist())   // T1.17
-    {
-        if (pass_1based == 0) {
-            ui_ini_write_float("Intensity", v);
-            ui_ini_write_float("Intensity1", v);
-            ui_ini_write_float("Intensity2", v);
-        } else {
-            char key[32]; snprintf(key, sizeof key, "Intensity%u", pass_1based);
-            ui_ini_write_float(key, v);
-        }
-        ui_ini_write_word("Preset", "manual");
+    // R300n: the T1.17 write moved to ui_persist_intensity, called once when the slider is
+    // let go. It used to rewrite mgpu.ini on every frame of a drag while holding s.cs - the
+    // lock the game's producer takes.
+}
+
+// R300n (PanelPersist=1 only). Called by the panel once, when a slider is released.
+// Same keys and values as T1.17 wrote; written with s.cs NOT held.
+void ui_persist_intensity(unsigned pass_1based, float v)
+{
+    if (!mgpu::t119::panel_persist()) return;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    if (pass_1based == 0) {
+        ui_ini_write_float("Intensity", v);
+        ui_ini_write_float("Intensity1", v);
+        ui_ini_write_float("Intensity2", v);
+    } else {
+        char key[32]; snprintf(key, sizeof key, "Intensity%u", pass_1based);
+        ui_ini_write_float(key, v);
     }
+    ui_ini_write_word("Preset", "manual");
 }
 
 // P7.5. Move the split seam. `dir` is -1 (left) or +1 (right); `coarse` takes
@@ -17980,7 +18979,16 @@ void ui_set_split_pos(float v)
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
     s.split_pos = v;
-    if (mgpu::t119::panel_persist()) ui_ini_write_float("SplitPos", v);   // T1.17
+    // R300n: the T1.17 write moved to ui_persist_split_pos (once, on release, s.cs not held).
+}
+
+// R300n (PanelPersist=1 only). Called by the panel once, when the seam slider is released.
+void ui_persist_split_pos(float v)
+{
+    if (!mgpu::t119::panel_persist()) return;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    ui_ini_write_float("SplitPos", v);   // T1.17
 }
 
 // P7.4. The present mode, LIVE. 0 nr, 1 in, 2 split.
@@ -19292,7 +20300,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     }
 
     stream_state &s = str();
+    // R309 (MVecStepAside=1 only): how long THIS thread waited for s.cs - R168 below times the
+    // hold, never the wait. Key off: one relaxed load, nothing else.
+    const LONGLONG r309_w0 = r309::time_game.load(std::memory_order_relaxed) ? sfdiag::qpc() : 0;
     std::lock_guard<std::mutex> lk(s.cs);
+    if (r309_w0 != 0) r309::note_game_wait(r309_w0);
     // R168. THE MEASUREMENT THAT MATTERS FOR THE GATE'S LOCK BUCKET.
     //
     // This is the GAME'S RENDER THREAD holding s.cs, and it is the only other
@@ -19306,6 +20318,29 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // periodic report name the resource the lane was looking at when it went
     // quiet, without this file ever including the probe's header.
     s.mvec_pub_handle.store(mvec_handle, std::memory_order_relaxed);
+    // R324 (MVecBarrierSource=2): the re-judge, AT THE EVENT. The judge's verdict (TAIL / EVALUATE) was
+    // proven on one published buffer. When the game publishes another (a rebuild around a menu on
+    // Cyberpunk 2026-10-16, a pool member on Dragon Sword, a feature recreate on Starfield), the window
+    // re-opens right here, on the frame the handle changes, under s.cs: the DLSS-call copy delivers
+    // (correct, the costlier route) until a new verdict on the new buffer, then the cheap route again.
+    // The consumer's own compare stays as it was; this is the same re-open, issued where the change is
+    // seen. Key absent / 1: mvec2_off is 0, one compare.
+    if (s.mvec2_off != 0 && mvec_handle != 0ull && s.r315_judge_handle != 0ull &&
+        mvec_handle != s.r315_judge_handle && g_r315_phase.load(std::memory_order_relaxed) != R315_WINDOW)
+    {
+        const unsigned long long was = s.r315_judge_handle;
+        g_r315_phase.store(R315_WINDOW, std::memory_order_relaxed);
+        mgpu::calibrator::set_eval_copy(1);   // the reference copy at the DLSS call, from this frame
+        s.r315_judged = 0; s.r315_same = 0; s.r315_window_at = 0;
+        s.r315_prev_bits.clear(); s.r315_prev_diff = 0;
+        s.r315_flat = 0;   // R326
+        s.r315_judge_handle = mvec_handle;    // the verdict sets it again; no second re-open on the same change
+        char rl[300];
+        snprintf(rl, sizeof rl, "[MGPU][R324] JUDGE window re-opened at the producer: the published vector buffer changed "
+                                "0x%llx -> 0x%llx. The DLSS-call copy delivers until the verdict on the new buffer.",
+                 was, mvec_handle);
+        mgpu::diag::info(rl);
+    }
 
     if (!s.requested || s.finished) return;
 
@@ -19367,6 +20402,31 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // released first (R287), then this arm goes on WITHOUT depth once the
         // probe ran, or 10 s after the request. Without the evidence nothing
         // is started, as in 0.2.4 / 0.3.0, and one line asks for the log.
+        // R312 (DepthTransport >= 2): until the tap's resource is the pushed geometry, the arm
+        // treats depth as absent - the existing hold and its fallback decide what happens if it
+        // never arrives (one [R312] line says so). Key absent: g_r312_set is false, nothing here.
+        if (depth_handle != 0 && g_r312_set.load(std::memory_order_acquire))
+        {
+            ID3D12Resource *r312_res = reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)depth_handle);
+            const D3D12_RESOURCE_DESC r312_d = r312_res->GetDesc();
+            const unsigned ww = g_r312_w.load(std::memory_order_relaxed), hh = g_r312_h.load(std::memory_order_relaxed);
+            const unsigned ff = g_r312_fmt.load(std::memory_order_relaxed);
+            const bool ok = (ww == 0u || (unsigned)r312_d.Width == ww) && (hh == 0u || r312_d.Height == hh) &&
+                            (ff == 0u || (unsigned)r312_d.Format == ff);
+            if (!ok)
+            {
+                if (!s.r312_hold_said)
+                {
+                    s.r312_hold_said = true;
+                    char hl[300];
+                    snprintf(hl, sizeof hl, "[MGPU][R312] DEPTH LANE: holding the arm - the tap is still %ux%u fmt=%u, the pushed "
+                                            "geometry is %ux%u fmt=%u (the effect reloads once; DepthHoldMax decides if it never does).",
+                             (unsigned)r312_d.Width, r312_d.Height, (unsigned)r312_d.Format, ww, hh, ff);
+                    mgpu::diag::info(hl);
+                }
+                depth_handle = 0;
+            }
+        }
         if (depth_handle != 0) s.depth_hold_saw_depth = true;
         if (s.depth_mode != 0 && depth_handle == 0 && s.depth_hold_max_ms != 0ull && !s.depth_hold_saw_depth)
         {
@@ -19464,9 +20524,66 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (!s.learn_decided)
         {
             s.learn_decided = true;
-            const bool no_contract = !game_contract_seen();   // R280k: Init seen OR the game's NGX table (DW-R1)
-            const bool auto_learn = !ini_has_key("MVecTap") && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3 && no_contract;
-            g_mvec_tap_live.store(auto_learn ? 1 : 0, std::memory_order_relaxed);
+            // R309/R310: their keys, read here once from the file (never through ui_ini_read's
+            // 12-slot mirror). Nothing of them is read again under the bridge's probes.
+            {
+                const r309::keys k = r309::read_keys();
+                s.r309_mode = k.step_aside; s.r309_on = (k.step_aside == 2);
+                s.r309_l99 = (k.learned == 99);   // R311e: 99 binds the zero field at the arm whatever MVecStepAside says (MVec unset strobes more - FC6 2.3)
+                s.r310_cost = k.cost; s.r310_offlock = k.offlock; s.r310_test_ms = k.offlock ? k.test_ms : 0u;
+                s.r311c_thread = k.thread;   // R311c
+                s.r311_src = k.source; g_r311_src.store(k.source, std::memory_order_relaxed);   // R311
+                r309::time_game.store(s.r310_cost, std::memory_order_relaxed);
+                if (s.r311_src != 0)
+                {
+                    static const char *const r311_what[4] = { "", "R280's extract (a four-channel target of the game, x,y into our own two-channel target)",
+                                                              "the velocity tap (the two-channel target the census picked, copied at finish_effects)",
+                                                              "the zero field (MVec=1, MVecDX/MVecDY - zero unless you set them)" };
+                    char sl[520];
+                    snprintf(sl, sizeof sl, "[MGPU][R311] MVecSource=%d: the vectors bound on this title are %s%s. The game's own vector routes "
+                                            "(NGX evaluate, barrier) do not land while this key is set; nothing is learned or written to mgpu.ini; "
+                                            "the judge (MVecStepAside=auto) runs on what is bound. Remove the key for the path as before.",
+                             s.r311_src, r311_what[s.r311_src],
+                             game_contract_seen() ? " - ON A TITLE WITH AN NGX CONTRACT, whose own vectors are therefore NOT used" : "");
+                    mgpu::diag::warn(sl);
+                }
+                if (s.r309_mode == 2)
+                    mgpu::diag::info("[MGPU][R309] MVecStepAside=auto: the vectors are judged as BOUND against no motion, in windows opened by "
+                                     "gameplay (180 s, then 20 minutes off); 5 of 6 probes worse and none better binds the zero field, live. "
+                                     "Contract titles are not touched.");
+                if (s.r310_cost)
+                    mgpu::diag::info("[MGPU][R310] ProbeCost=1: [R310] COST lines give each probe's bridge time with s.cs held and released, "
+                                     "and the game render thread's wait to take s.cs (two QPC reads around the lock it already takes).");
+                if (s.r310_offlock)
+                {
+                    char ol[300];
+                    if (s.r311c_thread)
+                        snprintf(ol, sizeof ol, "[MGPU][R311c] ProbeOffLock=2: R258's and R309's probes run their pixel loops on a PROBE THREAD of the add-on's own; "
+                                                "the bridge thread hands the mapped readbacks over and takes the result on a later poll (the decision code is unchanged). "
+                                                "No new probe is recorded while one is scoring.");
+                    else
+                        snprintf(ol, sizeof ol, "[MGPU][R310] ProbeOffLock=1: R258's and R309's probes run their pixel loops with s.cs RELEASED. "
+                                                "ProbeOffLockTestMs=%u (a deliberate sleep inside that window, 0 = none; for the teardown test only).",
+                                 s.r310_test_ms);
+                    mgpu::diag::info(ol);
+                }
+            }
+            const bool no_contract = !vectors_contract();   // R280k: Init seen OR the game's NGX table (DW-R1). R311: false when MVecSource is set
+            // R309 FORCED (MVecStepAside=1) - R311: now MVecSource=3, of which MVecStepAside=1 is the alias, and
+            // on ANY title (the zero field was already reachable on a contract title through MVec=1; this is
+            // the same thing under the one key). Set here, before auto_learn below, so the tap's learning
+            // never turns on; R280 is not armed either (mvec_extract reads the same key).
+            if (s.r311_src == 3 && s.mvec_mode == 3)
+            {
+                s.mvec_mode = 1;
+                mgpu::diag::warn("[MGPU][R309] MVecSource=3 / MVecStepAside=1 (forced): the synthetic field (MVec=1, MVecDX/MVecDY - zero "
+                                 "unless you set them) is bound from the arm. No tap learning, no R280, no probes.");
+            }
+            const bool auto_learn = !ini_has_key("MVecTap") && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3 && no_contract && s.r311_src == 0;
+            // R311: MVecSource=1 / 2 turn the tap on the way the learning does (R278b), without the learning:
+            // R280's target (1) or the census pick (2) is copied by the tap, nothing is written back.
+            const bool r311_tap = (s.r311_src == 1 || s.r311_src == 2) && s.mvec_mode == 3;
+            g_mvec_tap_live.store((auto_learn || r311_tap) ? 1 : 0, std::memory_order_relaxed);
             static bool s_first_said = false;   // R278e: once per process, not per arm
             if (auto_learn && !s_first_said && (s_first_said = true))
                 mgpu::diag::warn("[MGPU][R278] FIRST LAUNCH on a title without an NGX contract: the velocity tap is ON for this "
@@ -19476,6 +20593,15 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         }
         const bool learnable = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
         const bool can_tap = (tap_k == 1 || tap_k == 2) || learnable;   // R277: 2 is the D3D12 tap with the common assumption
+        // R309: MVecLearned=99 on a no-contract title binds the ZERO field from the arm. Without the
+        // key, a probe that still publishes a candidate keeps MVec=3 armed with no copy route and
+        // every evaluate runs with MVec unset (Far Cry 6: more strobe than zeros).
+        if (s.mvec_mode == 3 && s.r309_l99 && !can_tap && !vectors_contract())
+        {
+            mgpu::diag::warn("[MGPU][R309] MVecLearned=99 on a title with no NGX contract: no buffer of this title passed. The synthetic "
+                             "field (MVec=1, MVecDX/MVecDY - zero unless you set them) is bound from the arm, never MVec unset.");
+            s.mvec_mode = 1;
+        }
         if (s.mvec_mode == 3 && mvec_handle == 0 && g_no_real_vectors.load(std::memory_order_acquire) &&
             (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap)))
         {
@@ -19545,6 +20671,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         s.hold_lane = 0;
 
         s.tried = true;
+        mgpu::strace::note_arm_enter();   // R313: one relaxed load when off; first entry only
 
         ID3D12Device *gdev = nullptr;
         if (FAILED(src->GetDevice(IID_PPV_ARGS(&gdev))) || gdev == nullptr) return;
@@ -19670,6 +20797,34 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                                         &mrows2, &mrowb2, &s.mvec_bytes2);
             s.mvec_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
             slot_end = s.mvec_off + s.mvec_bytes2;
+            // R315b (MVecBarrierSource=2): a second region of the same size for the tail copy
+            // during the judge window. System memory on the cross-adapter heap, like the rest
+            // of the slot; nothing on the game's card. Key absent / 1: mvec2_off stays 0.
+            // R323 (HistoryGate=1): read at arm, like every key. Off: 0, and the stamp is never read.
+            g_hist_gate.store(ini_read_float("HistoryGate", 0.0f) != 0.0f ? 1 : 0, std::memory_order_relaxed);
+            s.gate_break = false; s.gate_stretches = 0; s.gate_since = 0;
+            for (unsigned q = 0; q < stream_state::RING; ++q) s.slot_dlss[q].store((signed char)-1, std::memory_order_relaxed);
+            if (g_hist_gate.load(std::memory_order_relaxed) != 0)
+                mgpu::diag::info("[MGPU][R323] HISTORY GATE ON (HistoryGate=1): a frame the game's own DLSS did not evaluate "
+                                 "(menu, video, loading screen) is evaluated with DLSSNR.Reset=1 on every pass, and the first "
+                                 "frame with DLSS again resets once more. No history is built without vectors, at any frame "
+                                 "rate. A title with no NGX table cannot tell and is left exactly as before.");
+            if (g_r315_on.load(std::memory_order_relaxed) == 2)
+            {
+                s.mvec2_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
+                slot_end = s.mvec2_off + s.mvec_bytes2;
+                g_r315_phase.store(R315_WINDOW, std::memory_order_relaxed);
+                s.r315_window_at = 0; s.r315_judged = 0; s.r315_same = 0; s.r315_judge_handle = 0;
+                s.r315_prev_bits.clear(); s.r315_prev_diff = 0;   // R315b fix 4
+                s.r315_flat = 0;   // R326
+                for (unsigned q = 0; q < stream_state::RING; ++q) s.r315_both[q].store(0u, std::memory_order_relaxed);
+                mgpu::calibrator::set_eval_copy(1);   // R315b fix 3: the reference copy, at the DLSS call, from the first frame
+                mgpu::diag::info("[MGPU][R315] MVecBarrierSource=2: judge window open - the copy at the DLSS call delivers (the bytes "
+                                 "DLSS consumed), the tail copy lands beside it, the bridge compares the two. Identical on this "
+                                 "title -> the tail carries (the DLSS-call copy and its barriers stop); different -> the DLSS-call "
+                                 "copy carries, as today. On a title with no DLSS table nothing is judged and the key is inert "
+                                 "(R315c: no periodic line until something moves).");
+            }
         }
 
         // One slot = seal (padded to the placement alignment) + payload, plus
@@ -19941,6 +21096,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         else if (ndev == nullptr) h = E_FAIL;
 
         s.ll_due_arm = true;   // R267b: written off the lock on the bridge thread, next stream_poll
+        mgpu::strace::note_arm_exit((unsigned)h);   // R313
         snprintf(line, sizeof line,
                  "[MGPU][P4.0] stream arm hr=0x%08X source=%ux%u fmt=%d rowPitch=%u "
                  "payload=%llu slot=%llu ring=%u heap=%llu bytes. The heap is created on the "
@@ -20024,8 +21180,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             // The warp test then keeps it (writes MVecTap=1 + MVecLearned) or turns
             // it off (depth only). A contract title never enters; a set key is honoured.
             const bool auto_learn = g_mvec_tap_live.load(std::memory_order_relaxed) != 0;
-            s.learn_on = ((tk == 1 || tk == 2) && lr < 0) || auto_learn;
-            s.learn_write = s.learn_on || tk != 0;   // R278f-r: the key read above already answers presence-with-value
+            // R311: MVecSource set = a forced source, not a learning launch: no learning, no write-back
+            // (no MVecLearned / MVecTap / MVecCandidate / units). Key absent: exactly the two lines before R311.
+            const bool r311_forced = g_r311_src.load(std::memory_order_relaxed) != 0;
+            s.learn_on = (((tk == 1 || tk == 2) && lr < 0) || auto_learn) && !r311_forced;
+            s.learn_write = (s.learn_on || tk != 0) && !r311_forced;   // R278f-r: the key read above already answers presence-with-value
             if ((tk == 1 || tk == 2) && lr >= 0) s.cp_written = true;   // learned: R258 stays closed
             // R278c: THE LEARNED UNIT, NOT THE LEARNED NUMBER. The warp test
             // writes MVecUnits (uv / uvhalf / px) and MVecSignX/Y; the scale is
@@ -20038,10 +21197,18 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             // is x,y as the engine wrote them, RE4-TP3), so the scale is derived with no key;
             // MVecSignX/Y in the ini still count as the user's override. X1 armed at 1.0 here.
             const bool x_on = g_mvec_x_active.load(std::memory_order_relaxed);
-            if (s.mvec_scale_x == 1.0f && s.mvec_scale_y == 1.0f && s.mvec_w != 0u && s.mvec_h != 0u && (tk != 0 || x_on))   // R278f-r: tk read above
+            // R311a: the FIRST launch of a no-contract tap title (auto_learn, no MVecTap key, no MVecLearned) armed at
+            // scale 1,1 and stayed there for the whole session - the R258 verdict was written for the NEXT launch only
+            // (Skyrim SK-L1 2026-10-08 and S1 2026-10-15: every transport line scale=(1,1), the picture strobes). Now
+            // the first launch assumes UV from the arm, the unit every tap title so far has learned and the one R280's
+            // target has by construction, and the verdict corrects it LIVE below (R311a part 2). Learned titles (tk set),
+            // the R280 path (x_on) and contract titles do not enter here: their lines are unchanged.
+            const bool r311a_first = s.learn_on && tk == 0 && !x_on;
+            if (s.mvec_scale_x == 1.0f && s.mvec_scale_y == 1.0f && s.mvec_w != 0u && s.mvec_h != 0u && (tk != 0 || x_on || r311a_first))   // R278f-r: tk read above
             {
                 char un[16]; ini_read_word("MVecUnits", un, sizeof un);
-                if (un[0] == 0 && x_on) { un[0] = 'u'; un[1] = 'v'; un[2] = 0; }
+                const bool un_from_ini = (un[0] != 0);   // R311f
+                if (un[0] == 0 && (x_on || r311a_first)) { un[0] = 'u'; un[1] = 'v'; un[2] = 0; }
                 const int gx = ui_ini_read("MVecSignX", 1) < 0 ? -1 : 1, gy = ui_ini_read("MVecSignY", 1) < 0 ? -1 : 1;
                 float sx = 0.0f, sy = 0.0f;
                 if (_stricmp(un, "uv") == 0)          { sx = (float)s.width;        sy = (float)s.height; }
@@ -20051,7 +21218,35 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 {
                     s.mvec_scale_x = (float)gx * sx; s.mvec_scale_y = (float)gy * sy; s.mvec_dirty = true;
                     char ul[260];
-                    if (x_on && tk == 0)
+                    // R311f: on the R280 path, units / signs that came FROM THE INI are a carried verdict: seed the judge with
+                    // them so the vectors are bound at that scale from the first evaluate (no zero-field wait, R311e), and
+                    // the judge re-evaluates them in its windows this launch (a different verdict applies live and rewrites).
+                    bool r311f_carried = false;
+                    if (x_on && tk == 0 && un_from_ini)
+                    {
+                        const bool half = (_stricmp(un, "uvhalf") == 0);
+                        // the judge's kx/ky are in the probe footprint's pixels (W/H at the verdict site), set at ~20385
+                        const unsigned pw = s.fp.Footprint.Width ? s.fp.Footprint.Width : s.width;
+                        const unsigned ph = s.fp.Footprint.Height ? s.fp.Footprint.Height : s.height;
+                        s.x_kx = gx * (int)(half ? pw / 2u : pw);
+                        s.x_ky = gy * (int)(half ? ph / 2u : ph);
+                        s.x_verdicts = 1u;
+                        r311f_carried = true;
+                    }
+                    if (r311f_carried)
+                        snprintf(ul, sizeof ul, "[MGPU][R311f] R280 verdict carried from mgpu.ini (MVecUnits=%s, signs %+d/%+d): MVecScaleX=%.2f MVecScaleY=%.2f bound from the arm; "
+                                                "R280's judge re-evaluates it this launch and rewrites the keys if it differs.",
+                                 un, gx, gy, s.mvec_scale_x, s.mvec_scale_y);
+                    else if (r311a_first && !x_on && un_from_ini)   // R311j: the line says where the units came from
+                        snprintf(ul, sizeof ul, "[MGPU][R311a] FIRST LAUNCH: units %s and signs %+d/%+d taken from mgpu.ini (not assumed) - MVecScaleX=%.2f "
+                                                "MVecScaleY=%.2f from source %ux%u and vectors %ux%u. The warp test (R258) corrects them live in this session "
+                                                "and writes them for the next.",
+                                 un, gx, gy, s.mvec_scale_x, s.mvec_scale_y, s.width, s.height, s.mvec_w, s.mvec_h);
+                    else if (r311a_first && !x_on)
+                        snprintf(ul, sizeof ul, "[MGPU][R311a] FIRST LAUNCH: units uv assumed from the arm - MVecScaleX=%.2f MVecScaleY=%.2f from source %ux%u and "
+                                                "vectors %ux%u. The warp test (R258) corrects the unit and the signs live in this session and writes them for the next.",
+                                 s.mvec_scale_x, s.mvec_scale_y, s.width, s.height, s.mvec_w, s.mvec_h);
+                    else if (x_on && tk == 0)
                         snprintf(ul, sizeof ul, "[MGPU][R280] vectors from the virtual target: units uv by construction, MVecScaleX=%.2f MVecScaleY=%.2f "
                                                 "derived from source %ux%u and vectors %ux%u. The warp test settles the signs live; nothing is written to mgpu.ini on this path.",
                                  s.mvec_scale_x, s.mvec_scale_y, s.width, s.height, s.mvec_w, s.mvec_h);
@@ -20400,6 +21595,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u) seal.mvec_valid = 1u;
         else ++s.mvec_missing;
     }
+    // R323 (HistoryGate=1 only): stamp the slot with dllmain's fact for this game frame.
+    if (g_hist_gate.load(std::memory_order_relaxed) != 0)
+        s.slot_dlss[slot].store((signed char)g_game_dlss.load(std::memory_order_relaxed), std::memory_order_release);
     // D2.0 NR step one: record what this seal says about vectors. Read only. Off: one load.
     if (mgpu::fgmap::on()) mgpu::fgmap::on_seal(fi, slot, seal.mvec_valid, rtv_handle);
 
@@ -20559,6 +21757,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // Frame fi used slot (fi-1) % RING, so frame fi+1 uses fi % RING. Cleared
     // here, under this mutex, BEFORE the next frame's scene can be drawn.
     s.mvec_slot_valid[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);
+    if (s.mvec2_off != 0) s.r315_both[(unsigned)(fi % stream_state::RING)].store(0u, std::memory_order_release);   // R315b
 }
 
 // ---- R78: THE MID-FRAME MOTION VECTOR COPY ----
@@ -20623,6 +21822,22 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     if (!s.mvec_live.load(std::memory_order_relaxed)) return;
     if (s.mvec_mode != 3) return;
     if (s.gxfer == nullptr || s.mvec_bytes2 == 0) return;
+    // R311: with MVecSource=1 or 2, only the TAP's copies land (R280's target under 1, the census pick
+    // under 2 - both copied by the tap at finish_effects, inside tap_copy_scope). The game's own routes
+    // - the calibrator's evaluate copy and the probe's barrier copy - are counted and dropped here, so a
+    // contract title whose buffer happens to match the slot's layout cannot mix its vectors in. Key
+    // absent: one relaxed load of 0, the branch is never taken.
+    if (g_r311_src.load(std::memory_order_relaxed) != 0 && !t_tap_copy_scope)
+    {
+        ++s.r311_dropped;
+        if (!s.r311_drop_said)
+        {
+            s.r311_drop_said = true;
+            mgpu::diag::info("[MGPU][R311] a copy from one of the game's own vector routes (NGX evaluate or barrier) was dropped: "
+                             "MVecSource is set, only the tap's copies land. Said once; the count is on the [R78] MVEC TRANSPORT line.");
+        }
+        return;
+    }
 
     ID3D12GraphicsCommandList *gl =
         reinterpret_cast<ID3D12GraphicsCommandList *>(cmd_list_v);
@@ -20656,6 +21871,16 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     const UINT64 slot_off = (UINT64)slot * s.slot_bytes;
     // R300 (T1.19), each only with its key.
     const unsigned long long t119_mfi = s.produced_a.load(std::memory_order_acquire) + 1ull;   // the seal this vector travels with
+    // R315b (MVecBarrierSource=2): the tail copy. In the WINDOW it is the compare copy - region 2,
+    // no counters, no valid flag; the slot is marked as holding both. In the TAIL phase it is the
+    // delivery (region 1, counted as the game's own route). In TRANSITION it is not called.
+    // Key absent / 1: t_r315_tail is never set, mvec2_off is 0.
+    const bool r315_tail = t_r315_tail && s.mvec2_off != 0;
+    const bool r315_compare = r315_tail && g_r315_phase.load(std::memory_order_relaxed) == R315_WINDOW;
+    if (r315_compare && s.mvec_slot_valid[slot].load(std::memory_order_acquire) == 0u)
+        return;   // nothing delivered this frame to compare against (no transition / evaluate copy yet)
+    if (r315_tail && !r315_compare && g_r315_phase.load(std::memory_order_relaxed) != R315_TAIL)
+        return;
     if (mgpu::t119::temporal_active())
     {
         mgpu::tdiag::note_mvec_copy(slot, t119_mfi);   // R300a1
@@ -20674,7 +21899,7 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     mt.pResource = s.gxfer;
     mt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     mt.PlacedFootprint = s.mvec_fp2;
-    mt.PlacedFootprint.Offset = slot_off + s.mvec_off;
+    mt.PlacedFootprint.Offset = slot_off + (r315_compare ? s.mvec2_off : s.mvec_off);
     if (t119_pd) mgpu::p0t::mark(gl, t119_mfi, 4);   // R300h: MVec begin
     D3D12_RESOURCE_BARRIER t119_b{};                  // R300d: only with SLTagsCapture, see t_t119_tag_barrier
     if (t_t119_tag_barrier)
@@ -20704,6 +21929,12 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     // Counted ONCE per frame even if the engine binds the target twice, so
     // that copies + missing equals the number of frames sealed and a
     // disagreement between those two numbers is a real finding.
+    if (r315_compare)
+    {   // R315b: the compare copy - the seal and the counters never see it
+        s.r315_both[slot].store(1u, std::memory_order_release);
+        return;
+    }
+    if (r315_tail) ++s.r315_tail_delivered;   // R315b: the tail delivering (TAIL phase)
     if (s.mvec_slot_valid[slot].load(std::memory_order_relaxed) == 0u)
     {
         ++s.mvec_copies;
@@ -21459,6 +22690,20 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 // Periodic, because Frames=0 runs print no summary and a
                 // transport nobody can see the state of is a transport nobody
                 // can trust.
+                if (f >= s.r312_report_at)   // R312: the lane's own line, every 600 frames (prints at any key value)
+                {
+                    s.r312_report_at = f + 600ull;
+                    char r312l[420];
+                    snprintf(r312l, sizeof r312l,
+                             "[MGPU][R312] DEPTH LANE f=%llu DepthTransport=%d: %ux%u fmt=%u pitch=%u bytes/frame=%llu (colour %ux%u, "
+                             "%.1f%% of its bytes) | seals valid=%llu invalid=%llu size-rejected=%llu | GPU0 depth copy ms: the R300g1 "
+                             "DEPTH split (Gpu0Timers=1).",
+                             f, ini_read_depth_transport(), s.depth_w, s.depth_h, s.depth_format,
+                             (unsigned)s.depth_fp.Footprint.RowPitch, (unsigned long long)s.depth_bytes, s.width, s.height,
+                             s.payload_bytes ? 100.0 * (double)s.depth_bytes / (double)s.payload_bytes : 0.0,
+                             s.depth_seen_valid, s.depth_seen_invalid, (unsigned long long)s.depth_size_rejects);
+                    mgpu::diag::info(r312l);
+                }
                 if (f >= s.depth_report_at)
                 {
                     s.depth_report_at = f + 300ull;
@@ -21539,6 +22784,30 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (f >= s.mvec_report_at)
                 {
                     s.mvec_report_at = f + 300ull;
+                    if (s.r310_cost) r309::cost_line(s, "last 300 frames");   // R317 instrument: the game thread's wait on s.cs, every report (ProbeCost=1 only)
+                    // R315c: the line only while there is something to report. On a title with no NGX table
+                    // (RE4, FC6, Skyrim) nothing fires, nothing is copied on our route and the judge never
+                    // starts, and the line repeated "fired 0 ... WINDOW" every 300 frames all session. A late
+                    // table (KCD2) brings it back as soon as any of these moves.
+                    const bool r315_live = g_r315_fires.load(std::memory_order_relaxed) != 0ull ||
+                                           s.mvec_copies_own.load(std::memory_order_relaxed) != 0ull ||
+                                           s.r315_tail_delivered != 0ull || s.r315_judged != 0u ||
+                                           (s.mvec2_off != 0 && g_r315_phase.load(std::memory_order_relaxed) != R315_WINDOW);
+                    if (g_r315_on.load(std::memory_order_relaxed) != 0 && r315_live)   // R315 (MVecBarrierSource=1 only)
+                    {
+                        char r315l[520];
+                        snprintf(r315l, sizeof r315l,
+                                 "[MGPU][R315] f=%llu barrier route on the PUBLISHED source: fired %llu time(s) | copies own=%llu tap=%llu | "
+                                 "evaluate route %s | value 2: phase=%s tail delivered=%llu judged=%u same=%u. Fired > 0 with eval-copies "
+                                 "flat = the game's own transition carries the vectors; fired = 0 = this engine's transition is not seen.",
+                                 f, g_r315_fires.load(std::memory_order_relaxed),
+                                 s.mvec_copies_own.load(std::memory_order_relaxed), s.mvec_copies_tap.load(std::memory_order_relaxed),
+                                 s.mvec_auto_armed ? "ARMED (R118)" : "not armed",
+                                 s.mvec2_off == 0 ? "n/a" : (g_r315_phase.load(std::memory_order_relaxed) == R315_TAIL ? "TAIL" :
+                                                             g_r315_phase.load(std::memory_order_relaxed) == R315_EVALUATE ? "EVALUATE" : "WINDOW"),
+                                 s.r315_tail_delivered, s.r315_judged, s.r315_same);
+                        mgpu::diag::info(r315l);
+                    }
 
                     // ---- R118: THE AUTO-FALLBACK ----
                     //
@@ -21604,9 +22873,11 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     // Its own buffer: `line` is 1400 and the depth report
                     // above already fills most of it.
                     char ml[1600];
+                    char r311s[96]; r311s[0] = 0;   // R311: present only with MVecSource set - the line is byte-identical otherwise
+                    if (s.r311_src != 0) snprintf(r311s, sizeof r311s, "own-route copies dropped (MVecSource=%d)=%llu ", s.r311_src, s.r311_dropped);
                     snprintf(ml, sizeof ml,
                         "[MGPU][R78] MVEC TRANSPORT f=%llu mode=3 REAL | producer: copies=%llu "
-                        "missing=%llu size-rejected=%llu lock-skipped=%llu, arm held %llu "
+                        "missing=%llu size-rejected=%llu lock-skipped=%llu, %sarm held %llu "
                         "frame(s) | consumer: "
                         "seals seen valid=%llu invalid=%llu contract mismatches=%llu flag "
                         "disagreements=%llu | region %ux%u fmt=%u pitch=%u bytes=%llu at slot "
@@ -21622,6 +22893,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         s.mvec_missing.load(std::memory_order_relaxed),
                         s.mvec_size_rejects.load(std::memory_order_relaxed),
                         s.mvec_lock_skips.load(std::memory_order_relaxed),
+                        r311s,
                         s.mvec_arm_waits,
                         s.mvec_seen_valid, s.mvec_seen_invalid, s.mvec_contract,
                         s.mvec_flag_disagree,
@@ -22304,6 +23576,7 @@ void stream_poll()
             ndev = st().device;
         }
         s.nr_ok = (ndev != nullptr) && stream_nr_create(s, ndev);
+        if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "stream-nr-create", s.nr_ok ? "ok" : "FAILED");   // R313
 
         // V31. No retry, no stale-session special case. If CreateFeature
         // fails it fails the way it always has, and if it kills the process
@@ -22536,7 +23809,24 @@ void stream_poll()
                 lk.unlock();
                 const DWORD bwr = WaitForSingleObject(s.nev, 5000);
                 lk.lock();
-                if (bwr != WAIT_OBJECT_0) bh = E_FAIL;
+                if (bwr != WAIT_OBJECT_0)
+                {
+                    bh = E_FAIL;
+                    // R311b: this wait was silent on timeout (frames marked consumed, no line). F0 2026-10-15: a 15275 ms
+                    // poll scope = 3 x 5000 + 275 fits three of these in a row; whether it was that cannot be read from
+                    // the log because nothing said so. Now it does. Said at most once per 10 s.
+                    const unsigned long long r311b_now = GetTickCount64();
+                    if (r311b_now - s.r311b_last_ms >= 10000ull)
+                    {
+                        s.r311b_last_ms = r311b_now;
+                        char tl[300];
+                        snprintf(tl, sizeof tl, "[MGPU][R311b] GPU 1 FENCE TIMEOUT (copy-queue batch): waited 5000 ms for fence %llu, completed %llu, "
+                                                "f=%llu - the batch is counted consumed and the poll goes on. If this repeats, GPU 1 (or the copy "
+                                                "queue's wait on the game's fence) is not finishing work; the bridge picture freezes meanwhile.",
+                                 (unsigned long long)s.nf_value, (unsigned long long)s.nf->GetCompletedValue(), (unsigned long long)s.consumed);
+                        mgpu::diag::warn(tl);
+                    }
+                }
             }
         }
         if (SUCCEEDED(bh))
@@ -22817,9 +24107,21 @@ void stream_poll()
                 // R258: the calibration. Stage machine over three consecutive
                 // frames: record colour (f), record colour + vectors (f+1),
                 // read all three (f+2). Up to 12 probes, every 150 frames.
-                if (s.cp_stage == 2u && s.cp_rb[0] && s.cp_rb[1] && s.vp_rb && !s.vp_pending)
+                // R311c (ProbeOffLock=2): a probe whose loops ran on the probe thread comes back here on a later
+                // poll (replay) - same block, same decision code, the arithmetic taken from the job instead of computed.
+                const bool r311c_replay = s.r311c_thread && r309::r311c::done();
+                const unsigned long long f_seal = f;
+                if ((s.cp_stage == 2u && s.cp_rb[0] && s.cp_rb[1] && s.vp_rb && !s.vp_pending) || r311c_replay)
                 {
-                    s.cp_stage = 0; ++s.cp_n; ++s.cp_win_n;   // R278f: per-candidate window
+                    const unsigned long long f = r311c_replay ? r309::r311c::g_job.f : f_seal;   // R311c: the probe's own seal for its lines and the judge
+                    if (!r311c_replay) { s.cp_stage = 0; ++s.cp_n; ++s.cp_win_n; }   // R278f: per-candidate window (counted at launch, not at replay)
+                    const LONGLONG r309_q0 = s.r310_cost ? sfdiag::qpc() : 0;   // R310 (ProbeCost=1): this probe's bridge time
+                    unsigned votes_x = 0u; bool win_end = false;   // R311c: assigned below (no initialised declaration may sit between the launch goto and its label)
+                    bool r309_own;
+                    if (r311c_replay) r309_own = r309::r311c::g_job.own;
+                    else { r309_own = s.r309_probe_own; s.r309_probe_own = false; }
+                    ID3D12Resource *r310_ref[3] = { nullptr, nullptr, nullptr };   // R310 (ProbeOffLock=1): held across the unlock
+                    unsigned long long r310_off = 0;                               // R310: microseconds with s.cs released
                     // R280o (Fable's ladder; SF-R1 vs SF-R2): the first-launch learning is the
                     // LAST rung. Once the evaluate route has delivered - the calibrator copying the
                     // vectors the game hands DLSS, at the DLSS pass (R118) - a lower rung carries
@@ -22845,115 +24147,158 @@ void stream_poll()
                     }
                     unsigned char *c0 = nullptr, *c1 = nullptr, *mv = nullptr;
                     D3D12_RANGE rc{ 0, (SIZE_T)s.payload_bytes }, rm{ 0, (SIZE_T)s.mvec_bytes2 }, none{ 0, 0 };
-                    const bool ok0 = SUCCEEDED(s.cp_rb[0]->Map(0, &rc, (void **)&c0)) && c0;
-                    const bool ok1 = SUCCEEDED(s.cp_rb[1]->Map(0, &rc, (void **)&c1)) && c1;
-                    const bool okm = SUCCEEDED(s.vp_rb->Map(0, &rm, (void **)&mv)) && mv;
-                    if (ok0 && ok1 && okm)
+                    bool ok0, ok1, okm;
+                    if (r311c_replay)   // R311c: the job holds the maps
                     {
-                        const unsigned W = s.fp.Footprint.Width, H = s.fp.Footprint.Height, P = s.fp.Footprint.RowPitch;
-                        const unsigned fmt = (unsigned)s.fp.Footprint.Format, bpp = bpp_of(fmt);
+                        c0 = (unsigned char *)r309::r311c::g_job.i.c0; c1 = (unsigned char *)r309::r311c::g_job.i.c1; mv = (unsigned char *)r309::r311c::g_job.i.mv;
+                        ok0 = r309::r311c::g_job.ok0; ok1 = r309::r311c::g_job.ok1; okm = r309::r311c::g_job.okm;
+                    }
+                    else
+                    {
+                        ok0 = SUCCEEDED(s.cp_rb[0]->Map(0, &rc, (void **)&c0)) && c0;
+                        ok1 = SUCCEEDED(s.cp_rb[1]->Map(0, &rc, (void **)&c1)) && c1;
+                        okm = SUCCEEDED(s.vp_rb->Map(0, &rm, (void **)&mv)) && mv;
+                    }
+                    if (ok0 && ok1 && okm && r309_own)
+                    {
+                        // R309: a probe R309 started on its own - the bound reading and no motion only,
+                        // the same sampling as R258's warp test. No votes, no R280 judge, no R278, no line
+                        // per probe: nothing R258 decides moves because of R309's probes.
+                        // R311c: at replay the geometry is the job's (a re-arm between launch and replay must not re-read s.fp)
+                        const r309::r311c::in &rj = r309::r311c::g_job.i;
+                        const unsigned W = r311c_replay ? rj.W : s.fp.Footprint.Width, H = r311c_replay ? rj.H : s.fp.Footprint.Height, P = r311c_replay ? rj.P : s.fp.Footprint.RowPitch;
+                        const unsigned fmt = r311c_replay ? rj.fmt : (unsigned)s.fp.Footprint.Format, bpp = bpp_of(fmt);
+                        const unsigned MP = r311c_replay ? rj.MP : s.mvec_fp2.Footprint.RowPitch, mfmt = r311c_replay ? rj.mfmt : s.mvec_format;
+                        const unsigned mv_tb = mv_texel_bytes(mfmt);
+                        const size_t mv_bpp = mv_tb ? mv_tb : 8u;
+                        const double sxm = (double)W / (double)s.mvec_w, sym = (double)H / (double)s.mvec_h;
+                        const double bsx = (double)s.mvec_scale_x * (double)W / (double)s.width, bsy = (double)s.mvec_scale_y * (double)H / (double)s.height;
+                        (void)bsx; (void)bsy; (void)sxm; (void)sym; (void)mv_tb;
+                        double e0s = 0.0, ebs = 0.0; unsigned long long n0 = 0, nb = 0;
+                        // R311c: the loop is r311c::compute_own (moved verbatim). Thread: launch now, decide at replay.
+                        r309::r311c::in pin{ c0, c1, mv, W, H, P, fmt, bpp, MP, mfmt, mv_tb, mv_bpp, s.mvec_w, s.mvec_h, s.width, s.height,
+                                             s.mvec_scale_x, s.mvec_scale_y, true, false };   // launch / inline only; at replay the job's values are used above
+                        if (r311c_replay)
+                        {
+                            e0s = r309::r311c::g_job.o.e0s; ebs = r309::r311c::g_job.o.ebs; n0 = r309::r311c::g_job.o.n0; nb = r309::r311c::g_job.o.nb;
+                            r310_off = r309::r311c::g_job.us;
+                        }
+                        else if (s.r311c_thread && r309::r311c::launch(s, pin, ok0, ok1, okm, f, true))
+                        {
+                            goto r311c_launched;   // the maps stay open for the thread; the result comes back on a later poll
+                        }
+                        else
+                        {
+                            r309::r311c::out pout;
+                            const LONGLONG r310_t0 = s.r310_offlock ? r309::off_begin(s, lk, r310_ref) : 0;   // R310
+                            r309::r311c::compute_own(pin, pout, nullptr);
+                            if (r310_t0 != 0 && !r309::off_end(s, lk, r310_t0, r310_off)) { r309::off_drop(s, r310_ref, ok0, ok1, okm); return; }   // R310
+                            e0s = pout.e0s; ebs = pout.ebs; n0 = pout.n0; nb = pout.nb;
+                        }
+                        r309::judge(s, n0 ? e0s / (double)n0 : 0.0, nb ? ebs / (double)nb : 0.0, n0, nb, f, true);
+                    }
+                    if (ok0 && ok1 && okm && !r309_own)
+                    {
+                        // R311c: at replay the geometry is the job's (a re-arm between launch and replay must not re-read s.fp)
+                        const r309::r311c::in &rj = r309::r311c::g_job.i;
+                        const unsigned W = r311c_replay ? rj.W : s.fp.Footprint.Width, H = r311c_replay ? rj.H : s.fp.Footprint.Height, P = r311c_replay ? rj.P : s.fp.Footprint.RowPitch;
+                        const unsigned fmt = r311c_replay ? rj.fmt : (unsigned)s.fp.Footprint.Format, bpp = bpp_of(fmt);
                         const unsigned x0 = W / 4, x1 = 3 * W / 4, y0 = H / 4, y1 = 3 * H / 4;
-                        std::vector<double> ca(W, 0.0), cb(W, 0.0), ra(H, 0.0), rb(H, 0.0);
-                        for (unsigned y = y0; y < y1; y += 2)
+                        // R311c: the profile, mean-vector / R305 and warp loops are r311c::compute_base (moved verbatim).
+                        // ProbeOffLock=2: launched on the probe thread now, decided here at replay; 0 / 1: computed inline
+                        // as before (1: with s.cs released between off_begin and off_end).
+                        // The panel can change the MVecScale live (ui_set_mvec_value, under s.cs): taken here, under the lock.
+                        const float r310_sx = r311c_replay ? r309::r311c::g_job.i.sx : s.mvec_scale_x;
+                        const float r310_sy = r311c_replay ? r309::r311c::g_job.i.sy : s.mvec_scale_y;
+                        const unsigned MP = r311c_replay ? rj.MP : s.mvec_fp2.Footprint.RowPitch;
+                        const unsigned mfmt = r311c_replay ? rj.mfmt : s.mvec_format;
+                        const unsigned mv_tb = mv_texel_bytes(mfmt);
+                        const size_t mv_bpp = mv_tb ? mv_tb : 8u;
+                        const unsigned mvw = r311c_replay ? rj.mvec_w : s.mvec_w, mvh = r311c_replay ? rj.mvec_h : s.mvec_h;
+                        const double sxm = (double)W / (double)mvw, sym = (double)H / (double)mvh;   // vector grid -> colour grid
+                        const bool r309_b = r311c_replay ? rj.r309_b : s.r309_on;
+                        r309::r311c::in pin{ c0, c1, mv, W, H, P, fmt, bpp, MP, mfmt, mv_tb, mv_bpp, mvw, mvh,
+                                             r311c_replay ? rj.width : s.width, r311c_replay ? rj.height : s.height,
+                                             r310_sx, r310_sy, false, r309_b };
+                        r309::r311c::out pout;
+                        if (r311c_replay)
                         {
-                            const unsigned char *r0 = c0 + (size_t)y * P, *r1 = c1 + (size_t)y * P;
-                            for (unsigned x = x0; x < x1; x += 2)
-                            {
-                                const double l0 = lum_at(r0 + (size_t)x * bpp, fmt), l1 = lum_at(r1 + (size_t)x * bpp, fmt);
-                                ca[x] += l0; cb[x] += l1; ra[y] += l0; rb[y] += l1;
-                            }
+                            pout = r309::r311c::g_job.o;   // one copy of four profile vectors and the counters
+                            r310_off = r309::r311c::g_job.us;
                         }
-                        // mean vector over the same region, in buffer units
-                        double svx = 0, svy = 0; unsigned long long nv = 0;
-                        const unsigned MP = s.mvec_fp2.Footprint.RowPitch;
-                        // R280o: the vector pair is read in the slot's own format, the way DLSS reads
-                        // it. SF-R1/SF-R2: R16G16_TYPELESS (4 bytes) was read as two 32-bit floats at
-                        // an 8-byte stride, and every warp candidate then scored the same error. The
-                        // decision rules below are unchanged - this is the reading, not the judgement.
-                        // 4-byte: FLOAT and TYPELESS as halves (what DLSS reads), UNORM / SNORM
-                        // normalised, SINT as integers. 8-byte: R32G32 FLOAT / TYPELESS as floats.
-                        const unsigned mfmt = s.mvec_format;
-                        const bool mv4 = (mfmt == (unsigned)DXGI_FORMAT_R16G16_FLOAT || mfmt == (unsigned)DXGI_FORMAT_R16G16_TYPELESS ||
-                                          mfmt == (unsigned)DXGI_FORMAT_R16G16_UNORM || mfmt == (unsigned)DXGI_FORMAT_R16G16_SNORM ||
-                                          mfmt == (unsigned)DXGI_FORMAT_R16G16_SINT);
-                        const size_t mv_bpp = mv4 ? 4u : 8u;
-                        auto read_mv = [mfmt, mv4](const unsigned char *px, float &vx, float &vy)
+                        else if (s.r311c_thread && r309::r311c::launch(s, pin, ok0, ok1, okm, f, false))
                         {
-                            if (!mv4) { const float *q = (const float *)px; vx = q[0]; vy = q[1]; return; }
-                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_UNORM)
-                            { const unsigned short *q = (const unsigned short *)px; vx = (float)q[0] / 65535.0f; vy = (float)q[1] / 65535.0f; return; }
-                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_SNORM)
-                            {
-                                const short *q = (const short *)px;
-                                vx = (q[0] <= -32767) ? -1.0f : (float)q[0] / 32767.0f;
-                                vy = (q[1] <= -32767) ? -1.0f : (float)q[1] / 32767.0f;
-                                return;
-                            }
-                            if (mfmt == (unsigned)DXGI_FORMAT_R16G16_SINT)
-                            { const short *q = (const short *)px; vx = (float)q[0]; vy = (float)q[1]; return; }
-                            const unsigned short *q = (const unsigned short *)px; vx = half_to_float(q[0]); vy = half_to_float(q[1]);
-                        };
-                        const unsigned mx0 = s.mvec_w / 4, mx1 = 3 * s.mvec_w / 4, my0 = s.mvec_h / 4, my1 = 3 * s.mvec_h / 4;
-                        for (unsigned y = my0; y < my1; y += 2)
-                        {
-                            const unsigned char *row = mv + (size_t)y * MP;
-                            for (unsigned x = mx0; x < mx1; x += 4)
-                            {
-                                float vx, vy;
-                                read_mv(row + (size_t)x * mv_bpp, vx, vy);   // R280o
-                                svx += vx; svy += vy; ++nv;
-                            }
+                            goto r311c_launched;   // the maps stay open for the thread; the result comes back on a later poll
                         }
-                        const double mvx = nv ? svx / (double)nv : 0.0, mvy = nv ? svy / (double)nv : 0.0;
+                        else
+                        {
+                            const LONGLONG r310_t0 = s.r310_offlock ? r309::off_begin(s, lk, r310_ref) : 0;
+                            r309::r311c::compute_base(pin, pout, nullptr);
+                            if (r310_t0 != 0 && !r309::off_end(s, lk, r310_t0, r310_off)) { r309::off_drop(s, r310_ref, ok0, ok1, okm); return; }   // R310
+                        }
+                        (void)x0; (void)x1; (void)y0; (void)y1;
+                        const std::vector<double> &ca = pout.ca, &cb = pout.cb, &ra = pout.ra, &rb = pout.rb;
+                        const double mvx = pout.nv ? pout.svx / (double)pout.nv : 0.0, mvy = pout.nv ? pout.svy / (double)pout.nv : 0.0;
                         const cal_axis ax = cal_axis_eval(ca.data(), cb.data(), W, mvx, (double)W);
                         const cal_axis ay = cal_axis_eval(ra.data(), rb.data(), H, mvy, (double)H);
-                        // R258d: THE WARP TEST - the vote that needs no eyes. For each
-                        // candidate scale (sign x unit, both axes) every sampled pixel of
-                        // frame 2 follows its vector back by that scale and reads frame 1
-                        // there (NGX: the vector points to the previous frame). The right
-                        // candidate makes frame 1 line up and the error falls well under
-                        // the no-motion baseline; a wrong sign makes it worse than baseline.
-                        // Winner must beat the baseline by 10% and the runner-up by 5%.
-                        double err[13] = {0}; unsigned long long cnt[13] = {0};
+                        unsigned char cfirst[8]; memcpy(cfirst, pout.cfirst, sizeof cfirst);
+                        const bool cconst = pout.cconst, chave = pout.chave;
+                        double err[13]; unsigned long long cnt[13];
+                        for (int c = 0; c < 13; ++c) { err[c] = pout.err[c]; cnt[c] = pout.cnt[c]; }
                         const double KX[4] = { (double)W, -(double)W, (double)W * 0.5, -(double)W * 0.5 };
                         const double KY[4] = { (double)H, -(double)H, (double)H * 0.5, -(double)H * 0.5 };
-                        // candidates: index = 1 + ux*4 + ... keep it explicit: [0]=baseline,
-                        // [1..4] = (sx,sy) in {++,+-,-+,--} at full units, [5..8] the same at half.
-                        const double sxm = (double)W / (double)s.mvec_w, sym = (double)H / (double)s.mvec_h;   // vector grid -> colour grid
-                        // R278b: [9..12] PIXEL units on the vector grid (RE4-4: |x| mean 0.37 max 3.1 on
-                        // 1280x720 reads as pixels, which the eight UV candidates can only reject).
                         const double sxv[12] = { KX[0], KX[0], KX[1], KX[1], KX[2], KX[2], KX[3], KX[3],  sxm,  sxm, -sxm, -sxm };
                         const double syv[12] = { KY[0], KY[1], KY[0], KY[1], KY[2], KY[3], KY[2], KY[3],  sym, -sym,  sym, -sym };
-                        for (unsigned y = y0; y < y1; y += 4)
-                        {
-                            const unsigned char *r1 = c1 + (size_t)y * P;
-                            const unsigned my = (unsigned)((double)y / sym); if (my >= s.mvec_h) continue;
-                            const unsigned char *mrow = mv + (size_t)my * MP;
-                            for (unsigned x = x0; x < x1; x += 4)
-                            {
-                                const unsigned mxx = (unsigned)((double)x / sxm); if (mxx >= s.mvec_w) continue;
-                                float vx, vy;
-                                read_mv(mrow + (size_t)mxx * mv_bpp, vx, vy);   // R280o
-                                const double l2 = lum_at(r1 + (size_t)x * bpp, fmt);
-                                // baseline
-                                { const double l1 = lum_at(c0 + (size_t)y * P + (size_t)x * bpp, fmt); err[0] += (l1 > l2 ? l1 - l2 : l2 - l1); ++cnt[0]; }
-                                for (int c = 0; c < 12; ++c)
-                                {
-                                    const double px = (double)x + sxv[c] * (double)vx, py = (double)y + syv[c] * (double)vy;
-                                    if (px < 0 || py < 0 || px >= (double)W - 1 || py >= (double)H - 1) continue;
-                                    const double l1 = lum_at(c0 + (size_t)(unsigned)py * P + (size_t)(unsigned)px * bpp, fmt);
-                                    err[1 + c] += (l1 > l2 ? l1 - l2 : l2 - l1); ++cnt[1 + c];
-                                }
-                            }
-                        }
+                        const double r309_eb = pout.r309_eb; const unsigned long long r309_nb = pout.r309_nb;
                         double e[13]; for (int c = 0; c < 13; ++c) e[c] = cnt[c] ? err[c] / (double)cnt[c] : 1e300;
                         int bestc = 1; for (int c = 2; c <= 12; ++c) if (e[c] < e[bestc]) bestc = c;
                         double second = 1e300; for (int c = 1; c <= 12; ++c) if (c != bestc && e[c] < second) second = e[c];
                         const bool decisive = (e[bestc] < e[0] * 0.90) && (e[bestc] < second * 0.95) && cnt[bestc] > 1000ull;
+                        if (r309_b) r309::judge(s, e[0], r309_nb ? r309_eb / (double)r309_nb : 0.0, cnt[0], r309_nb, f, false);   // R309
                         // R278: the other half of the judge. Every vector reading
                         // making the picture line up WORSE than no motion at all
                         // (RE4-4: 8 of 8) is a buffer that is not this frame's motion.
                         if (s.learn_on && e[bestc] > e[0] * 1.10 && cnt[0] > 1000ull) ++s.cp_worse;
+                        // R305: the case the line above cannot see. Far Cry 6: every probe of two
+                        // runs read the same bytes (00 00 80 3F) over the whole sampled region, so
+                        // every warp landed on the pixel it started from, scored exactly the
+                        // no-motion error, and the candidate was never "worse" - never rejected,
+                        // never decided, nothing written. A field of ONE non-zero value, the SAME
+                        // value probe after probe, while the picture itself changes (the no-motion
+                        // error spans at least 4x across those probes) is not this game's motion.
+                        // Six such probes in a row count as six "worse" probes, which the R278
+                        // reject below already acts on. A no-motion encoding (zero, or UNORM 0.5)
+                        // never counts: a real velocity buffer looks like that whenever nothing
+                        // moves. Learning only - a contract title and the virtual target are untouched.
+                        if (s.learn_on && chave && cconst && cnt[0] > 1000ull && !mv_is_zero_encoding(mfmt, cfirst))
+                        {
+                            if (s.cp_const_run != 0u && memcmp(cfirst, s.cp_const_raw, mv_tb) == 0)
+                            {
+                                ++s.cp_const_run;
+                                if (e[0] < s.cp_const_e0_min) s.cp_const_e0_min = e[0];
+                                if (e[0] > s.cp_const_e0_max) s.cp_const_e0_max = e[0];
+                            }
+                            else
+                            {
+                                s.cp_const_run = 1u; memcpy(s.cp_const_raw, cfirst, mv_tb);
+                                s.cp_const_e0_min = e[0]; s.cp_const_e0_max = e[0];
+                            }
+                            if (s.cp_const_run >= 6u && !s.cp_const_counted &&
+                                s.cp_const_e0_max >= 4.0 * (s.cp_const_e0_min > 1e-6 ? s.cp_const_e0_min : 1e-6))
+                            {
+                                s.cp_const_counted = true;
+                                if (s.cp_worse < 6u) s.cp_worse = 6u;
+                                char hx[24]; mv_hex(cfirst, mv_tb, hx, sizeof hx);
+                                char kl[420];
+                                snprintf(kl, sizeof kl,
+                                         "[MGPU][R305] CONSTANT VECTORS: candidate %d read the same bytes (%s, fmt=%u) over the whole sampled "
+                                         "region in %u probes running, while the picture's no-motion error ranged %.3g..%.3g. Not this "
+                                         "game's motion: counted as 6 probes worse than none, so the R278 reject below applies.",
+                                         s.learn_cand, hx, mfmt, s.cp_const_run, s.cp_const_e0_min, s.cp_const_e0_max);
+                                mgpu::diag::warn(kl);
+                            }
+                        }
+                        else s.cp_const_run = 0u;
                         const char *cname[13] = { "none", "+W,+H", "+W,-H", "-W,+H", "-W,-H", "+W/2,+H/2", "+W/2,-H/2", "-W/2,+H/2", "-W/2,-H/2",
                                                   "+px,+px", "+px,-px", "-px,+px", "-px,-px" };
                         if (decisive)
@@ -22967,15 +24312,17 @@ void stream_poll()
                         }
                         char cl[760];
                         snprintf(cl, sizeof cl,
-                                 "[MGPU][R258] calibration %u/24 at f=%llu: WARP TEST error none=%.3g best=%.3g (%s) second=%.3g -> %s | "
+                                 "[MGPU][R258] calibration %u/%u at f=%llu: WARP TEST error none=%.3g best=%.3g (%s) second=%.3g -> %s | "
                                  "profile cross-check: shift x=%+.0f y=%+.0f, mean vector x=%+.5f y=%+.5f, K_x=%+.1f K_y=%+.1f | "
                                  "votes x: +W %d, -W %d, half %d, px %d | y: +H %d, -H %d, half %d, px %d",
-                                 s.cp_n, f, e[0], e[bestc], cname[bestc], second,
+                                 s.cp_n, s.learn_on ? 40u : 24u, f, e[0], e[bestc], cname[bestc], second,   // R305: the limit in force (40 while learning)
                                  decisive ? "DECISIVE" : "not decisive (too little motion or no clear winner)",
                                  ax.shift, ay.shift, mvx, mvy, ax.k, ay.k,
                                  s.cp_kx_votes[0], s.cp_kx_votes[1], s.cp_kx_votes[2], s.cp_kx_votes[3],
                                  s.cp_ky_votes[0], s.cp_ky_votes[1], s.cp_ky_votes[2], s.cp_ky_votes[3]);
                         mgpu::diag::info(cl);
+                        const bool sw_on = g_sweep_on.load(std::memory_order_relaxed);   // R307
+                        if (sw_on) sweep_note(s.sw_rec_id, e[0], e[bestc], decisive, bestc, cnt[0], fmt);
                         // Three agreeing votes on an axis -> the key. Written once per axis pair,
                         // next launch is the heal (the R244 shape). Y falls back to X's unit and
                         // sign when it never saw enough vertical motion.
@@ -22999,8 +24346,30 @@ void stream_poll()
                         // once per frame, until one edge wins; a chosen edge that goes worse three
                         // windows running reopens the choice. No key, no eye: the picture decides.
                         const bool x_live = g_mvec_x_active.load(std::memory_order_relaxed);
-                        const bool may_write = s.learn_write && !x_live;   // R278f-r: decided at arm (R258 runs under s.cs on the bridge thread: no file read here)
-                        if (x_live)
+                        // R311e: the reject the virtual-target path never had. The picture moved (none >= 2) and the field
+                        // R280 extracted was >= 90% no-motion samples: that source is not this game's motion. Six such
+                        // probes running: R280 stands down (R311d's path), the zero field stays bound (r309_aside), and
+                        // the ini gets MVecTap=0 + MVecLearned=99 so the next launch binds zero from the arm and never
+                        // arms R280 - what 0.3.1's first launch ended with on a title like Far Cry 6, minus the strobe.
+                        // RE4's field is motion (edge means 0.63 at its window 16) and never reaches four.
+                        if (x_live && !sw_on && s.x_verdicts == 0u && cnt[0] > 1000ull && e[0] >= 5.0 && pout.nv != 0ull && s.x_edges_rec != 0u)   // none >= 5: the camera moved, not one character; x_edges_rec: the source was WRITTEN this frame (a video or a menu that does not write it is not scored - R280g's guard)
+                        {
+                            if (pout.zeros * 10ull >= pout.nv * 9ull) ++s.x_still_motion; else s.x_still_motion = 0u;   // >= 90% no-motion samples (FC6: 95.8-99.4%; RE4 in gameplay: 0.0%)
+                            if (s.x_still_motion >= 6u && !g_mvec_x_stand_down.load(std::memory_order_relaxed))   // six running (R278's reject count)
+                            {
+                                g_mvec_x_stand_down.store(true, std::memory_order_relaxed);
+                                s.r309_aside = true;   // the zero field stays whatever the census picks next
+                                const bool w1 = ui_ini_write("MVecTap", 0), w2 = ui_ini_write("MVecLearned", 99);
+                                char xl[460];
+                                snprintf(xl, sizeof xl, "[MGPU][R311e] R280's extract is NOT this game's motion: %u probes running read >= 90%% no-motion samples "
+                                                        "while the picture moved (none=%.3g this probe). R280 stands down for this session, the ZERO field stays bound, "
+                                                        "and mgpu.ini %s MVecTap=0 MVecLearned=99: the next launch binds the zero field from the arm and does not arm R280.",
+                                         s.x_still_motion, e[0], (w1 && w2) ? "is written with" : "could NOT be written with (writer failed)");
+                                mgpu::diag::warn(xl);
+                            }
+                        }
+                        const bool may_write = s.learn_write && !x_live && !sw_on;   // R278f-r: decided at arm (R258 runs under s.cs on the bridge thread: no file read here); R307: never in the sweep
+                        if (x_live && !sw_on)   // R307: the sweep changes no scale and no edge
                         {
                             const bool motion = s.x_edges_rec != 0u && cnt[0] > 1000ull && e[0] > 0.0 && (decisive || e[bestc] > e[0] * 1.10);   // R280g: a window with no source write is not scored
                             const unsigned eu = s.x_edge_used & 1u;
@@ -23040,9 +24409,22 @@ void stream_poll()
                                 s.mvec_scale_x = (nkx != 0) ? (float)nkx * ((float)s.width / (float)W) : (float)s.width;
                                 s.mvec_scale_y = (nky != 0) ? (float)nky * ((float)s.height / (float)H) : (float)s.height;
                                 s.mvec_dirty = true;
-                                snprintf(cl, sizeof cl, "[MGPU][R280] VERDICT applied live (#%u): MVecScaleX=%.2f MVecScaleY=%.2f (uv; X from %d votes, Y from %d - Y not yet measured keeps +). Nothing written to mgpu.ini.%s",
+                                // R311f: the verdict is CARRIED to the next launch - the three keys the tap writes (R278c), which the
+                                // arm's R280 derivation already reads. The next launch binds at this scale from the first evaluate
+                                // (no zero-field wait) and the judge re-evaluates it in its windows as always; a different live
+                                // verdict rewrites them. Not in the sweep, not under a forced MVecSource.
+                                bool r311f_w = false;
+                                if (!sw_on && g_r311_src.load(std::memory_order_relaxed) == 0)
+                                {
+                                    const int akx = nkx < 0 ? -nkx : nkx;
+                                    const bool half = (akx != 0 && akx != (int)W);
+                                    r311f_w = ini_write_text("MVecUnits", half ? "uvhalf" : "uv") &&
+                                              ui_ini_write("MVecSignX", nkx < 0 ? -1 : 1) && ui_ini_write("MVecSignY", nky < 0 ? -1 : 1);
+                                }
+                                snprintf(cl, sizeof cl, "[MGPU][R280] VERDICT applied live (#%u): MVecScaleX=%.2f MVecScaleY=%.2f (uv; X from %d votes, Y from %d - Y not yet measured keeps +). %s%s",
                                          s.x_verdicts, s.mvec_scale_x, s.mvec_scale_y,
-                                         s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2], s.cp_ky_votes[0] + s.cp_ky_votes[1] + s.cp_ky_votes[2], el);
+                                         s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2], s.cp_ky_votes[0] + s.cp_ky_votes[1] + s.cp_ky_votes[2],
+                                         r311f_w ? "R311f: written to mgpu.ini (MVecUnits, MVecSignX/Y) - the next launch binds this from the arm and re-evaluates it." : "Nothing written to mgpu.ini.", el);
                                 mgpu::diag::warn(cl);
                             }
                             else if (el[0] != 0 || (s.cp_n % 8u) == 0u)
@@ -23063,11 +24445,15 @@ void stream_poll()
                             const bool w1 = ini_write_text("MVecUnits", "px"),
                                        w2 = ui_ini_write("MVecSignX", fx < 0 ? -1 : 1) && ui_ini_write("MVecSignY", fy < 0 ? -1 : 1);
                             s.cp_written = w1 && w2;
+                            // R311a part 2: the verdict is APPLIED LIVE on the tap path (R280's path always did), not only
+                            // written for the next launch. Learning launches only (learn_on): a learned title never gets here.
+                            if (s.learn_on && fx != 0.0f && fy != 0.0f) { s.mvec_scale_x = fx; s.mvec_scale_y = fy; s.mvec_dirty = true; }
                             if (s.learn_on && s.cp_written) { (void)ui_ini_write("MVecLearned", s.learn_cand); (void)ui_ini_write("MVecTap", 1); (void)ui_ini_write("MVecCandidate", s.learn_cand); }   /* R278f: the pick the next launch must take */   // R278b: kept
                             snprintf(cl, sizeof cl,
                                      "[MGPU][R258] VERDICT: PIXEL units (this launch: MVecScaleX=%.2f MVecScaleY=%.2f, colour pixels per vector pixel) - "
-                                     "mgpu.ini %s with MVecUnits=px and the signs; every launch derives the scale from its own sizes.",
-                                     fx, fy, s.cp_written ? "REWRITTEN" : "NOT written (writer failed)");
+                                     "mgpu.ini %s with MVecUnits=px and the signs; every launch derives the scale from its own sizes.%s",
+                                     fx, fy, s.cp_written ? "REWRITTEN" : "NOT written (writer failed)",
+                                     s.learn_on ? " R311a: APPLIED LIVE from the next evaluate." : "");
                             mgpu::diag::warn(cl);
                         }
                         else if (!s.cp_written && may_write && decide(s.cp_kx_votes, s.cp_kx_half_sign, (double)W, kx))
@@ -23078,12 +24464,16 @@ void stream_poll()
                             const bool w1 = ini_write_text("MVecUnits", is_half ? "uvhalf" : "uv"),
                                        w2 = ui_ini_write("MVecSignX", kx < 0 ? -1 : 1) && ui_ini_write("MVecSignY", ky < 0 ? -1 : 1);
                             s.cp_written = w1 && w2;
+                            // R311a part 2: applied live on a learning launch (kx, ky are colour pixels per unit vector, signed:
+                            // +-W or +-W/2 - the same numbers [R278c] derives at the next arm from MVecUnits and the signs).
+                            if (s.learn_on && kx != 0 && ky != 0) { s.mvec_scale_x = (float)kx; s.mvec_scale_y = (float)ky; s.mvec_dirty = true; }
                             if (s.learn_on && s.cp_written) { (void)ui_ini_write("MVecLearned", s.learn_cand); (void)ui_ini_write("MVecTap", 1); (void)ui_ini_write("MVecCandidate", s.learn_cand); }   /* R278f: the pick the next launch must take */   // R278: closed for this title, tap kept
                             snprintf(cl, sizeof cl,
                                      "[MGPU][R258] VERDICT: %s units (this launch: MVecScaleX=%d MVecScaleY=%d) %s - mgpu.ini %s with MVecUnits and the signs; "
-                                     "every launch derives the scale from its own sizes.", is_half ? "UV/2" : "UV", kx, ky,
+                                     "every launch derives the scale from its own sizes.%s", is_half ? "UV/2" : "UV", kx, ky,
                                      (s.cp_ky_votes[0] + s.cp_ky_votes[1] + s.cp_ky_votes[2] >= 3) ? "(both axes measured)" : "(Y taken from X: not enough vertical motion seen)",
-                                     s.cp_written ? "REWRITTEN" : "NOT written (writer failed)");
+                                     s.cp_written ? "REWRITTEN" : "NOT written (writer failed)",
+                                     s.learn_on ? " R311a: APPLIED LIVE from the next evaluate." : "");
                             mgpu::diag::warn(cl);
                         }
                     }
@@ -23093,10 +24483,10 @@ void stream_poll()
                     // the title is closed. One line either way, then silence.
                     // R278e: or on balance at the end of the 24 probes - one lucky
                     // decisive vote no longer vetoes (RE4-L1: 1 vote, ~17 worse).
-                    const unsigned votes_x = (unsigned)(s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2] + s.cp_kx_votes[3]);
+                    votes_x = (unsigned)(s.cp_kx_votes[0] + s.cp_kx_votes[1] + s.cp_kx_votes[2] + s.cp_kx_votes[3]);   // R311c: declared at the block's top (the launch goto)
                     // R278f: per candidate - a window of 8 probes. Rejected early (6 worse,
                     // no vote) or on balance at the window's end (worse >= 4 and >= 3 x votes).
-                    const bool win_end = (s.cp_win_n >= 8u);
+                    win_end = (s.cp_win_n >= 8u);
                     // R280e: on the virtual-target path there is no reject - the judge stays open (above).
                     if (g_mvec_x_active.load(std::memory_order_relaxed)) { }
                     else if (s.learn_on && !s.cp_written &&
@@ -23114,14 +24504,18 @@ void stream_poll()
                             mgpu::diag::warn(rl);
                             g_mv_cand_req.store(ns, std::memory_order_relaxed);
                             s.learn_cand = ns; s.cp_worse = 0; s.cp_win_n = 0;
+                            s.cp_const_run = 0; s.cp_const_counted = false;   // R305: a new candidate is judged afresh
                             for (int i = 0; i < 4; ++i) { s.cp_kx_votes[i] = 0; s.cp_ky_votes[i] = 0; }
                             goto r278f_next;
                         }
                         if (nc > s.learn_cand && (unsigned)nc < en)
                         {
                             (void)ui_ini_write("MVecCandidate", nc);
-                            snprintf(rl, sizeof rl, "[MGPU][R278] vector candidate %d rejected (%u of %u probes worse than none). No other candidate of this size; "
-                                                    "the next launch tries candidate %d (a smaller size) of %u.", s.learn_cand, s.cp_worse, s.cp_win_n, nc, en);
+                            // R306: wording only. "Same" here means same size AND same format (one slot
+                            // layout, probe.cpp R278f-r); Far Cry 6's next candidate was the same size in
+                            // another format and the old text called it "a smaller size".
+                            snprintf(rl, sizeof rl, "[MGPU][R278] vector candidate %d rejected (%u of %u probes worse than none). No other candidate of the same size "
+                                                    "AND format (switching live needs one slot layout); the next launch tries candidate %d of %u.", s.learn_cand, s.cp_worse, s.cp_win_n, nc, en);
                         }
                         else
                         {
@@ -23134,14 +24528,31 @@ void stream_poll()
                         s.cp_written = true;   // closes R258 for this session
                     }
                     r278f_next:;
-                    if (ok0) s.cp_rb[0]->Unmap(0, &none);
-                    if (ok1) s.cp_rb[1]->Unmap(0, &none);
-                    if (okm) s.vp_rb->Unmap(0, &none);
+                    if (r311c_replay) r309::r311c::finish();   // R311c: unmap through the refs the job held, release them, job idle
+                    else
+                    {
+                        if (ok0) s.cp_rb[0]->Unmap(0, &none);
+                        if (ok1) s.cp_rb[1]->Unmap(0, &none);
+                        if (okm) s.vp_rb->Unmap(0, &none);
+                    }
+                    if (r309_q0 != 0) r309::note_hold(s, r309_q0, r309_own, r310_off);   // R310: map, score, unmap (R311c: the thread's compute time counts as 'released')
+                    for (int r310_i = 0; r310_i < 3; ++r310_i) if (r310_ref[r310_i] != nullptr) { r310_ref[r310_i]->Release(); r310_ref[r310_i] = nullptr; }   // R310
+                    r311c_launched:;   // R311c: a launched job skips the unmaps (the thread holds them) and the hold note (nothing was held)
                 }
                 // R280e: on the virtual-target path the judge never closes (no probe budget);
                 // after the first verdict it runs every 1000 frames instead of every 100.
                 const bool x_judge = g_mvec_x_active.load(std::memory_order_relaxed);
-                if (((x_judge && (s.x_verdicts == 0u || (f % 1000ull) < 100ull)) || (s.cp_n < (s.learn_on ? 40u : 24u) && !s.cp_written)) && s.mvec_bytes2 != 0)   // R278f: room for 3 same-size windows while learning
+                const bool r309_base = (x_judge && (s.x_verdicts == 0u || (f % 1000ull) < 100ull)) || (s.cp_n < (s.learn_on ? 40u : 24u) && !s.cp_written);
+                if (s.r310_cost && !s.r309_on)   // R310: ProbeCost without the judge - a COST line every 5 minutes
+                {
+                    const unsigned long long r310_now = GetTickCount64();
+                    if (s.r310_next_ms == 0ull) s.r310_next_ms = r310_now + 300000ull;
+                    else if (r310_now >= s.r310_next_ms) { s.r310_next_ms = r310_now + 300000ull; r309::cost_line(s, "last 5 minutes (R258's probes only)"); }
+                }
+                // R309: its own probes only inside a gameplay window; R258's schedule above is unchanged.
+                const bool r309_win = s.r309_on && s.mvec_mode == 3 &&
+                                      r309::window(s, mvec_fresh, s.depth_mode == 0 || s.depth_slot_valid[slot] != 0u, f);
+                if ((r309_base || r309_win) && s.mvec_bytes2 != 0)   // R278f: room for 3 same-size windows while learning
                 {
                     // Staged recording. Stage 1 at the odd 150s (150, 450, 750, ...) so it
                     // never shares a frame with R257's readback at 300/900/1800; stage 2
@@ -23149,8 +24560,18 @@ void stream_poll()
                     // ended at f=1586, before the old gate at 1801).
                     // R258c: every 100 frames at the 50s (150, 250, 350, ...): never a
                     // multiple of 300, so never R257's frame.
-                    if (s.cp_stage == 0u && (f % 100ull) == 50ull && f >= 150ull)
+                    bool sw_ok = true;   // R307: in the sweep, a probe starts only 60+ frames into a setting
+                    if (g_sweep_on.load(std::memory_order_relaxed))
                     {
+                        const unsigned sid = g_sweep_id.load(std::memory_order_relaxed);
+                        if (sid != s.sw_seen_id) { s.sw_seen_id = sid; s.sw_seen_f = f; }
+                        sw_ok = (f - s.sw_seen_f >= 60ull);
+                    }
+                    if (s.cp_stage == 0u && (f % 100ull) == 50ull && f >= 150ull && sw_ok && (!s.r311c_thread || r309::r311c::idle()))   // R311c: the readbacks are in use while a job scores
+                    {
+                        s.sw_rec_id = s.sw_seen_id;   // R307
+                        s.r309_probe_own = !r309_base;   // R309: started by R309 alone - scored by R309 alone
+                        if (s.r309_probe_own) s.r309_bytes += 2ull * (unsigned long long)s.payload_bytes + (unsigned long long)s.mvec_bytes2;
                         if (s.cp_rb[0] == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.payload_bytes, D3D12_HEAP_TYPE_READBACK, &s.cp_rb[0]);
                         if (s.cp_rb[1] == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.payload_bytes, D3D12_HEAP_TYPE_READBACK, &s.cp_rb[1]);
                         if (s.vp_rb == nullptr && s.ndev_b) (void)make_buf(s.ndev_b, s.mvec_bytes2, D3D12_HEAP_TYPE_READBACK, &s.vp_rb);
@@ -23184,17 +24605,195 @@ void stream_poll()
                     {
                         const vec_probe_result vr = vec_probe_eval(pm, s.mvec_w, s.mvec_h, (unsigned)s.mvec_fp2.Footprint.RowPitch, s.mvec_format);
                         D3D12_RANGE none{0, 0}; s.vp_rb->Unmap(0, &none);
-                        char vl[560];
+                        char vl[760];
+                        char hx[24]; mv_hex(vr.first_raw, vr.texel_bytes, hx, sizeof hx);   // R305
                         snprintf(vl, sizeof vl,
                                  "[MGPU][R257] vector probe %u/3 at f=%llu (%ux%u fmt=%u, every 2nd row/4th col): samples=%llu zero=%.1f%% | "
-                                 "|x| mean=%.4g max=%.4g | |y| mean=%.4g max=%.4g | x>0 %.0f%% y>0 %.0f%% -> %s",
+                                 "|x| mean=%.4g max=%.4g | |y| mean=%.4g max=%.4g | x>0 %.0f%% y>0 %.0f%% | R305: first texel bytes %s, "
+                                 "%.1f%% of samples identical to it -> %s",
                                  s.vp_n, f, s.mvec_w, s.mvec_h, s.mvec_format, vr.n,
                                  vr.n ? 100.0 * (double)vr.zeros / (double)vr.n : 0.0,
-                                 vr.mean_ax, vr.max_ax, vr.mean_ay, vr.max_ay, 100.0 * vr.pos_x, 100.0 * vr.pos_y, vr.verdict);
+                                 vr.mean_ax, vr.max_ax, vr.mean_ay, vr.max_ay, 100.0 * vr.pos_x, 100.0 * vr.pos_y,
+                                 hx[0] ? hx : "-", vr.n ? 100.0 * (double)vr.same_as_first / (double)vr.n : 0.0, vr.verdict);
                         mgpu::diag::info(vl);
                     }
                 }
-                if (mvec_fresh && s.vp_n < 3u && !s.vp_pending && s.mvec_bytes2 != 0 && (f == 300ull || f == 900ull || f == 1800ull))
+                // ---- R315b (MVecBarrierSource=2): the judge ----
+                // The readback of both regions is issued here (this list, this slot, before the
+                // unpack reads the same bytes), mapped on a LATER poll (the fence says the list ran),
+                // compared on a sample grid. A frame is "same" when every sampled texel is byte-
+                // identical. Decision after R315_WINDOW_N judged frames: >= 90% same -> TAIL; else
+                // TRANSITION. The window re-opens when the published handle changes and every
+                // ~5 minutes of sealed frames. Key absent / 1: mvec2_off is 0, nothing here runs.
+                if (s.mvec2_off != 0)
+                {
+                    const unsigned R315_WINDOW_N = 24u;
+                    const unsigned long long pub = s.mvec_pub_handle.load(std::memory_order_relaxed);
+                    const int ph = g_r315_phase.load(std::memory_order_relaxed);
+                    if (ph != R315_WINDOW && pub != 0ull && s.r315_judge_handle != 0ull &&
+                        (pub != s.r315_judge_handle || f >= s.r315_recheck_at))
+                    {
+                        g_r315_phase.store(R315_WINDOW, std::memory_order_relaxed);
+                        mgpu::calibrator::set_eval_copy(1);   // R315b fix 3
+                        s.r315_judged = 0; s.r315_same = 0; s.r315_window_at = f;
+                        s.r315_prev_bits.clear(); s.r315_prev_diff = 0;   // R315b fix 4
+                        s.r315_flat = 0;   // R326
+                        char wl[260];
+                        snprintf(wl, sizeof wl, "[MGPU][R315] JUDGE window re-opened at f=%llu (%s): the DLSS-call copy delivers until the verdict.",
+                                 f, pub != s.r315_judge_handle ? "the published vector buffer changed" : "periodic re-check");
+                        mgpu::diag::info(wl);
+                    }
+                    if (s.r315_rb_pending && s.r315_rb != nullptr)
+                    {
+                        s.r315_rb_pending = false;
+                        unsigned char *pm = nullptr;
+                        D3D12_RANGE rr{ 0, (SIZE_T)(2ull * s.mvec_bytes2) };
+                        if (SUCCEEDED(s.r315_rb->Map(0, &rr, (void **)&pm)) && pm != nullptr)
+                        {
+                            const unsigned pitch = (unsigned)s.mvec_fp2.Footprint.RowPitch;
+                            // R315b fix 1: bytes per texel for ANY vector format the lane carries (mv_texel_bytes
+                            // knows the two-channel decoders only; Cyberpunk's buffer is R16G16B16A16_FLOAT = 10).
+                            unsigned tb = 0u;
+                            switch (s.mvec_format)
+                            {
+                            case 2: case 3: case 4:                         tb = 16u; break;   // R32G32B32A32 *
+                            case 10: case 11: case 12: case 13: case 14:    tb = 8u;  break;   // R16G16B16A16 *
+                            case 15: case 16: case 17: case 18:             tb = 8u;  break;   // R32G32 *
+                            case 23: case 24: case 25:                      tb = 4u;  break;   // R10G10B10A2 *, R11G11B10
+                            case 27: case 28: case 29: case 30: case 31: case 32: tb = 4u; break;   // R8G8B8A8 *
+                            case 33: case 34: case 35: case 36: case 37: case 38: tb = 4u; break;   // R16G16 *
+                            case 39: case 40: case 41: case 42: case 43:    tb = 4u;  break;   // R32 *
+                            case 48: case 49: case 50: case 51: case 52:    tb = 2u;  break;   // R8G8 *
+                            default: tb = mv_texel_bytes(s.mvec_format); break;
+                            }
+                            if (tb == 0u && !s.r315_fmt_said)
+                            {
+                                s.r315_fmt_said = true;
+                                char fl[200];
+                                snprintf(fl, sizeof fl, "[MGPU][R315] JUDGE cannot sample vector format %u (unknown texel size): the verdict will be "
+                                                        "TRANSITION by default, which is value 1.", s.mvec_format);
+                                mgpu::diag::warn(fl);
+                            }
+                            unsigned long long n = 0, diff = 0, overlap = 0;
+                            unsigned bx0 = ~0u, by0 = ~0u, bx1 = 0u, by1 = 0u;   // bounding box of the differing texels (full-res coords)
+                            // R326 (E15): sample only the area the game writes. The calibrator table carries the
+                            // vector subrect (Dawnwalker: 1485x836 at 0,0 inside a 2560x1440 buffer - two thirds
+                            // of the whole-buffer grid were texels nothing ever wrote). No subrect: the whole
+                            // buffer, as before. The grid indices (sx, sy) stay buffer-relative so the prev-bits
+                            // set keeps its meaning across frames.
+                            unsigned gx0 = 0u, gy0 = 0u, gx1 = s.mvec_w, gy1 = s.mvec_h;
+                            {
+                                mgpu::calibrator::table st;
+                                if (mgpu::calibrator::read(st) && (st.have & mgpu::calibrator::KEY_SUBRECTS) != 0u &&
+                                    st.sub_w >= 64u && st.sub_h >= 64u &&
+                                    st.mvec_x + st.sub_w <= s.mvec_w && st.mvec_y + st.sub_h <= s.mvec_h)
+                                { gx0 = st.mvec_x; gy0 = st.mvec_y; gx1 = st.mvec_x + st.sub_w; gy1 = st.mvec_y + st.sub_h; }
+                            }
+                            const unsigned ns_x = (s.mvec_w + 7u) / 8u, ns_y = (s.mvec_h + 3u) / 4u;
+                            const size_t nbits = (size_t)ns_x * ns_y;
+                            std::vector<unsigned char> bits((nbits + 7u) / 8u, 0u);
+                            const bool have_prev = (s.r315_prev_bits.size() == bits.size());
+                            // R326 (E15): a frame counts only if its field carries motion. The R305 rule the R257
+                            // probe uses: sampled texels of the DLSS-call copy byte-identical to the FIRST sampled
+                            // texel. >= 99% identical = a flat field (all zero, -0, or one constant, whatever the
+                            // format) - identical copies of it prove nothing. Dawnwalker D1B-D1D and Cyberpunk
+                            // FG1 judged 24 such frames right after the arm and picked TAIL on them.
+                            unsigned long long flat_same = 0ull;
+                            const unsigned char *first_tx = nullptr;
+                            if (tb != 0u)
+                                for (unsigned y = gy0 & ~3u, sy = y / 4u; y < gy1; y += 4u, ++sy)
+                                {
+                                    const unsigned char *a = pm + (size_t)y * pitch;
+                                    const unsigned char *b = pm + (size_t)s.mvec_bytes2 + (size_t)y * pitch;
+                                    for (unsigned x = gx0 & ~7u, sx = x / 8u; x < gx1; x += 8u, ++sx)
+                                    {
+                                        ++n;
+                                        if (first_tx == nullptr) first_tx = a + (size_t)x * tb;
+                                        if (memcmp(a + (size_t)x * tb, first_tx, tb) == 0) ++flat_same;
+                                        if (memcmp(a + (size_t)x * tb, b + (size_t)x * tb, tb) != 0)
+                                        {
+                                            ++diff;
+                                            const size_t bi = (size_t)sy * ns_x + sx;
+                                            bits[bi >> 3] |= (unsigned char)(1u << (bi & 7u));
+                                            if (have_prev && (s.r315_prev_bits[bi >> 3] & (1u << (bi & 7u))) != 0u) ++overlap;
+                                            if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y;
+                                        }
+                                    }
+                                }
+                            D3D12_RANGE none{0, 0}; s.r315_rb->Unmap(0, &none);
+                            // R326: no motion in the field -> not a judged frame. The window stays open and the
+                            // DLSS-call copy keeps delivering until 24 frames WITH motion have been compared.
+                            const bool flat = (tb != 0u && n != 0ull && flat_same * 100ull >= n * 99ull);
+                            if (flat)
+                            {
+                                ++s.r315_flat;
+                                if (s.r315_flat == 1u || s.r315_flat == 100u || s.r315_flat == 1000u)
+                                {
+                                    char fl2[260];
+                                    snprintf(fl2, sizeof fl2, "[MGPU][R326] JUDGE: frame f=%llu not counted - the vector field is flat (%.1f%% of %llu "
+                                                              "sampled texels identical to the first). %u flat frame(s) skipped in this window so far; the "
+                                                              "DLSS-call copy delivers until 24 frames with motion are judged.",
+                                             f, n ? 100.0 * (double)flat_same / (double)n : 0.0, n, s.r315_flat);
+                                    mgpu::diag::info(fl2);
+                                }
+                            }
+                            else
+                            {
+                            ++s.r315_judged;
+                            // R315b fix 4. same = identical, OR a small (< 1%) FIXED set: >= 90% of this frame's differing
+                            // samples were differing in the previous judged frame too (a deterministic write to a fixed
+                            // region after DLSS - a HUD / weapon mask - not stale motion, which moves with the scene).
+                            // The first judged frame with a difference has no previous set and counts as DIFFERENT.
+                            const bool patch_small = (n != 0ull && diff * 100ull < n);   // 'small' is a Windows macro (rpcndr.h)
+                            const bool patch_fixed = (diff != 0ull && have_prev && s.r315_prev_diff != 0ull && overlap * 10ull >= diff * 9ull);
+                            const bool same = (diff == 0ull) || (patch_small && patch_fixed);
+                            if (same) ++s.r315_same;
+                            s.r315_prev_bits.swap(bits); s.r315_prev_diff = diff;
+                            if (s.r315_judged <= 3u || s.r315_judged == R315_WINDOW_N)
+                            {
+                                char jl[520];   // R326: longer line
+                                snprintf(jl, sizeof jl, "[MGPU][R315] JUDGE frame %u/%u at f=%llu: %llu sampled texels, %llu differ (%.3f%%), %llu of them "
+                                                        "also differed last time, box x=%u..%u y=%u..%u of %ux%u -> %s | R326: grid x=%u..%u y=%u..%u, "
+                                                        "%.1f%% flat, %u flat frame(s) skipped",
+                                         s.r315_judged, R315_WINDOW_N, f, n, diff, n ? 100.0 * (double)diff / (double)n : 0.0, overlap,
+                                         diff ? bx0 : 0u, diff ? bx1 : 0u, diff ? by0 : 0u, diff ? by1 : 0u, s.mvec_w, s.mvec_h,
+                                         same ? (diff ? "same (a fixed patch)" : "same") : "DIFFERENT",
+                                         gx0, gx1, gy0, gy1, n ? 100.0 * (double)flat_same / (double)n : 0.0, s.r315_flat);
+                                mgpu::diag::info(jl);
+                            }
+                            if (s.r315_judged >= R315_WINDOW_N)
+                            {
+                                const bool tail_ok = (s.r315_same * 10u >= R315_WINDOW_N * 9u);
+                                g_r315_phase.store(tail_ok ? R315_TAIL : R315_EVALUATE, std::memory_order_relaxed);
+                                mgpu::calibrator::set_eval_copy(tail_ok ? 0 : 1);   // R315b fix 3: the DLSS-call copy stops only when the tail carries
+                                s.r315_judge_handle = pub; s.r315_recheck_at = f + 18000ull; ++s.r315_decisions;
+                                char dl[420];
+                                snprintf(dl, sizeof dl,
+                                         "[MGPU][R315] VERDICT #%u at f=%llu: %u of %u judged frames byte-identical between the copy at the DLSS "
+                                         "call and the tail of the frame -> %s. Re-judged if the published buffer changes, and every 18000 frames.",
+                                         s.r315_decisions, f, s.r315_same, R315_WINDOW_N,
+                                         tail_ok ? "the TAIL carries the vectors from here (the DLSS-call copy and its two barriers stop)"
+                                                 : "the DLSS-CALL copy carries, as today (the tail is not what DLSS consumed on this title)");
+                                mgpu::diag::info(dl);
+                            }
+                            }   // R326: !flat
+                        }
+                    }
+                    if (g_r315_phase.load(std::memory_order_relaxed) == R315_WINDOW && mvec_fresh && !s.r315_rb_pending &&
+                        s.r315_both[slot].load(std::memory_order_acquire) != 0u && s.mvec_bytes2 != 0 && (f & 3ull) == 0ull)
+                    {
+                        if (s.r315_rb == nullptr && s.ndev_b != nullptr)
+                            (void)make_buf(s.ndev_b, 2ull * s.mvec_bytes2, D3D12_HEAP_TYPE_READBACK, &s.r315_rb);
+                        if (s.r315_rb != nullptr)
+                        {
+                            s.nl->CopyBufferRegion(s.r315_rb, 0, s.nxfer, slot_off + s.mvec_off, s.mvec_bytes2);
+                            s.nl->CopyBufferRegion(s.r315_rb, s.mvec_bytes2, s.nxfer, slot_off + s.mvec2_off, s.mvec_bytes2);
+                            s.r315_rb_pending = true;
+                        }
+                    }
+                }
+                if (mvec_fresh && s.vp_n < 3u && !s.vp_pending && s.mvec_bytes2 != 0 && (f == 300ull || f == 900ull || f == 1800ull) &&
+                    (!s.r311c_thread || r309::r311c::idle()))   // R311c: vp_rb is being read by the probe thread while a job scores
                 {
                     if (s.vp_rb == nullptr && s.ndev_b != nullptr) (void)make_buf(s.ndev_b, s.mvec_bytes2, D3D12_HEAP_TYPE_READBACK, &s.vp_rb);
                     if (s.vp_rb != nullptr)
@@ -23308,6 +24907,32 @@ void stream_poll()
                     s.mvec_in_read = true;
                     s.mvec_dirty = false;
                     ++s.mvec_fills;
+                }
+                // R309: the zero field, once, the first time R309 steps aside. In mode 3 nothing has
+                // written the upload buffer (mvec_fills == 0), and a committed resource is created
+                // zeroed, so it is copied as it is - a GPU 1 copy, no CPU fill under s.cs. If the
+                // panel ever filled it (mode switched live), it is zeroed first.
+                // R311e: THE DEFAULT IS THE ZERO FIELD. On the R280 path the extract is bound only once R280's own
+                // judge has applied a verdict (x_verdicts > 0: RE4 at its window ~16); until then, and on a title whose
+                // extract never earns one (Far Cry 6), the zero field is what DLSS-NR gets - from the first evaluate,
+                // not after a judge stepped aside from strobing vectors. The copies and the probes carry on so the
+                // verdict can still arrive. The tap path (Skyrim) and contract titles are not on this branch.
+                const bool r311e_zero = s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u);
+                if (s.mvec_mode == 3 && r311e_zero && !s.r309_zero_ready &&
+                    s.tex_mvec != nullptr && s.mvec_cpu != nullptr && s.mvec_up != nullptr)
+                {
+                    if (s.mvec_fills != 0)
+                        for (UINT row = 0; row < s.height; ++row)
+                            memset(s.mvec_cpu + (size_t)row * (size_t)s.mvec_fp.Footprint.RowPitch, 0, (size_t)s.width * 8u);
+                    if (s.mvec_in_read)
+                        barrier(s.nl, s.tex_mvec, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION zs{}, zd{};
+                    zs.pResource = s.mvec_up; zs.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; zs.PlacedFootprint = s.mvec_fp;
+                    zd.pResource = s.tex_mvec; zd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; zd.SubresourceIndex = 0;
+                    s.nl->CopyTextureRegion(&zd, 0, 0, 0, &zs, nullptr);
+                    barrier(s.nl, s.tex_mvec, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    s.mvec_in_read = true;
+                    s.r309_zero_ready = true;
                 }
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
@@ -23427,8 +25052,12 @@ void stream_poll()
                 {
                     ew = s.sr_w; eh = s.sr_h;
 
+                    // R312: the reduce maps depth by the COLOUR extent, so a smaller depth
+                    // (DepthTransport 3/4) is not handed to it. Today depth is always the
+                    // colour's size, so the key-absent path is unchanged.
                     sr_write_descriptors(s, s.ndev_b, ii, s.tex_in[ii],
-                                         (s.depth_mode == 1) ? s.tex_depth[ii] : nullptr);
+                                         (s.depth_mode == 1 && s.depth_w == s.width && s.depth_h == s.height)
+                                             ? s.tex_depth[ii] : nullptr);
 
                     barrier(s.nl, s.sr_color[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -23644,6 +25273,31 @@ void stream_poll()
                                   ((jct.have & mgpu::calibrator::KEY_RESET) != 0u && jct.reset != 0u);
                     jout = mgpu::tdiag::jitter_decide(ji);
                 }
+                // R323 (HistoryGate=1): one decision per consumed frame, every pass follows it.
+                bool gate_rst = false;
+                if (g_hist_gate.load(std::memory_order_relaxed) != 0)
+                {
+                    const int gd = (int)s.slot_dlss[slot].load(std::memory_order_acquire);
+                    const bool no_dlss = (gd == 0);   // -1: no table on this title, the gate cannot tell, history as before
+                    gate_rst = no_dlss || s.gate_break;
+                    if (no_dlss && !s.gate_break)
+                    {
+                        ++s.gate_stretches; s.gate_since = f;
+                        if (s.gate_stretches <= 3u)
+                        {
+                            char gl[200];
+                            snprintf(gl, sizeof gl, "[MGPU][R323] no DLSS from the game at f=%llu: Reset=1 on every pass until it returns (stretch %u).", f, s.gate_stretches);
+                            mgpu::diag::info(gl);
+                        }
+                    }
+                    else if (!no_dlss && s.gate_break && s.gate_stretches <= 3u)
+                    {
+                        char gl[200];
+                        snprintf(gl, sizeof gl, "[MGPU][R323] DLSS is back at f=%llu after %llu frame(s): one more Reset=1, then history from the game.", f, f - s.gate_since);
+                        mgpu::diag::info(gl);
+                    }
+                    s.gate_break = no_dlss;
+                }
                 for (unsigned pi = 0; pi < npass; ++pi)
                 {
                     ID3D12Resource *src = (pi == 0)
@@ -23808,7 +25462,10 @@ void stream_poll()
                     // and call it the whole frame. R30 established that each
                     // input carries its own subrect; this is the input that
                     // makes that mandatory rather than tidy.
-                    if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
+                    // R309: stepped aside - the zero field (tex_mvec) through the synthetic branch below,
+                    // fresh vectors or not. Exactly what MVec=1 with MVecDX=MVecDY=0 binds.
+                    const bool r309_zero = r311e_zero && s.r309_zero_ready && s.mvec_mode == 3;   // R311e: zero until R280's verdict, or stepped aside
+                    if (!r309_zero && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                         s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u &&
                         tdec.bind_mvec)   // R300a1: false only with TemporalRequireTuple=1 on an incoherent tuple
                     {
@@ -23850,7 +25507,7 @@ void stream_poll()
                             : (unsigned int)s.mvec_h);
                         if (pi == 0 && sk == 0) ++s.mvec_bound;
                     }
-                    else if (s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
+                    else if (!r309_zero && s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
                              s.mvec_keep_f != 0ull &&
                              f - s.mvec_keep_f <= (unsigned long long)mgpu::fgmap::reuse_window())
                     {
@@ -23882,7 +25539,7 @@ void stream_poll()
                             : (unsigned int)s.mvec_h);
                         if (pi == 0 && sk == 0) { ++s.mvec_bound; mgpu::fgmap::on_reuse(); }
                     }
-                    else if (s.mvec_mode == 3)
+                    else if (!r309_zero && s.mvec_mode == 3)
                     {
                         // R61's rule, applied to motion. The bind hook did not
                         // fire this frame - a menu, a load screen. UNSET it.
@@ -24003,6 +25660,7 @@ void stream_poll()
                     if (p1f_here && s.p1f_fresh[fidx]) rst = 1u;           // R214
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
+                    if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
                     s.nr_params->Set("DLSSNR.Reset", rst);
                     // [OURS] NRS: a feature rebuilt by a live scale change has no history;
                     // the first evaluate on it must discard whatever the module still has.
@@ -24089,6 +25747,13 @@ void stream_poll()
                     // and the composition, and those are game dependent.
                     LARGE_INTEGER nrs_t0{}; LARGE_INTEGER nrs_fq{};
                     if (nrs_here) { QueryPerformanceFrequency(&nrs_fq); QueryPerformanceCounter(&nrs_t0); }
+                    // R316: the residual pass module, same plain-full-frame shape as nrs_here, on
+                    // ITS pass. Never both: the module stays off when NRScale is set. Off: one
+                    // relaxed load.
+                    const bool rsd_here = mgpu::residual::active() && pi == mgpu::residual::pass() &&
+                                          sk == 0u && !p2f && !p1f_here && !vr_c && !vr_wh && !nr16_on &&
+                                          ew == s.width && eh == s.height && !s.nrs_on;
+                    if (rsd_here) mgpu::residual::before(s.nl, ii, s.nr_params, nr_color);
 
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
@@ -24118,6 +25783,13 @@ void stream_poll()
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true);
                         ID3D12Resource *nrs_depth = nullptr;
                         (void)s.nr_params->Get("DLSSNR.Depth", &nrs_depth);
+                        // NRScaleResolveDepth=0: the composite runs without its depth guard, as
+                        // when no depth is bound; NGX above still gets depth. On Starfield
+                        // (3840x2160, NRScale=0.75, Depth=1) the guard - native depth at 5 taps,
+                        // residual cut to 25% above a 0.02 relative range - put vertical stripes
+                        // and a dark veil on the shadowed side of faces. The bind line below then
+                        // reports depth=0.
+                        if (!s.nrs_res_depth) nrs_depth = nullptr;
                         // Depth is a GIFT, not a given: the proxy validates it before
                         // binding (SRV allowed, and the size must be the native one)
                         // and falls back to a harmless SRV with hasDepth=0 otherwise.
@@ -24304,6 +25976,10 @@ void stream_poll()
                             mgpu::diag::info(nsl);
                         }
                     }
+                    if (rsd_here)   // R316: resolve into dst, then the caller's bindings back
+                        mgpu::residual::after(s.nl, ii, s.nr_params, nr_color, nr_output,
+                                              er == NVSDK_NGX_Result_Success, nr_color, nr_output,
+                                              s.width, s.height, rbx, rby, rw, rh);
                     if (p2f)
                     {
                         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
@@ -24796,7 +26472,21 @@ void stream_poll()
                 const DWORD wr = WaitForSingleObject(s.nev, 5000);
                 lk.lock();
                 if (mgpu::t119::perf_active()) mgpu::perf::job_done();   // R300e1
-                if (wr != WAIT_OBJECT_0) h = E_FAIL;
+                if (wr != WAIT_OBJECT_0)
+                {
+                    h = E_FAIL;
+                    const unsigned long long r311b_now = GetTickCount64();   // R311b: see the copy-queue wait above
+                    if (r311b_now - s.r311b_last_ms >= 10000ull)
+                    {
+                        s.r311b_last_ms = r311b_now;
+                        char tl[300];
+                        snprintf(tl, sizeof tl, "[MGPU][R311b] GPU 1 FENCE TIMEOUT (evaluate): waited 5000 ms for fence %llu, completed %llu, f=%llu - "
+                                                "the frame is counted consumed and the poll goes on. If this repeats, GPU 1 is not finishing the evaluate; "
+                                                "the bridge picture freezes meanwhile.",
+                                 (unsigned long long)s.nf_value, (unsigned long long)s.nf->GetCompletedValue(), (unsigned long long)f);
+                        mgpu::diag::warn(tl);
+                    }
+                }
             }
         }
         if (FAILED(h)) { if (mgpu::t119::perf_active()) mgpu::perf::job_abort(); s.consumed = f; continue; }   // R300e1

@@ -98,6 +98,11 @@ shaders from [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost
 vendored unchanged. They are used only by the residual neural-rendering path,
 which runs only when `NRScale` is set in `mgpu.ini` (R299). Contributed by N01950.
 
+`src/residual.cpp` (R316, private test build) carries two compute kernels adapted from
+the same project's `shaders.hlsl` (MIT, text below): the depth taps of the silhouette guard
+are scaled to the depth buffer's own size and the skip-frame branches are removed. The
+kernels are compiled at run time; nothing of them is used unless `ResidualPass` is set.
+
 ### MIT License (DLSS-NR Cost-Scaler)
 
 Copyright (c) 2026 xen
