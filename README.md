@@ -357,6 +357,22 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 
 * * *
 
+## Choosing the render card on Unreal Engine titles
+
+Some Unreal Engine games pick their own GPU and ignore Windows Graphics settings. If the game renders on the card that should run DLSS 5, the two cards swap roles. On some setups the bridge then cannot start DLSS 5, and the stream runs without neural rendering.
+
+**Steam.** Right-click the game, Properties, General, and put this in Launch Options:
+
+```
+-graphicsadapter=N %command%
+```
+
+N is the number of the card that should render the game: the card with no monitor. The `adapter[N]` lines in `ReShade.log` list your cards with their numbers. If the game still renders on the wrong card, try the other number.
+
+**A desktop shortcut** takes the same flag at the end of the Target field, outside the quotes.
+
+* * *
+
 ## Limitations
 
 - **Engine motion vectors can need the game to be running DLSS or DLAA.** Measured on Battlefield 6 (0.2.2): 96-98% of frames with DLSS or DLAA, none with TAA. Since 0.3.0 the add-on also finds the game's own motion vectors on games without DLSS, tested on Resident Evil 4 (2023).
@@ -365,6 +381,7 @@ This only works if the title actually carries a D3D12 renderer - there is nothin
 - **Frame generation:** Not recommended. It still flickers, as in 0.3.x. Some games with frame generation on can crash at startup. Workaround: set `AutoArm=0` in `mgpu.ini`, get into gameplay, and press `CTRL+ALT+F10` to arm by hand.
 - **Colour handling:** Not fully implemented; tone adjustment may be needed. Motion vectors for UI and HUD elements are still missing
 - **External overlays:** Tools like RivaTuner/MSI Afterburner misbehave; use ReShade's built-in FPS display instead
+- **Unreal Engine titles can ignore Windows Graphics settings** and render on the wrong card. See Choosing the render card on Unreal Engine titles
 - **No Vulkan support.** DirectX 12 and DirectX 11 only. Some Unity titles can be forced to D3D12, optional since 0.3.0 - see Forcing D3D12 on Unity titles
 - **Keyboard focus:** With `DcompOverlay=0`, interacting with the bridge window removes focus from the game, so a controller is recommended. With the default `DcompOverlay=1` there is no bridge window to take focus. See Display setup
 
