@@ -42,6 +42,7 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "panel_simple.hpp"   // the simple-panel hotkey below
 #include "startup_trace.hpp"   // R313
 #include "worker.hpp"
 
@@ -81,6 +82,9 @@
 // not "no regression".
 // F6 and not F12 because Steam's screenshot key is F12.
 #define MGPU_HOTKEY_PEEK       0x4D50   // CTRL+ALT+F6
+// The simple panel. F4 because F5/F9 are quick save/load on several titles, F6-F11 are taken by
+// the keys above, and F12 belongs to Steam.
+#define MGPU_HOTKEY_SIMPLE     0x4D51   // CTRL+ALT+F4 - full panel <-> simple panel
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -782,6 +786,17 @@ namespace
                                 mgpu::gpu1::dcomp_overlay_mode() &&
                                 RegisterHotKey(nullptr, MGPU_HOTKEY_PEEK,
                                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6) != FALSE;
+                            // Registered independently of the peek key, like every other
+                            // hotkey here: one failing must not cost the others.
+                            const bool k_s = RegisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F4) != FALSE;
+                            if (k_s)
+                                mgpu::diag::info("[MGPU][R330] simple panel hotkey: CTRL+ALT+F4 switches the "
+                                                 "panel between the full view and the simple one. It writes "
+                                                 "PanelSimple to mgpu.ini, so the choice survives a restart.");   // R330
+                            else
+                                mgpu::diag::warn("[MGPU][R330] simple panel hotkey CTRL+ALT+F4 FAILED to "
+                                                 "register - the checkbox in the full panel still switches it.");
                             if (mgpu::gpu1::dcomp_overlay_mode())
                             {
                                 char pk[440];
@@ -1038,6 +1053,7 @@ namespace
                 unsigned view_cycles = 0;
                 int seam_delta = 0;
                 int seam_coarse = 0;
+                unsigned simple_toggles = 0;   // R330: counted here, acted on after the drain
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
@@ -1055,6 +1071,13 @@ namespace
                     // the key is not registered there.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
+                    // The panel draws its next frame from the flag, so this is immediate and
+                    // needs neither a restart nor the panel to be open. R330 (F1): toggle() only
+                    // flips PanelSimple; the layout is never touched from this thread. Like
+                    // every other key here it is counted now and acted on once the queue is empty -
+                    // toggle() rewrites mgpu.ini, and a file rewrite does not belong inside the drain.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SIMPLE)
+                    { ++simple_toggles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
@@ -1085,6 +1108,8 @@ namespace
                 // step the thing they just selected.
                 for (unsigned c = 0; c < int_cycles; ++c)
                     mgpu::gpu1::intensity_cycle_target();
+                // R330: an odd number of presses in one drain is one flip; an even number is none.
+                if ((simple_toggles & 1u) != 0u) mgpu::psimple::toggle();
                 for (int d = 0; d < int_delta; ++d)  mgpu::gpu1::intensity_step(+1);
                 for (int d = 0; d > int_delta; --d)  mgpu::gpu1::intensity_step(-1);
 
@@ -1570,6 +1595,7 @@ namespace
             // V52: only ever registered in ghost mode.
             if (mgpu::gpu1::dcomp_overlay_mode())
                 UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);

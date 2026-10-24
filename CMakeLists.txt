@@ -92,6 +92,7 @@ add_library(mgpu_bridge SHARED
     # PanelOverPicture (N01950): the live panel over the neural frame. OFF unless
     # PanelOverPicture=1; registers its own ReShade event only then.
     src/live_panel.cpp
+    src/panel_simple.cpp   # the player-facing panel; its layout lives in panel_simple.txt
     # R300 - T1.19 (Dom / LordZaxxon), docs/R300_T119.md. Every path OFF unless its mgpu.ini key is set:
     # t119_keys.cpp is the one place the keys are read (from probe's ini read).
     src/t119_keys.cpp
@@ -215,6 +216,11 @@ target_link_libraries(mgpu_bridge PRIVATE
 # P0: warnings visible, not fatal. A compile error costs the same round
 # trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
+# R330 (F7): panel_simple.cpp carries UTF-8 text, so it is read AND emitted as UTF-8 (ImGui expects
+# UTF-8). Only that file: every other source compiles exactly as before.
+if (MSVC)
+    set_source_files_properties(src/panel_simple.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
 if(MGPU_BUILD_TESTS)

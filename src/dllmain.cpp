@@ -110,6 +110,7 @@
 #include "residual.hpp"   // R319a: one relaxed load, to word the x2 line
 #include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
 #include "live_panel.hpp"     // PanelOverPicture (N01950): own file, off unless PanelOverPicture=1
+#include "panel_simple.hpp"   // the player-facing panel; its layout is panel_simple.txt
 #include "latency_probe.hpp"  // D1.5a (0.3.0 R&D): read-only latency probe, off unless LatencyProbe=1
 #include "journal.hpp"        // D2.0: what / when / why journal, off unless Journal=1
 #include "stall_watch.hpp"    // D2.0: stall watch, off unless StallWatch=N
@@ -1126,6 +1127,16 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // read at arm time, so a menu that gets armed out from under the reader is
     // a menu that does nothing.
     mgpu::gpu1::ui_panel_drawn();
+
+    // The simple mode REPLACES the panel instead of greying parts of it out. `Advanced >>` at
+    // its bottom, the checkbox in the editor section, and CTRL+ALT+F4 all switch back. Every
+    // control it draws calls the same setter the full panel does - same state, less on screen.
+    if (mgpu::psimple::enabled())
+    {
+        mgpu::psimple::draw_simple_panel();
+        return;
+    }
+
 
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
@@ -2759,6 +2770,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
     }
 
+    mgpu::psimple::draw_editor();   // toggle, open panel_simple.txt, export the row list
+
     ImGui::Separator();
     ImGui::TextDisabled("Do not change resolution, DLSS mode or presets while armed - disarm first.");
     ImGui::TextDisabled("Frame generation is untested. Changes here make this a tuning run.");
@@ -4093,6 +4106,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // PanelOverPicture (N01950): reads its key once and registers its
         // reshade_overlay event only when PanelOverPicture=1 (live_panel.cpp).
         mgpu::live_panel::attach(hModule);
+        // The simple panel's layout file lives beside the add-on. init() only remembers the
+        // directory (R330, F2: no file read here); panel_simple.txt is read on the first panel draw.
+        mgpu::psimple::init(hModule);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242

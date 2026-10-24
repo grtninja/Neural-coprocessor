@@ -1,0 +1,97 @@
+﻿# panel_simple.txt —— MGPU 桥的"精简面板"布局
+#
+# 每行一项：  id | 中文标签 | 说明（写 \n 表示换行）
+# 以 # 或 ; 开头的是注释；不写在本文件里的行不会出现在精简面板，顺序就是显示顺序。
+# 改完点面板里的 reload（或按 CTRL+ALT+F4 切两次），不用重启游戏。
+#
+# 分区标题：以 = 开头的行不是控件，而是标题
+#   ==== 画质 ====    → 带标题的分隔线
+#   ======            → 只有一条分隔线
+#
+# 【重启】= 切换后需重新武装/重启游戏才生效（面板上也会显示这句提示）。
+# 这个桥不只为 FC6 服务：有 DLSS 的游戏、有帧生成的游戏，下面这些行都可以直接用。
+
+# ==================== 当前启用 ====================
+
+panel.title      | MGPU 神经渲染 | 神经卡负责降噪，渲染卡负责出画。\n这里只有日常会用到的几项；其余参数、日志和帧时间统计都在"高级"面板里。
+
+==== 模型 / 画风 ====
+
+model.style      | 画风         | A/B/C 三套预置强度风格，最直观，建议先试这一项。
+model.tone       | 明暗         | 0–2，整体明暗/色调的强度。
+model.structure  | 结构         | 0–2，结构纹理的强度；过高会显脏。
+model.skin       | 皮肤         | 0–2，单独控制皮肤区域。
+model.mask       | 自动遮罩     | 自动识别皮肤区域再应用强度，一般配合"皮肤"用。
+
+==== 神经渲染 ====
+
+nrs.scale        | 神经缩放     | 0.30–1.00，实时。越小神经卡越省、画面略软。
+nrs.gain         | 细节增益     | 0–2，让神经结果多保留一点纹理；过高会显得脏。
+nrs.sharp        | 锐化         | 0–1，提高边缘锐度；过高会有白边和闪烁。
+nrs.colour       | 颜色强度     | 0–1，神经结果的颜色参与程度，一般不用动。
+nrs.mode         | 模式         | 残差 = 只在原生画面上叠加神经差异（推荐）；直接 = 完全用神经结果。
+
+==== 处理强度与遍数 ====
+
+passes           | 渲染遍数     | x1 最省神经卡；x2 画质更好、开销更大。
+intensity        | 强度         | 0–2，越低越接近原生画面；作用到所有遍。
+intensity.preset | 强度曲线     | manual = 手动；front / back = 前/后段加重。
+nrs1.on          | 第一遍缩放   | 与「神经缩放」是同一个控件（作者面板里的 Pass 1 scale）；用哪个 id 都一样。
+x2.mode          | 第二遍强度   | x2 时第二遍走多重的处理。【重启】
+
+#==== 视图 ====
+
+# view           | 视图         | output = 看神经结果；input = 看喂给模型的原始帧；split = 左右对比（可拖分割线）。
+
+==== DLSS / 超分辨率（游戏本身支持 DLSS 时才有用）====
+
+sr.enable        | 神经卡超分   | 把游戏的原生 DLSS 交给 神经卡跑；没有 DLSS 的游戏会糊。【重启】
+sr.quality       | 超分档位     | 性能 / 平衡 / 质量（对应 DLSS分辨率的 50/58/67）。【重启】
+sr.preset        | 超分预设     | 游戏默认 / K / L / M，换一套 DLSS 内部预设。【重启】
+
+==== 帧生成（游戏本身有帧生成时才有用）====
+
+fg.mode          | 帧生成       | 修正向量（修正生成帧的向量）/ 修正+抽帧（每 N 帧只评估 1 张）。实时，可能不稳。
+fg.keep          | 生成帧窗口   | 修正+抽帧 时"每 N 帧保留 1 张"的 N，2–8。实时。
+
+#==== 诊断（一般不用动）====
+
+# neural         | 神经阶段     | 关闭 = 不使用神经卡，用于对比/排错。
+# mvec.mode      | 运动向量     | 日常用 real；off / synthetic 只用于排错。
+
+==== 需要重启才生效 ====
+
+fps.cap          | 帧率上限     | 0 = 不限制，30–240；同时限制游戏和 MGPU 生产端。【重启】
+colour.16bit     | 16 位色深    | 颜色用 16 位精度传输，画质更好、带宽更高。【重启】
+crop             | 裁切         | 只把画面中的一块送去神经卡，省带宽。【重启】
+
+# R330: control labels (buttons, choices). ui.<name> | 标签 . A missing line shows English.
+# 控件上的文字：ui.<名字> | 标签。删掉一行就显示英文。
+ui.default          | 默认
+ui.residual         | 残差
+ui.direct           | 直接
+ui.output           | 输出
+ui.input            | 输入
+ui.split            | 分屏
+ui.seam             | 分界
+ui.off              | 关
+ui.turn_off         | 关闭
+ui.on               | 开
+ui.auto             | 自动
+ui.synthetic        | 合成
+ui.real             | 真实
+ui.manual           | 手动
+ui.front            | 前置
+ui.back             | 后置
+ui.performance      | 性能
+ui.balanced         | 均衡
+ui.quality          | 质量
+ui.title_default    | 标题默认
+ui.fg_fix           | 修正向量
+ui.fg_fix_thin      | 修正+抽帧
+ui.fg_keep_hint     | 每 N 帧保留 1 张
+ui.medium           | 中等
+ui.light            | 轻量
+ui.full             | 完整
+ui.advanced         | 高级  >>
+ui.reload           | 重新加载
